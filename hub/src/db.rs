@@ -1,0 +1,728 @@
+//! SQLite storage. One writer connection behind a mutex: at a handful of nodes
+//! reporting every couple of seconds every statement here is sub-millisecond.
+// ponytail: single global connection; move to a read pool if the dashboard ever
+// blocks behind ingest.
+
+use std::sync::Mutex;
+
+use anyhow::Result;
+use chrono::{Datelike, NaiveDate, Utc};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+
+pub struct Db(Mutex<Connection>);
+
+const SCHEMA: &str = r#"
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA foreign_keys = ON;
+PRAGMA busy_timeout = 5000;
+
+CREATE TABLE IF NOT EXISTS setting (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS node (
+  id            INTEGER PRIMARY KEY,
+  name          TEXT    NOT NULL,
+  token_hash    TEXT    NOT NULL UNIQUE,
+  sort          INTEGER NOT NULL DEFAULT 0,
+  public        INTEGER NOT NULL DEFAULT 1,
+  price         REAL    NOT NULL DEFAULT 0,
+  currency      TEXT    NOT NULL DEFAULT 'USD',
+  billing_cycle TEXT    NOT NULL DEFAULT 'monthly',
+  expires_at    TEXT,
+  remark        TEXT    NOT NULL DEFAULT '',
+  traffic_limit INTEGER NOT NULL DEFAULT 0,
+  traffic_mode  TEXT    NOT NULL DEFAULT 'sum',
+  traffic_reset_day INTEGER NOT NULL DEFAULT 1,
+  hostname TEXT NOT NULL DEFAULT '', os TEXT NOT NULL DEFAULT '',
+  kernel   TEXT NOT NULL DEFAULT '', arch TEXT NOT NULL DEFAULT '',
+  virt     TEXT NOT NULL DEFAULT '', cpu_name TEXT NOT NULL DEFAULT '',
+  cpu_cores INTEGER NOT NULL DEFAULT 0, mem_total INTEGER NOT NULL DEFAULT 0,
+  swap_total INTEGER NOT NULL DEFAULT 0, disk_total INTEGER NOT NULL DEFAULT 0,
+  agent_version TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+);
+
+-- Monotonic byte counters that survive both agent reboots and hub restarts.
+CREATE TABLE IF NOT EXISTS traffic (
+  node_id  INTEGER PRIMARY KEY REFERENCES node(id) ON DELETE CASCADE,
+  boot_id  TEXT    NOT NULL DEFAULT '',
+  last_rx  INTEGER NOT NULL DEFAULT 0,
+  last_tx  INTEGER NOT NULL DEFAULT 0,
+  total_rx INTEGER NOT NULL DEFAULT 0,
+  total_tx INTEGER NOT NULL DEFAULT 0,
+  month_rx INTEGER NOT NULL DEFAULT 0,
+  month_tx INTEGER NOT NULL DEFAULT 0,
+  month_start TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS metric (
+  node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+  ts      INTEGER NOT NULL,
+  cpu REAL NOT NULL, load1 REAL NOT NULL,
+  mem_used INTEGER NOT NULL, swap_used INTEGER NOT NULL, disk_used INTEGER NOT NULL,
+  net_rx INTEGER NOT NULL, net_tx INTEGER NOT NULL,
+  tcp INTEGER NOT NULL, udp INTEGER NOT NULL, procs INTEGER NOT NULL,
+  PRIMARY KEY (node_id, ts)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS ping_task (
+  id       INTEGER PRIMARY KEY,
+  name     TEXT    NOT NULL,
+  target   TEXT    NOT NULL,
+  interval INTEGER NOT NULL DEFAULT 60
+);
+
+CREATE TABLE IF NOT EXISTS ping_node (
+  task_id INTEGER NOT NULL REFERENCES ping_task(id) ON DELETE CASCADE,
+  node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+  PRIMARY KEY (task_id, node_id)
+);
+
+CREATE TABLE IF NOT EXISTS ping_record (
+  node_id INTEGER NOT NULL, task_id INTEGER NOT NULL,
+  ts INTEGER NOT NULL, latency INTEGER NOT NULL,
+  PRIMARY KEY (node_id, task_id, ts)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS session (
+  token_hash TEXT    PRIMARY KEY,
+  expires_at INTEGER NOT NULL
+);
+"#;
+
+/// One node's stored configuration and last known facts.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct Node {
+    #[serde(default)]
+    pub id: i64,
+    pub name: String,
+    #[serde(default = "yes")]
+    pub public: bool,
+    #[serde(default)]
+    pub sort: i64,
+    #[serde(default)]
+    pub price: f64,
+    #[serde(default = "usd")]
+    pub currency: String,
+    #[serde(default = "monthly")]
+    pub billing_cycle: String,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub remark: String,
+    /// Monthly allowance in bytes; 0 means unmetered.
+    #[serde(default)]
+    pub traffic_limit: i64,
+    /// How the allowance is counted: sum, max, up or down.
+    #[serde(default = "sum")]
+    pub traffic_mode: String,
+    #[serde(default = "one")]
+    pub traffic_reset_day: u32,
+    #[serde(default)]
+    pub hostname: String,
+    #[serde(default)]
+    pub os: String,
+    #[serde(default)]
+    pub kernel: String,
+    #[serde(default)]
+    pub arch: String,
+    #[serde(default)]
+    pub virt: String,
+    #[serde(default)]
+    pub cpu_name: String,
+    #[serde(default)]
+    pub cpu_cores: i64,
+    #[serde(default)]
+    pub mem_total: i64,
+    #[serde(default)]
+    pub swap_total: i64,
+    #[serde(default)]
+    pub disk_total: i64,
+    #[serde(default)]
+    pub agent_version: String,
+    #[serde(default)]
+    pub ip: String,
+}
+
+fn yes() -> bool { true }
+fn usd() -> String { "USD".into() }
+fn monthly() -> String { "monthly".into() }
+fn sum() -> String { "sum".into() }
+fn one() -> u32 { 1 }
+
+#[derive(Serialize, Debug, Clone, Default)]
+pub struct Traffic {
+    pub total_rx: i64,
+    pub total_tx: i64,
+    pub month_rx: i64,
+    pub month_tx: i64,
+    pub month_start: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PingTask {
+    #[serde(default)]
+    pub id: i64,
+    pub name: String,
+    pub target: String,
+    #[serde(default)]
+    pub interval: i64,
+    #[serde(default)]
+    pub nodes: Vec<i64>,
+}
+
+impl Db {
+    pub fn open(path: &str) -> Result<Self> {
+        let conn = Connection::open(path)?;
+        conn.execute_batch(SCHEMA)?;
+        Ok(Self(Mutex::new(conn)))
+    }
+
+    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    // ---- settings ----
+
+    pub fn get(&self, key: &str) -> Option<String> {
+        self.conn()
+            .query_row("SELECT value FROM setting WHERE key = ?1", [key], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    pub fn set(&self, key: &str, value: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO setting (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    // ---- nodes ----
+
+    pub fn nodes(&self) -> Result<Vec<Node>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT * FROM node ORDER BY sort, id")?;
+        let rows = stmt.query_map([], |r| Ok(row_to_node(r)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn node(&self, id: i64) -> Result<Option<Node>> {
+        Ok(self
+            .conn()
+            .query_row("SELECT * FROM node WHERE id = ?1", [id], |r| Ok(row_to_node(r)))
+            .optional()?)
+    }
+
+    /// Creates a node and returns its id. The caller keeps the plaintext token;
+    /// only its hash is ever stored.
+    pub fn create_node(&self, n: &Node, token_hash: &str) -> Result<i64> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO node (name, token_hash, sort, public, price, currency, billing_cycle,
+                               expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![
+                n.name, token_hash, n.sort, n.public, n.price, n.currency, n.billing_cycle,
+                n.expires_at, n.remark, n.traffic_limit, n.traffic_mode, n.traffic_reset_day,
+                Utc::now().timestamp()
+            ],
+        )?;
+        let id = conn.last_insert_rowid();
+        conn.execute("INSERT INTO traffic (node_id) VALUES (?1)", [id])?;
+        Ok(id)
+    }
+
+    pub fn update_node(&self, id: i64, n: &Node) -> Result<()> {
+        self.conn().execute(
+            "UPDATE node SET name=?2, sort=?3, public=?4, price=?5, currency=?6, billing_cycle=?7,
+                             expires_at=?8, remark=?9, traffic_limit=?10, traffic_mode=?11,
+                             traffic_reset_day=?12
+             WHERE id=?1",
+            params![
+                id, n.name, n.sort, n.public, n.price, n.currency, n.billing_cycle, n.expires_at,
+                n.remark, n.traffic_limit, n.traffic_mode, n.traffic_reset_day
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_node(&self, id: i64) -> Result<()> {
+        self.conn().execute("DELETE FROM node WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Replaces a node's token, which immediately locks out the old one.
+    pub fn reset_token(&self, id: i64, token_hash: &str) -> Result<()> {
+        self.conn()
+            .execute("UPDATE node SET token_hash=?2 WHERE id=?1", params![id, token_hash])?;
+        Ok(())
+    }
+
+    pub fn node_by_token(&self, token_hash: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn()
+            .query_row("SELECT id FROM node WHERE token_hash = ?1", [token_hash], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Stores the slow-changing facts an agent sends when it connects.
+    pub fn save_facts(&self, id: i64, f: &serde_json::Value, ip: &str) -> Result<()> {
+        let s = |k: &str| f.get(k).and_then(|v| v.as_str()).unwrap_or("").to_owned();
+        let n = |k: &str| f.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+        self.conn().execute(
+            "UPDATE node SET hostname=?2, os=?3, kernel=?4, arch=?5, virt=?6, cpu_name=?7,
+                             cpu_cores=?8, mem_total=?9, swap_total=?10, disk_total=?11,
+                             agent_version=?12, ip=?13
+             WHERE id=?1",
+            params![
+                id, s("hostname"), s("os"), s("kernel"), s("arch"), s("virt"), s("cpu_name"),
+                n("cpu_cores"), n("mem_total"), n("swap_total"), n("disk_total"),
+                s("agent_version"), ip
+            ],
+        )?;
+        Ok(())
+    }
+
+    // ---- traffic ----
+
+    pub fn traffic(&self, node_id: i64) -> Traffic {
+        self.conn()
+            .query_row(
+                "SELECT total_rx, total_tx, month_rx, month_tx, month_start FROM traffic WHERE node_id=?1",
+                [node_id],
+                |r| {
+                    Ok(Traffic {
+                        total_rx: r.get(0)?,
+                        total_tx: r.get(1)?,
+                        month_rx: r.get(2)?,
+                        month_tx: r.get(3)?,
+                        month_start: r.get(4)?,
+                    })
+                },
+            )
+            .unwrap_or_default()
+    }
+
+    /// Folds one report's raw kernel counters into the node's running totals.
+    ///
+    /// A changed boot_id, or a counter that moved backwards, means the kernel
+    /// started counting from zero again: the whole current reading is new
+    /// traffic. This is what keeps the total from collapsing on every reboot,
+    /// which is the behaviour komari has.
+    pub fn accumulate(&self, node_id: i64, boot_id: &str, rx: i64, tx: i64, reset_day: u32) -> Result<Traffic> {
+        let conn = self.conn();
+        let (prev_boot, last_rx, last_tx, mut total_rx, mut total_tx, mut month_rx, mut month_tx, month_start) =
+            conn.query_row(
+                "SELECT boot_id, last_rx, last_tx, total_rx, total_tx, month_rx, month_tx, month_start
+                 FROM traffic WHERE node_id=?1",
+                [node_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?,
+                        r.get::<_, i64>(6)?, r.get::<_, String>(7)?,
+                    ))
+                },
+            )?;
+
+        let rebooted = prev_boot != boot_id || rx < last_rx || tx < last_tx;
+        let (d_rx, d_tx) = if rebooted { (rx, tx) } else { (rx - last_rx, tx - last_tx) };
+        // A brand new node has no baseline, so its first report would otherwise
+        // book the machine's entire lifetime traffic in one go.
+        let (d_rx, d_tx) = if prev_boot.is_empty() { (0, 0) } else { (d_rx, d_tx) };
+        total_rx += d_rx;
+        total_tx += d_tx;
+        month_rx += d_rx;
+        month_tx += d_tx;
+
+        let period = period_start(Utc::now().date_naive(), reset_day).to_string();
+        if month_start != period {
+            // New billing period: the month counter restarts, the total does not.
+            month_rx = d_rx;
+            month_tx = d_tx;
+        }
+
+        conn.execute(
+            "UPDATE traffic SET boot_id=?2, last_rx=?3, last_tx=?4, total_rx=?5, total_tx=?6,
+                                month_rx=?7, month_tx=?8, month_start=?9 WHERE node_id=?1",
+            params![node_id, boot_id, rx, tx, total_rx, total_tx, month_rx, month_tx, period],
+        )?;
+        Ok(Traffic { total_rx, total_tx, month_rx, month_tx, month_start: period })
+    }
+
+    /// Lets the panel correct a total, e.g. after moving a node to new hardware.
+    pub fn set_traffic(&self, node_id: i64, total_rx: i64, total_tx: i64, month_rx: i64, month_tx: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE traffic SET total_rx=?2, total_tx=?3, month_rx=?4, month_tx=?5 WHERE node_id=?1",
+            params![node_id, total_rx, total_tx, month_rx, month_tx],
+        )?;
+        Ok(())
+    }
+
+    // ---- metrics ----
+
+    pub fn insert_metric(&self, node_id: i64, ts: i64, m: &serde_json::Value) -> Result<()> {
+        let f = |k: &str| m.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let n = |k: &str| m.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+        let load1 = m.get("load").and_then(|v| v.get(0)).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        self.conn().execute(
+            "INSERT OR REPLACE INTO metric
+               (node_id, ts, cpu, load1, mem_used, swap_used, disk_used, net_rx, net_tx, tcp, udp, procs)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![
+                node_id, ts, f("cpu"), load1, n("mem_used"), n("swap_used"), n("disk_used"),
+                n("net_rx"), n("net_tx"), n("tcp"), n("udp"), n("procs")
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn metrics(&self, node_id: i64, since: i64) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT ts, cpu, load1, mem_used, swap_used, disk_used, net_rx, net_tx
+             FROM metric WHERE node_id=?1 AND ts>=?2 ORDER BY ts",
+        )?;
+        let rows = stmt.query_map(params![node_id, since], |r| {
+            Ok(serde_json::json!({
+                "ts": r.get::<_, i64>(0)?, "cpu": r.get::<_, f64>(1)?, "load1": r.get::<_, f64>(2)?,
+                "mem_used": r.get::<_, i64>(3)?, "swap_used": r.get::<_, i64>(4)?,
+                "disk_used": r.get::<_, i64>(5)?, "net_rx": r.get::<_, i64>(6)?,
+                "net_tx": r.get::<_, i64>(7)?,
+            }))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Drops history past the retention window. Traffic totals are unaffected:
+    /// they live in their own table precisely so history can be pruned freely.
+    pub fn prune(&self, keep_days: i64) -> Result<usize> {
+        let cutoff = Utc::now().timestamp() - keep_days * 86_400;
+        let conn = self.conn();
+        let a = conn.execute("DELETE FROM metric WHERE ts < ?1", [cutoff])?;
+        let b = conn.execute("DELETE FROM ping_record WHERE ts < ?1", [cutoff])?;
+        Ok(a + b)
+    }
+
+    // ---- ping ----
+
+    pub fn ping_tasks(&self) -> Result<Vec<PingTask>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT id, name, target, interval FROM ping_task ORDER BY id")?;
+        let tasks: Vec<PingTask> = stmt
+            .query_map([], |r| {
+                Ok(PingTask {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    target: r.get(2)?,
+                    interval: r.get(3)?,
+                    nodes: Vec::new(),
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        drop(stmt);
+        let mut stmt = conn.prepare("SELECT node_id FROM ping_node WHERE task_id=?1")?;
+        tasks
+            .into_iter()
+            .map(|mut t| {
+                t.nodes = stmt.query_map([t.id], |r| r.get(0))?.collect::<Result<_, _>>()?;
+                Ok(t)
+            })
+            .collect()
+    }
+
+    pub fn save_ping_task(&self, t: &PingTask) -> Result<i64> {
+        let conn = self.conn();
+        let id = if t.id > 0 {
+            conn.execute(
+                "UPDATE ping_task SET name=?2, target=?3, interval=?4 WHERE id=?1",
+                params![t.id, t.name, t.target, t.interval],
+            )?;
+            t.id
+        } else {
+            conn.execute(
+                "INSERT INTO ping_task (name, target, interval) VALUES (?1,?2,?3)",
+                params![t.name, t.target, t.interval],
+            )?;
+            conn.last_insert_rowid()
+        };
+        conn.execute("DELETE FROM ping_node WHERE task_id=?1", [id])?;
+        for node in &t.nodes {
+            conn.execute("INSERT INTO ping_node (task_id, node_id) VALUES (?1,?2)", params![id, node])?;
+        }
+        Ok(id)
+    }
+
+    pub fn delete_ping_task(&self, id: i64) -> Result<()> {
+        self.conn().execute("DELETE FROM ping_task WHERE id=?1", [id])?;
+        Ok(())
+    }
+
+    /// The task list to push to one agent.
+    pub fn ping_tasks_for(&self, node_id: i64) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.target, t.interval FROM ping_task t
+             JOIN ping_node n ON n.task_id = t.id WHERE n.node_id = ?1",
+        )?;
+        let rows = stmt.query_map([node_id], |r| {
+            Ok(serde_json::json!({
+                "id": r.get::<_, i64>(0)?, "target": r.get::<_, String>(1)?,
+                "interval": r.get::<_, i64>(2)?
+            }))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn insert_ping(&self, node_id: i64, task_id: i64, ts: i64, latency: i64) -> Result<()> {
+        self.conn().execute(
+            "INSERT OR REPLACE INTO ping_record (node_id, task_id, ts, latency) VALUES (?1,?2,?3,?4)",
+            params![node_id, task_id, ts, latency],
+        )?;
+        Ok(())
+    }
+
+    pub fn ping_records(&self, node_id: i64, since: i64) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT task_id, ts, latency FROM ping_record WHERE node_id=?1 AND ts>=?2 ORDER BY ts",
+        )?;
+        let rows = stmt.query_map(params![node_id, since], |r| {
+            Ok(serde_json::json!({
+                "task_id": r.get::<_, i64>(0)?, "ts": r.get::<_, i64>(1)?,
+                "latency": r.get::<_, i64>(2)?
+            }))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    // ---- sessions ----
+
+    pub fn create_session(&self, token_hash: &str, expires_at: i64) -> Result<()> {
+        self.conn().execute(
+            "INSERT OR REPLACE INTO session (token_hash, expires_at) VALUES (?1, ?2)",
+            params![token_hash, expires_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn session_valid(&self, token_hash: &str) -> bool {
+        self.conn()
+            .query_row(
+                "SELECT 1 FROM session WHERE token_hash=?1 AND expires_at > ?2",
+                params![token_hash, Utc::now().timestamp()],
+                |_| Ok(()),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    pub fn drop_session(&self, token_hash: &str) -> Result<()> {
+        self.conn().execute("DELETE FROM session WHERE token_hash=?1", [token_hash])?;
+        Ok(())
+    }
+
+    /// Invalidates every login. Used when the admin password changes.
+    pub fn drop_all_sessions(&self) -> Result<()> {
+        self.conn().execute("DELETE FROM session", [])?;
+        Ok(())
+    }
+
+    pub fn expire_sessions(&self) -> Result<()> {
+        self.conn()
+            .execute("DELETE FROM session WHERE expires_at <= ?1", [Utc::now().timestamp()])?;
+        Ok(())
+    }
+}
+
+fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
+    let s = |i: &str| r.get::<_, String>(i).unwrap_or_default();
+    let n = |i: &str| r.get::<_, i64>(i).unwrap_or(0);
+    Node {
+        id: n("id"),
+        name: s("name"),
+        public: r.get::<_, bool>("public").unwrap_or(true),
+        sort: n("sort"),
+        price: r.get::<_, f64>("price").unwrap_or(0.0),
+        currency: s("currency"),
+        billing_cycle: s("billing_cycle"),
+        expires_at: r.get::<_, Option<String>>("expires_at").unwrap_or(None),
+        remark: s("remark"),
+        traffic_limit: n("traffic_limit"),
+        traffic_mode: s("traffic_mode"),
+        traffic_reset_day: n("traffic_reset_day") as u32,
+        hostname: s("hostname"),
+        os: s("os"),
+        kernel: s("kernel"),
+        arch: s("arch"),
+        virt: s("virt"),
+        cpu_name: s("cpu_name"),
+        cpu_cores: n("cpu_cores"),
+        mem_total: n("mem_total"),
+        swap_total: n("swap_total"),
+        disk_total: n("disk_total"),
+        agent_version: s("agent_version"),
+        ip: s("ip"),
+    }
+}
+
+/// Start of the billing period containing `today`, given a reset day of month.
+/// A reset day past the end of a short month lands on that month's last day.
+pub fn period_start(today: NaiveDate, reset_day: u32) -> NaiveDate {
+    let day = reset_day.clamp(1, 31);
+    let clamped = |y: i32, m: u32| {
+        let last = NaiveDate::from_ymd_opt(if m == 12 { y + 1 } else { y }, if m == 12 { 1 } else { m + 1 }, 1)
+            .unwrap()
+            .pred_opt()
+            .unwrap()
+            .day();
+        NaiveDate::from_ymd_opt(y, m, day.min(last)).unwrap()
+    };
+    let this = clamped(today.year(), today.month());
+    if today >= this {
+        this
+    } else if today.month() == 1 {
+        clamped(today.year() - 1, 12)
+    } else {
+        clamped(today.year(), today.month() - 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn db() -> Db {
+        Db::open(":memory:").unwrap()
+    }
+
+    fn node(db: &Db, reset_day: u32) -> i64 {
+        let hash = format!("hash-{}", rand::random::<u32>());
+        db.create_node(&Node { name: "n".into(), traffic_reset_day: reset_day, ..Default::default() }, &hash)
+            .unwrap()
+    }
+
+    #[test]
+    fn traffic_survives_a_reboot_instead_of_resetting() {
+        let db = db();
+        let id = node(&db, 1);
+
+        // First report only establishes the baseline: the box's lifetime
+        // counters are not booked as traffic seen by this hub.
+        let t = db.accumulate(id, "boot-a", 5_000, 3_000, 1).unwrap();
+        assert_eq!((t.total_rx, t.total_tx), (0, 0));
+
+        let t = db.accumulate(id, "boot-a", 9_000, 6_000, 1).unwrap();
+        assert_eq!((t.total_rx, t.total_tx), (4_000, 3_000));
+
+        // Reboot: new boot_id, counters restart near zero. The total must keep
+        // climbing rather than fall back to the fresh counter value.
+        let t = db.accumulate(id, "boot-b", 700, 400, 1).unwrap();
+        assert_eq!((t.total_rx, t.total_tx), (4_700, 3_400));
+
+        let t = db.accumulate(id, "boot-b", 1_700, 900, 1).unwrap();
+        assert_eq!((t.total_rx, t.total_tx), (5_700, 3_900));
+        assert_eq!((t.month_rx, t.month_tx), (5_700, 3_900));
+    }
+
+    #[test]
+    fn counter_wrap_without_a_reboot_is_also_absorbed() {
+        let db = db();
+        let id = node(&db, 1);
+        db.accumulate(id, "boot-a", 10_000, 10_000, 1).unwrap();
+        db.accumulate(id, "boot-a", 12_000, 12_000, 1).unwrap();
+        // Same boot, counter went backwards: treat the reading as fresh bytes.
+        let t = db.accumulate(id, "boot-a", 500, 500, 1).unwrap();
+        assert_eq!((t.total_rx, t.total_tx), (2_500, 2_500));
+    }
+
+    #[test]
+    fn month_counter_restarts_but_total_keeps_climbing() {
+        let db = db();
+        let id = node(&db, 1);
+        db.accumulate(id, "boot-a", 0, 0, 1).unwrap();
+        let t = db.accumulate(id, "boot-a", 8_000, 8_000, 1).unwrap();
+        assert_eq!(t.month_rx, 8_000);
+
+        // Force the stored period to look stale, as it would after a rollover.
+        db.conn()
+            .execute("UPDATE traffic SET month_start='1999-01-01' WHERE node_id=?1", [id])
+            .unwrap();
+        let t = db.accumulate(id, "boot-a", 9_500, 9_500, 1).unwrap();
+        assert_eq!(t.month_rx, 1_500, "new period counts only this report's delta");
+        assert_eq!(t.total_rx, 9_500, "lifetime total is untouched by the rollover");
+    }
+
+    #[test]
+    fn period_start_handles_short_months_and_wraparound() {
+        let d = |y, m, day| NaiveDate::from_ymd_opt(y, m, day).unwrap();
+        // Reset on the 15th, today is the 20th: this month.
+        assert_eq!(period_start(d(2026, 3, 20), 15), d(2026, 3, 15));
+        // Same day counts as the start of the new period.
+        assert_eq!(period_start(d(2026, 3, 15), 15), d(2026, 3, 15));
+        // Before the reset day: the period began last month.
+        assert_eq!(period_start(d(2026, 3, 10), 15), d(2026, 2, 15));
+        // January rolls back into the previous year.
+        assert_eq!(period_start(d(2026, 1, 10), 15), d(2025, 12, 15));
+        // Day 31 in February clamps to the 28th, and 2028 is a leap year.
+        assert_eq!(period_start(d(2026, 2, 28), 31), d(2026, 2, 28));
+        assert_eq!(period_start(d(2028, 2, 29), 31), d(2028, 2, 29));
+    }
+
+    #[test]
+    fn deleting_a_node_takes_its_data_with_it() {
+        let db = db();
+        let id = node(&db, 1);
+        db.accumulate(id, "b", 10, 10, 1).unwrap();
+        db.insert_metric(id, 1, &serde_json::json!({"cpu": 1.0})).unwrap();
+        db.delete_node(id).unwrap();
+        assert!(db.node(id).unwrap().is_none());
+        assert_eq!(db.metrics(id, 0).unwrap().len(), 0);
+        assert_eq!(db.traffic(id).total_rx, 0);
+    }
+
+    #[test]
+    fn prune_drops_history_but_never_traffic_totals() {
+        let db = db();
+        let id = node(&db, 1);
+        db.accumulate(id, "b", 100, 100, 1).unwrap();
+        db.accumulate(id, "b", 900, 900, 1).unwrap();
+        let old = Utc::now().timestamp() - 40 * 86_400;
+        db.insert_metric(id, old, &serde_json::json!({"cpu": 1.0})).unwrap();
+        db.insert_metric(id, Utc::now().timestamp(), &serde_json::json!({"cpu": 2.0})).unwrap();
+
+        db.prune(30).unwrap();
+        assert_eq!(db.metrics(id, 0).unwrap().len(), 1);
+        assert_eq!(db.traffic(id).total_rx, 800);
+    }
+
+    #[test]
+    fn ping_tasks_round_trip_with_their_node_assignments() {
+        let db = db();
+        let (a, b) = (node(&db, 1), node(&db, 1));
+        let id = db
+            .save_ping_task(&PingTask {
+                id: 0, name: "cf".into(), target: "1.1.1.1:443".into(), interval: 60, nodes: vec![a, b],
+            })
+            .unwrap();
+        assert_eq!(db.ping_tasks_for(a).unwrap().len(), 1);
+
+        // Reassigning to one node must drop the other's copy.
+        db.save_ping_task(&PingTask {
+            id, name: "cf".into(), target: "1.1.1.1:443".into(), interval: 30, nodes: vec![a],
+        })
+        .unwrap();
+        assert_eq!(db.ping_tasks_for(b).unwrap().len(), 0);
+        assert_eq!(db.ping_tasks().unwrap()[0].interval, 30);
+    }
+}
