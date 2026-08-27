@@ -500,9 +500,22 @@ function Nodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
                     >
                       <GripVertical className="size-4" />
                     </button>
-                    <div>
+                    <div className="min-w-0">
                       <div className="font-medium">{n.name}</div>
-                      <div className="text-xs text-muted-foreground">{n.ip || "—"}</div>
+                      {/* The address lives only here, never on the public page. */}
+                      {n.ip ? (
+                        <button
+                          type="button"
+                          onClick={() => copy(n.ip!)}
+                          title="复制 IP"
+                          className="tnum group inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+                        >
+                          {n.ip}
+                          <Copy className="size-3 opacity-0 transition-opacity group-hover:opacity-100" />
+                        </button>
+                      ) : (
+                        <div className="text-xs text-muted-foreground">—</div>
+                      )}
                     </div>
                   </div>
                 </TableCell>
