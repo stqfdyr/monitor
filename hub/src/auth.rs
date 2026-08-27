@@ -162,10 +162,20 @@ pub async fn github_start(State(app): State<crate::Shared>) -> Response {
     with_cookies(Redirect::to(&url), [set_cookie(STATE_COOKIE, &state, 600, app.secure_cookies())])
 }
 
-#[derive(Deserialize)]
+/// Every field is optional on purpose. With required fields axum rejects a
+/// malformed callback before the handler runs, which returns a bare 400 and
+/// logs nothing — and GitHub reports a refusal by sending `error` with no
+/// `code` at all, so that shape is not even unusual.
+#[derive(Deserialize, Default)]
 pub struct Callback {
-    code: String,
-    state: String,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    error_description: Option<String>,
 }
 
 pub async fn github_callback(
@@ -173,11 +183,20 @@ pub async fn github_callback(
     headers: HeaderMap,
     Query(query): Query<Callback>,
 ) -> Response {
-    // Reject a callback the browser did not initiate.
-    if cookie_value(&headers, STATE_COOKIE).as_deref() != Some(query.state.as_str()) {
-        return sign_in_failed(&app, "state mismatch; start again from the sign-in page");
+    // GitHub reports a refusal in the query string rather than in the body.
+    if let Some(error) = &query.error {
+        let reason = query.error_description.as_deref().unwrap_or(error);
+        return sign_in_failed(&app, &format!("GitHub returned {error}: {reason}"));
     }
-    if let Err(e) = github_login(&app, &query.code).await {
+    // Reject a callback the browser did not initiate.
+    let state = query.state.as_deref().unwrap_or_default();
+    if state.is_empty() || cookie_value(&headers, STATE_COOKIE).as_deref() != Some(state) {
+        return sign_in_failed(&app, "state mismatch or missing; start again from the sign-in page");
+    }
+    let Some(code) = query.code.as_deref().filter(|c| !c.is_empty()) else {
+        return sign_in_failed(&app, "GitHub sent no authorization code");
+    };
+    if let Err(e) = github_login(&app, code).await {
         return sign_in_failed(&app, &e.to_string());
     }
     let session = match issue_session(&app) {
@@ -342,6 +361,28 @@ mod tests {
 
         t.clear(ip);
         assert!(!t.locked(ip));
+    }
+
+    /// A callback that cannot be parsed never reaches the handler, so it can
+    /// neither be logged nor explained. Every field must therefore be optional.
+    #[test]
+    fn every_callback_shape_deserializes_instead_of_being_rejected() {
+        let parse = |q: &str| serde_urlencoded::from_str::<Callback>(q);
+
+        let ok = parse("code=abc&state=xyz").expect("the happy path");
+        assert_eq!(ok.code.as_deref(), Some("abc"));
+        assert_eq!(ok.state.as_deref(), Some("xyz"));
+
+        // GitHub reports a refusal with no code at all.
+        let denied = parse("error=access_denied&error_description=the+user+said+no&state=xyz")
+            .expect("a refusal must parse, not 400");
+        assert_eq!(denied.error.as_deref(), Some("access_denied"));
+        assert_eq!(denied.error_description.as_deref(), Some("the user said no"));
+        assert!(denied.code.is_none());
+
+        // Truncated or empty callbacks must still land in the handler.
+        assert!(parse("state=xyz").is_ok());
+        assert!(parse("").is_ok());
     }
 
     #[test]

@@ -82,6 +82,14 @@ struct Assets;
 
 async fn serve_asset(uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
+    if is_api_path(path) {
+        // An unmatched API path is a bug or a misconfiguration, never a
+        // client-side route. Answering it with the SPA turns a wrong URL into a
+        // silent 200 and hides the mistake completely — a GitHub OAuth app
+        // pointed at the wrong callback path looked exactly like "nothing
+        // happened", with no error anywhere.
+        return (StatusCode::NOT_FOUND, format!("no such endpoint: /{path}")).into_response();
+    }
     let path = if path.is_empty() { "index.html" } else { path };
     if let Some(file) = Assets::get(path) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
@@ -99,6 +107,10 @@ async fn serve_asset(uri: Uri) -> Response {
         Some(index) => Html(index.data.into_owned()).into_response(),
         None => (StatusCode::NOT_FOUND, "frontend not built; run `npm run build` in web/").into_response(),
     }
+}
+
+fn is_api_path(path: &str) -> bool {
+    path == "api" || path.starts_with("api/")
 }
 
 /// The one-liner pasted onto a new VPS.
@@ -277,6 +289,23 @@ mod tests {
         let db = || Db::open(":memory:").unwrap();
         assert!(!App::new(db(), "http://127.0.0.1:8080".into()).secure_cookies());
         assert!(App::new(db(), "https://hub.example.com".into()).secure_cookies());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_api_path_is_a_404_not_the_single_page_app() {
+        let spa = |p: &str| serve_asset(p.parse::<Uri>().unwrap());
+
+        // The shape that hid a misconfigured OAuth callback for an entire
+        // debugging session.
+        assert_eq!(spa("/api/oauth_callback?code=x").await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(spa("/api/nope").await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(spa("/api").await.status(), StatusCode::NOT_FOUND);
+
+        // Client-side routes still fall through to the app.
+        assert_eq!(spa("/admin").await.status(), StatusCode::OK);
+        assert_eq!(spa("/").await.status(), StatusCode::OK);
+        // A path merely starting with the letters "api" is not an API path.
+        assert_eq!(spa("/apiary").await.status(), StatusCode::OK);
     }
 
     #[test]
