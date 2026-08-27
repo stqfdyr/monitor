@@ -45,23 +45,25 @@ function copy(text: string) {
   )
 }
 
-/// Every address a node has, each one click-to-copy: reading one off the
-/// screen to paste into an ssh command is the whole reason it is shown.
+/// Every address a node has, on one line, each click-to-copy: reading one off
+/// the screen to paste into an ssh command is the whole reason it is shown.
 function Addresses({ node }: { node: Node }) {
-  const shown = [node.ipv4, node.ipv6].filter(Boolean) as string[]
-  const list = shown.length ? shown : ([node.ip].filter(Boolean) as string[])
-  if (!list.length) return <div className="text-xs text-muted-foreground">—</div>
+  const reported = [node.ipv4, node.ipv6].filter(Boolean) as string[]
+  // `ip` is only where the agent's connection came from — the fallback for an
+  // agent too old to report its own interfaces.
+  const list = reported.length ? reported : ([node.ip].filter(Boolean) as string[])
+  if (!list.length) return <span className="text-sm text-muted-foreground">—</span>
   return (
-    <div className="flex flex-col items-start">
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5">
       {list.map((address) => (
         <button
           key={address}
           type="button"
           onClick={() => copy(address)}
           title="点击复制"
-          className="tnum group inline-flex max-w-full items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+          className="tnum group inline-flex items-center gap-1 text-sm hover:text-foreground"
         >
-          <span className="truncate">{address}</span>
+          {address}
           <Copy className="size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100" />
         </button>
       ))}
@@ -479,6 +481,7 @@ function Nodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
           <TableHeader>
             <TableRow>
               <TableHead>名称</TableHead>
+              <TableHead>IP</TableHead>
               <TableHead>状态</TableHead>
               <TableHead>本月 / 额度</TableHead>
               <TableHead>价格</TableHead>
@@ -524,14 +527,12 @@ function Nodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
                     >
                       <GripVertical className="size-4" />
                     </button>
-                    <div className="min-w-0">
-                      <div className="font-medium">{n.name}</div>
-                      {/* Addresses live only here, never on the public page.
-                          The agent reports its own; `ip` is just where its
-                          connection came from, and is the fallback. */}
-                      <Addresses node={n} />
-                    </div>
+                    <div className="min-w-0 font-medium">{n.name}</div>
                   </div>
+                </TableCell>
+                {/* Addresses live only here, never on the public page. */}
+                <TableCell>
+                  <Addresses node={n} />
                 </TableCell>
                 <TableCell>
                   <Badge variant={n.online ? "default" : "secondary"} className="font-normal">
@@ -567,7 +568,7 @@ function Nodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
             ))}
             {nodes.length === 0 && (
               <TableRow>
-                <TableCell colSpan={6} className="py-10 text-center text-sm text-muted-foreground">
+                <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
                   还没有节点，点右上角添加一个
                 </TableCell>
               </TableRow>
