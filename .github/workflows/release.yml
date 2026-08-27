@@ -1,0 +1,57 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # The hub embeds the built frontend, so it has to exist before cargo runs.
+      - run: npm ci && npm run build
+        working-directory: web
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - run: cargo install --locked cross
+      - run: cross build --release --locked --target ${{ matrix.target }}
+
+      - run: |
+          for bin in monitor-agent monitor-hub; do
+            cp "target/${{ matrix.target }}/release/$bin" "$bin-${{ matrix.target }}"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: monitor-*-${{ matrix.target }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: monitor-*
+          generate_release_notes: true

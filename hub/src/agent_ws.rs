@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, Query, State};
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
@@ -26,11 +26,6 @@ pub struct Live {
 }
 
 #[derive(Deserialize)]
-pub struct Auth {
-    token: String,
-}
-
-#[derive(Deserialize)]
 struct Rpc {
     method: String,
     #[serde(default)]
@@ -41,10 +36,12 @@ pub async fn handler(
     State(app): State<Shared>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
-    Query(auth): Query<Auth>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let Ok(Some(node_id)) = app.db.node_by_token(&sha256(&auth.token)) else {
+    let Some(token) = bearer(&headers) else {
+        return (StatusCode::UNAUTHORIZED, "missing token").into_response();
+    };
+    let Ok(Some(node_id)) = app.db.node_by_token(&sha256(token)) else {
         // Same response whether the token is malformed or simply unknown.
         return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
     };
@@ -60,6 +57,11 @@ pub async fn handler(
             debug!("node {node_id} disconnected: {e:#}");
         }
     })
+}
+
+/// Extracts the node token from `Authorization: Bearer <token>`.
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers.get("authorization")?.to_str().ok()?.strip_prefix("Bearer ").filter(|t| !t.is_empty())
 }
 
 async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> Result<()> {
@@ -252,6 +254,18 @@ mod tests {
         let records = app.db.ping_records(id, 0).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0]["latency"], 42);
+    }
+
+    #[test]
+    fn the_token_is_read_from_the_authorization_header_only() {
+        let mut h = HeaderMap::new();
+        assert_eq!(bearer(&h), None, "no header means no token");
+        h.insert("authorization", "Bearer abc123".parse().unwrap());
+        assert_eq!(bearer(&h), Some("abc123"));
+        h.insert("authorization", "abc123".parse().unwrap());
+        assert_eq!(bearer(&h), None, "a bare value is not a bearer token");
+        h.insert("authorization", "Bearer ".parse().unwrap());
+        assert_eq!(bearer(&h), None, "an empty token is not accepted");
     }
 
     #[test]

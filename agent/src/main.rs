@@ -9,6 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
@@ -54,8 +55,11 @@ fn parse_args() -> Result<Args> {
     Ok(Args { server, token, interval: interval.clamp(1, 3600), skip_ifaces })
 }
 
-/// `https://host/path` -> `wss://host/path/api/agent/ws?token=...`
-fn ws_url(server: &str, token: &str) -> Result<String> {
+/// `https://host/path` -> `wss://host/path/api/agent/ws`.
+///
+/// The token travels in an Authorization header rather than the query string,
+/// so it stays out of reverse-proxy access logs.
+fn ws_url(server: &str) -> Result<String> {
     let base = server.trim_end_matches('/');
     let base = match base.split_once("://") {
         Some(("https", rest)) => format!("wss://{rest}"),
@@ -66,7 +70,7 @@ fn ws_url(server: &str, token: &str) -> Result<String> {
     if base.starts_with("ws://") && !is_loopback(&base) {
         bail!("refusing plaintext ws:// to a remote hub; the token would travel in the clear");
     }
-    Ok(format!("{base}/api/agent/ws?token={token}"))
+    Ok(format!("{base}/api/agent/ws"))
 }
 
 fn is_loopback(url: &str) -> bool {
@@ -101,12 +105,12 @@ async fn main() -> Result<()> {
         .init();
 
     let args = parse_args()?;
-    let url = ws_url(&args.server, &args.token)?;
+    let url = ws_url(&args.server)?;
     let mut collector = Collector::new(args.skip_ifaces.clone());
     let mut backoff = 1u64;
 
     loop {
-        match session(&url, &mut collector, args.interval).await {
+        match session(&url, &args.token, &mut collector, args.interval).await {
             Ok(()) => backoff = 1,
             Err(e) => warn!("session ended: {e:#}"),
         }
@@ -116,8 +120,12 @@ async fn main() -> Result<()> {
 }
 
 /// One connection: say hello, then report until the socket dies.
-async fn session(url: &str, collector: &mut Collector, interval: u64) -> Result<()> {
-    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.context("connect")?;
+async fn session(url: &str, token: &str, collector: &mut Collector, interval: u64) -> Result<()> {
+    let mut request = url.into_client_request()?;
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().context("token is not header-safe")?);
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await.context("connect")?;
     info!("connected");
 
     ws.send(notify("hello", serde_json::to_value(collector.facts())?)).await?;
@@ -213,17 +221,13 @@ mod tests {
 
     #[test]
     fn ws_url_upgrades_scheme_and_refuses_plaintext_to_remote() {
-        assert_eq!(
-            ws_url("https://hub.example.com/", "t1").unwrap(),
-            "wss://hub.example.com/api/agent/ws?token=t1"
-        );
-        assert_eq!(
-            ws_url("http://127.0.0.1:8080", "t2").unwrap(),
-            "ws://127.0.0.1:8080/api/agent/ws?token=t2"
-        );
+        assert_eq!(ws_url("https://hub.example.com/").unwrap(), "wss://hub.example.com/api/agent/ws");
+        assert_eq!(ws_url("http://127.0.0.1:8080").unwrap(), "ws://127.0.0.1:8080/api/agent/ws");
         // Bare host defaults to TLS rather than silently leaking the token.
-        assert!(ws_url("hub.example.com", "t3").unwrap().starts_with("wss://"));
-        assert!(ws_url("http://hub.example.com", "t4").is_err());
+        assert!(ws_url("hub.example.com").unwrap().starts_with("wss://"));
+        assert!(ws_url("http://hub.example.com").is_err());
+        // No token anywhere in the URL: it rides in a header instead.
+        assert!(!ws_url("https://hub.example.com").unwrap().contains("token"));
     }
 
     #[tokio::test]
