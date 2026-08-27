@@ -54,7 +54,7 @@ function Addresses({ node }: { node: Node }) {
   const list = reported.length ? reported : ([node.ip].filter(Boolean) as string[])
   if (!list.length) return <span className="text-sm text-muted-foreground">—</span>
   return (
-    <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5">
+    <div className="flex flex-col items-start gap-y-0.5">
       {list.map((address) => (
         <button
           key={address}
