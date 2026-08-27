@@ -45,6 +45,30 @@ function copy(text: string) {
   )
 }
 
+/// Every address a node has, each one click-to-copy: reading one off the
+/// screen to paste into an ssh command is the whole reason it is shown.
+function Addresses({ node }: { node: Node }) {
+  const shown = [node.ipv4, node.ipv6].filter(Boolean) as string[]
+  const list = shown.length ? shown : ([node.ip].filter(Boolean) as string[])
+  if (!list.length) return <div className="text-xs text-muted-foreground">—</div>
+  return (
+    <div className="flex flex-col items-start">
+      {list.map((address) => (
+        <button
+          key={address}
+          type="button"
+          onClick={() => copy(address)}
+          title="点击复制"
+          className="tnum group inline-flex max-w-full items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+        >
+          <span className="truncate">{address}</span>
+          <Copy className="size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100" />
+        </button>
+      ))}
+    </div>
+  )
+}
+
 function Field({ label, hint, className = "", children }: { label: string; hint?: string; className?: string; children: React.ReactNode }) {
   return (
     <div className={`space-y-2 ${className}`}>
@@ -502,20 +526,10 @@ function Nodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
                     </button>
                     <div className="min-w-0">
                       <div className="font-medium">{n.name}</div>
-                      {/* The address lives only here, never on the public page. */}
-                      {n.ip ? (
-                        <button
-                          type="button"
-                          onClick={() => copy(n.ip!)}
-                          title="复制 IP"
-                          className="tnum group inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
-                        >
-                          {n.ip}
-                          <Copy className="size-3 opacity-0 transition-opacity group-hover:opacity-100" />
-                        </button>
-                      ) : (
-                        <div className="text-xs text-muted-foreground">—</div>
-                      )}
+                      {/* Addresses live only here, never on the public page.
+                          The agent reports its own; `ip` is just where its
+                          connection came from, and is the fallback. */}
+                      <Addresses node={n} />
                     </div>
                   </div>
                 </TableCell>

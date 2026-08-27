@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS node (
   cpu_cores INTEGER NOT NULL DEFAULT 0, mem_total INTEGER NOT NULL DEFAULT 0,
   swap_total INTEGER NOT NULL DEFAULT 0, disk_total INTEGER NOT NULL DEFAULT 0,
   agent_version TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '',
+  ipv4 TEXT NOT NULL DEFAULT '', ipv6 TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
 );
 
@@ -150,6 +151,12 @@ pub struct Node {
     pub agent_version: String,
     #[serde(default)]
     pub ip: String,
+    /// Reported by the agent from its own interfaces, unlike `ip`, which is
+    /// merely whichever address the agent's connection happened to come from.
+    #[serde(default)]
+    pub ipv4: String,
+    #[serde(default)]
+    pub ipv6: String,
 }
 
 fn yes() -> bool {
@@ -203,6 +210,9 @@ impl Db {
             "day_start TEXT NOT NULL DEFAULT ''",
         ] {
             let _ = conn.execute(&format!("ALTER TABLE traffic ADD COLUMN {column}"), []);
+        }
+        for column in ["ipv4 TEXT NOT NULL DEFAULT ''", "ipv6 TEXT NOT NULL DEFAULT ''"] {
+            let _ = conn.execute(&format!("ALTER TABLE node ADD COLUMN {column}"), []);
         }
         Ok(Self(Mutex::new(conn)))
     }
@@ -348,7 +358,7 @@ impl Db {
         self.conn().execute(
             "UPDATE node SET hostname=?2, os=?3, kernel=?4, arch=?5, virt=?6, cpu_name=?7,
                              cpu_cores=?8, mem_total=?9, swap_total=?10, disk_total=?11,
-                             agent_version=?12, ip=?13
+                             agent_version=?12, ip=?13, ipv4=?14, ipv6=?15
              WHERE id=?1",
             params![
                 id,
@@ -363,7 +373,9 @@ impl Db {
                 n("swap_total"),
                 n("disk_total"),
                 s("agent_version"),
-                ip
+                ip,
+                s("ipv4"),
+                s("ipv6")
             ],
         )?;
         Ok(())
@@ -710,6 +722,8 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         disk_total: n("disk_total"),
         agent_version: s("agent_version"),
         ip: s("ip"),
+        ipv4: s("ipv4"),
+        ipv6: s("ipv6"),
     }
 }
 

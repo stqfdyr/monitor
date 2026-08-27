@@ -54,6 +54,8 @@ export type Node = {
   /** Panel only. */
   hostname?: string
   ip?: string
+  ipv4?: string
+  ipv6?: string
   remark?: string
 }
 

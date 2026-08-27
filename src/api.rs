@@ -96,6 +96,8 @@ fn node_view(app: &App, node: &Node, full: bool) -> Value {
     if full {
         view["hostname"] = json!(node.hostname);
         view["ip"] = json!(node.ip);
+        view["ipv4"] = json!(node.ipv4);
+        view["ipv6"] = json!(node.ipv6);
         view["remark"] = json!(node.remark);
     }
     view
