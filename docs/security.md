@@ -119,6 +119,28 @@ if full {
 
 往 `node_view()` 里加字段，**默认放在 `full` 分支里**。只有确认这个字段公开出去无害，才放到公共部分。
 
+### 排查 GitHub 登录不通
+
+回调路径是 **`/api/auth/github/callback`**。OAuth App 里必须精确填这个。
+
+komari 用的是 `/api/oauth_callback`——从 komari 迁过来的人很容易照抄那个路径。抄错的表现极具迷惑性：GitHub 授权成功，浏览器回到站点看起来一切正常，但没登上，**且服务端没有任何日志**，因为那个路径压根没进任何 handler。
+
+（现在未匹配的 `/api/` 会返回 404 而不是 SPA，所以这个错误会立刻现形。见 `hub/src/main.rs` 的 `is_api_path()`。）
+
+其余失败都会记进 journal：
+
+```bash
+journalctl -u monitor-hub -f | grep sign-in
+```
+
+- `no allowed GitHub users configured` —— 白名单为空。**空 = 拒绝所有人**，不是放行所有人
+- `GitHub user X is not on the allowed list` —— 用户名不在白名单里
+- `GitHub returned access_denied: ...` —— 在 GitHub 页面上点了拒绝
+- `state mismatch or missing` —— 不是从登录页发起的，或 state cookie 过期（10 分钟）
+- `incorrect_client_credentials` —— client secret 不对
+
+同样的原因也会红字显示在登录页上（回调失败会带 `?login_error=` 跳回来）。
+
 ## 密钥不回读
 
 `GET /api/settings` 有一个白名单 `READABLE_SETTINGS`，`github_client_secret` 不在里面。面板可以**设置**它，但读不回来，只能拿到一个 `github_secret_set: true/false`。
