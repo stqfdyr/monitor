@@ -18,6 +18,7 @@ use axum::Json;
 use chrono::Utc;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use tracing::{info, warn};
 
 use crate::App;
 
@@ -190,6 +191,9 @@ pub async fn github_callback(
 /// failure is readable in the UI instead of being a bare plain-text 401 at a
 /// callback URL the user cannot navigate away from.
 fn sign_in_failed(app: &App, reason: &str) -> Response {
+    // A rejected sign-in must leave a server-side trace; the browser only ever
+    // sees the redirect, and without this the operator is debugging blind.
+    warn!("GitHub sign-in rejected: {reason}");
     let target = format!("/admin?login_error={}", urlencode(reason));
     with_cookies(Redirect::to(&target), [clear_state(app), String::new()])
 }
@@ -269,21 +273,26 @@ async fn github_login(app: &App, code: &str) -> Result<()> {
     struct GithubUser {
         login: String,
     }
-    let user: GithubUser = app
+    let response = app
         .http
         .get("https://api.github.com/user")
         .header(header::AUTHORIZATION, format!("Bearer {access}"))
         .header(header::USER_AGENT, "monitor-hub")
         .send()
         .await
-        .context("user request")?
-        .json()
-        .await
-        .context("user response")?;
+        .context("user request")?;
+    let status = response.status();
+    let body = response.text().await.context("user response")?;
+    // Decoding an error page into GithubUser would report a misleading
+    // "missing field login" instead of what GitHub actually said.
+    let user: GithubUser = serde_json::from_str(&body).with_context(|| {
+        format!("user response ({status}): {}", body.chars().take(200).collect::<String>())
+    })?;
 
     if !allowed.contains(&user.login.to_lowercase()) {
-        bail!("{} is not on the allowed list", user.login);
+        bail!("GitHub user {} is not on the allowed list {allowed:?}", user.login);
     }
+    info!("GitHub sign-in accepted for {}", user.login);
     Ok(())
 }
 
