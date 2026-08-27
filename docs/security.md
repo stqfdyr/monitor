@@ -77,7 +77,7 @@ if allowed.is_empty() {
 ## 节点 token
 
 - 256 位随机值，**数据库里只存 sha256**
-- 明文只在创建时返回一次（`POST /api/nodes` 的响应），之后无法找回
+- 添加节点时 token 不离开服务端；点击生成安装命令时才换发 token，明文只在该响应中返回
 - 可以重新生成（`POST /api/nodes/{id}/token`），旧的立刻失效
 - 走 `Authorization: Bearer` 头，不走 URL query——query 会进反代的 access log
 - 无效/缺失一律返回 401，不区分"格式不对"和"不存在"
@@ -111,9 +111,19 @@ if full {
 
 `full=false` 时这三个字段**根本不会写进 JSON**。不是设成空字符串，不是靠前端不显示——匿名请求拿到的 payload 里就没有这些 key。
 
+agent 上报里的 `boot_id`、`net_rx_total`、`net_tx_total` 同样只留给面板：前两个是机器标识，后两个是
+网卡的**整机历史**计数（面板上那个"总流量"是 hub 自己累加的，两者不是一回事）。公开页看到的是 hub 的
+累计值，不是这台机器一辈子跑了多少。
+
 守着这条的测试：`the_public_view_hides_private_nodes_and_sensitive_fields`。
 
 单节点的历史查询走 `readable()`，同样检查登录状态 + 节点公开标志 + 全局开关。测试：`per_node_reads_follow_the_public_flag_and_the_public_page_switch`。
+
+### `/agent/{arch}`
+
+公开路由，把 GitHub Release 的 agent 二进制转发给装不了的节点。`arch` 只认 `x86_64` 和 `aarch64`
+两个字面量，其余一律 404——URL 是拿 `release_repo` 设置拼出来的，没有任何一段来自请求，不存在
+拿它当跳板打内网的可能。转发的东西本来就是公开的 release 文件，不需要鉴权。
 
 ### 加新字段时的规矩
 

@@ -42,7 +42,7 @@ WebSocket 承载 **JSON-RPC 2.0 通知**（只有 `method` + `params`，没有 `
 
 ### agent → hub
 
-连上之后先发一次 `hello`，之后按 `--interval`（默认 2 秒）持续发 `report`。
+连上之后先发一次 `hello`，之后按 `--interval` 持续发 `report`；面板生成的安装命令默认 1 秒。
 
 | method | params | 何时发 |
 |---|---|---|
@@ -105,7 +105,18 @@ agent 收到后会**保留没变化的任务**（同 id + 同 target + 同 inter
 
 `src/main.rs` 的路由表是权威定义。
 
-**agent**：`GET /api/agent/ws`（Bearer token）、`GET /install.sh`（公开，不含密钥）
+**agent**：`GET /api/agent/ws`（Bearer token）、`GET /install.sh`（公开，不含密钥）、
+`GET /agent/{arch}`（公开，把 release 二进制从 GitHub 转发给节点）
+
+安装命令默认传 `--interval 1`，也可在 1..3600 内调整；另有 `--github-proxy URL`。
+
+二进制默认走 `<hub>/agent/<arch>`，由 hub 从 GitHub Release 取回再转发——能连上 hub 就能装，
+IPv6-only 或者出不去的机器不用再找加速站。`--github-proxy` 是 hub 自己拉不到 release 时的退路，
+它让节点直连 GitHub 代理，只拼到下载地址前，不代理 agent 与 hub 的 WebSocket。
+
+`install.sh` 认 systemd 和 OpenRC：前者写 unit（`DynamicUser` + `ProtectSystem` 等加固），
+后者写 `/etc/init.d/monitor-agent`，用 `supervise-daemon` 拿到等价的自动重启。两边 token 都只在
+root-only 的 `/etc/monitor/agent.env` 里。
 
 **读取**（登录了看全部，没登录且公开页开着只看公开节点）：
 `GET /api/me`、`GET /api/nodes`、`GET /api/nodes/{id}/metrics?hours=N`、`GET /api/ws`（每 2 秒推一次快照）
@@ -113,7 +124,7 @@ agent 收到后会**保留没变化的任务**（同 id + 同 target + 同 inter
 **登录**：`POST /api/auth/login`、`POST /api/auth/logout`、`GET /api/auth/github`、`GET /api/auth/github/callback`
 
 **面板**（全部要 `Admin` 提取器）：
-`POST /api/nodes`、`PUT|DELETE /api/nodes/{id}`、`POST /api/nodes/{id}/token`、`PUT /api/nodes/{id}/traffic`、`GET|POST /api/ping-tasks`、`DELETE /api/ping-tasks/{id}`、`GET|PUT /api/settings`、`GET /api/themes`
+`POST /api/nodes`、`PUT /api/nodes/order`、`PUT|DELETE /api/nodes/{id}`、`POST /api/nodes/{id}/token`、`PUT /api/nodes/{id}/traffic`、`GET|POST /api/ping-tasks`、`DELETE /api/ping-tasks/{id}`、`GET|PUT /api/settings`、`GET /api/themes`
 
 其余路径按下面顺序处理：
 

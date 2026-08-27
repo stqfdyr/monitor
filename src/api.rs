@@ -78,6 +78,16 @@ fn node_view(app: &App, node: &Node, full: bool) -> Value {
         "month_tx": traffic.month_tx,
         "month_start": traffic.month_start,
     });
+    // Raw kernel counters are a wire-protocol detail: the hub's accumulated
+    // figures above are the truth, and the raw ones expose a machine's whole
+    // lifetime traffic to anyone loading the public page.
+    if !full {
+        if let Some(m) = view["metrics"].as_object_mut() {
+            m.remove("boot_id");
+            m.remove("net_rx_total");
+            m.remove("net_tx_total");
+        }
+    }
     // Address and private notes never leave the panel.
     if full {
         view["hostname"] = json!(node.hostname);
@@ -174,16 +184,16 @@ pub async fn create_node(
     State(app): State<Shared>,
     body: Result<Json<Node>, JsonRejection>,
 ) -> Response {
-    let Ok(Json(node)) = body else { return bad("invalid node") };
+    let Ok(Json(mut node)) = body else { return bad("invalid node") };
     if node.name.trim().is_empty() {
         return bad("name is required");
     }
+    node.name = node.name.trim().to_owned();
     let token = random_token();
     match app.db.create_node(&node, &sha256(&token)) {
-        // The plaintext token is shown exactly once, here.
-        Ok(id) => {
-            Json(json!({"id": id, "token": token, "install": app.install_command(&token)})).into_response()
-        }
+        // Installation is a separate action, so the bootstrap token never
+        // leaves the server and is replaced when the user generates a command.
+        Ok(id) => Json(json!({"id": id})).into_response(),
         Err(e) => fail(e),
     }
 }
@@ -194,8 +204,34 @@ pub async fn update_node(
     Path(id): Path<i64>,
     body: Result<Json<Node>, JsonRejection>,
 ) -> Response {
-    let Ok(Json(node)) = body else { return bad("invalid node") };
+    let Ok(Json(mut node)) = body else { return bad("invalid node") };
+    if node.name.trim().is_empty() {
+        return bad("name is required");
+    }
+    node.name = node.name.trim().to_owned();
     match app.db.update_node(id, &node) {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct NodeOrder {
+    ids: Vec<i64>,
+}
+
+pub async fn reorder_nodes(_: Admin, State(app): State<Shared>, Json(order): Json<NodeOrder>) -> Response {
+    let mut existing = match app.db.nodes() {
+        Ok(nodes) => nodes.into_iter().map(|node| node.id).collect::<Vec<_>>(),
+        Err(e) => return fail(e),
+    };
+    let mut requested = order.ids.clone();
+    existing.sort_unstable();
+    requested.sort_unstable();
+    if requested != existing {
+        return bad("node order must include every node exactly once");
+    }
+    match app.db.reorder_nodes(&order.ids) {
         Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(e) => fail(e),
     }
@@ -216,6 +252,7 @@ pub async fn reset_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64
         return (StatusCode::NOT_FOUND, "no such node").into_response();
     }
     match app.db.reset_token(id, &sha256(&token)) {
+        // The plaintext token exists only inside this one-time command.
         Ok(()) => Json(json!({"token": token, "install": app.install_command(&token)})).into_response(),
         Err(e) => fail(e),
     }
@@ -357,11 +394,29 @@ mod tests {
     }
 
     #[test]
+    fn creating_a_node_only_requires_its_name() {
+        let node: Node = serde_json::from_value(json!({"name": "Tokyo"})).unwrap();
+        assert_eq!(node.name, "Tokyo");
+        assert!(node.public);
+        assert_eq!(node.billing_cycle, "monthly");
+        assert_eq!(node.traffic_reset_day, 1);
+    }
+
+    #[test]
     fn the_public_view_hides_private_nodes_and_sensitive_fields() {
         let app = app();
         let open = node(&app, "open", true);
         node(&app, "hidden", false);
         app.db.save_facts(open, &json!({"hostname": "vps-1"}), "198.51.100.9").unwrap();
+
+        // A live report, so the public view has metrics to strip.
+        app.live.write().unwrap().insert(
+            open,
+            crate::agent_ws::Live {
+                metrics: json!({"boot_id": "abc", "net_rx_total": 134_000_000_000i64, "cpu": 1.0}),
+                ..Default::default()
+            },
+        );
 
         let public = visible_nodes(&app, false).unwrap();
         assert_eq!(public.len(), 1, "a node marked private must not be listed");
@@ -369,6 +424,11 @@ mod tests {
         for hidden in ["ip", "remark", "hostname"] {
             assert!(public[0].get(hidden).is_none(), "{hidden} must not be public");
         }
+        // Raw kernel counters would hand out the machine's lifetime traffic.
+        for hidden in ["boot_id", "net_rx_total", "net_tx_total"] {
+            assert!(public[0]["metrics"].get(hidden).is_none(), "{hidden} must not be public");
+        }
+        assert_eq!(public[0]["metrics"]["cpu"], 1.0, "the rest of the report still goes out");
 
         let admin = visible_nodes(&app, true).unwrap();
         assert_eq!(admin.len(), 2);

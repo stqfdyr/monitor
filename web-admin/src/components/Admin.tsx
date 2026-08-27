@@ -1,11 +1,12 @@
-import { useEffect, useState } from "react"
-import { Copy, KeyRound, Palette, Pencil, Plus, Radio, Server, Settings, Trash2 } from "lucide-react"
+import { useEffect, useRef, useState } from "react"
+import { flushSync } from "react-dom"
+import { CalendarClock, Copy, Download, GripVertical, Palette, Pencil, Plus, Radio, Server, Settings, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
-import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
@@ -15,11 +16,26 @@ import { api, type Node, type PingTask } from "@/lib/api"
 import { bytes, CYCLES } from "@/lib/format"
 
 const GIB = 1024 ** 3
+/// Counters the panel can correct by hand, e.g. after a node moved to new
+/// hardware and the hub booked the new machine's lifetime traffic in one go.
+const TRAFFIC_FIELDS = [
+  ["total_rx", "累计下行"],
+  ["total_tx", "累计上行"],
+  ["month_rx", "本月下行"],
+  ["month_tx", "本月上行"],
+] as const
 const TRAFFIC_MODES: Record<string, string> = {
   sum: "上下行相加",
   max: "取较大值",
   up: "仅上行",
   down: "仅下行",
+}
+
+/// Reordering rides on the browser's own view transitions, so the rows that
+/// make way slide instead of jumping. Browsers without it just jump.
+function animate(update: () => void) {
+  if (document.startViewTransition) document.startViewTransition(() => flushSync(update))
+  else update()
 }
 
 function copy(text: string) {
@@ -29,64 +45,60 @@ function copy(text: string) {
   )
 }
 
-function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+function Field({ label, hint, className = "", children }: { label: string; hint?: string; className?: string; children: React.ReactNode }) {
   return (
-    <div className="space-y-1.5">
-      <Label className="text-xs">{label}</Label>
+    <div className={`space-y-2 ${className}`}>
+      <Label className="text-sm font-medium">{label}</Label>
       {children}
-      {hint && <p className="text-[11px] text-muted-foreground">{hint}</p>}
+      {hint && <p className="text-xs leading-relaxed text-muted-foreground">{hint}</p>}
     </div>
   )
 }
 
-const BLANK: Partial<Node> = {
-  name: "",
-  public: true,
-  sort: 0,
-  price: 0,
-  currency: "USD",
-  billing_cycle: "monthly",
-  expires_at: "",
-  remark: "",
-  traffic_limit: 0,
-  traffic_mode: "sum",
-  traffic_reset_day: 1,
+
+function ConfirmDialog({ title, description, confirmLabel, busy = false, onClose, onConfirm }: {
+  title: string
+  description: string
+  confirmLabel: string
+  busy?: boolean
+  onClose: () => void
+  onConfirm: () => void
+}) {
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+          <DialogDescription className="leading-relaxed">{description}</DialogDescription>
+        </DialogHeader>
+        <DialogFooter className="border-t pt-4">
+          <Button variant="ghost" onClick={onClose}>取消</Button>
+          <Button variant="destructive" onClick={onConfirm} disabled={busy}>{confirmLabel}</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
 }
 
-function NodeForm({ node, onClose, onSaved }: {
-  node: Partial<Node> | null
+function CreateNode({ onClose, onSaved }: {
   onClose: () => void
-  onSaved: (created?: { token: string; install: string }) => void
+  onSaved: () => void
 }) {
-  const [form, setForm] = useState<Partial<Node>>(node ?? BLANK)
-  const [limitGib, setLimitGib] = useState(String((node?.traffic_limit ?? 0) / GIB || ""))
+  const [name, setName] = useState("")
   const [saving, setSaving] = useState(false)
-  const set = <K extends keyof Node>(k: K, v: Node[K]) => setForm((f) => ({ ...f, [k]: v }))
 
-  async function save() {
-    if (!form.name?.trim()) return toast.error("请填写节点名称")
+  async function save(e: React.FormEvent) {
+    e.preventDefault()
+    if (!name.trim()) return toast.error("请填写节点名称")
     setSaving(true)
-    const body = {
-      ...form,
-      traffic_limit: Math.round((Number(limitGib) || 0) * GIB),
-      expires_at: form.expires_at || null,
-      price: Number(form.price) || 0,
-      sort: Number(form.sort) || 0,
-      traffic_reset_day: Math.min(31, Math.max(1, Number(form.traffic_reset_day) || 1)),
-    }
     try {
-      if (node?.id) {
-        await api(`/nodes/${node.id}`, { method: "PUT", body: JSON.stringify(body) })
-        toast.success("已保存")
-        onSaved()
-      } else {
-        const created = await api<{ token: string; install: string }>("/nodes", {
-          method: "POST",
-          body: JSON.stringify(body),
-        })
-        onSaved(created)
-      }
+      await api("/nodes", {
+        method: "POST",
+        body: JSON.stringify({ name: name.trim() }),
+      })
+      toast.success("节点已添加")
       onClose()
+      onSaved()
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
@@ -96,82 +108,131 @@ function NodeForm({ node, onClose, onSaved }: {
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-h-[92vh] overflow-y-auto sm:max-w-lg">
+      <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>{node?.id ? "编辑节点" : "添加节点"}</DialogTitle>
+          <DialogTitle>添加节点</DialogTitle>
         </DialogHeader>
-
-        <div className="grid gap-4 sm:grid-cols-2">
+        <form className="space-y-4" onSubmit={save}>
           <Field label="名称">
-            <Input value={form.name ?? ""} onChange={(e) => set("name", e.target.value)} placeholder="香港 · 甲商家" />
+            <Input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="香港 · 甲商家" />
           </Field>
-          <Field label="排序" hint="数字小的排在前面">
-            <Input type="number" value={form.sort ?? 0} onChange={(e) => set("sort", Number(e.target.value))} />
-          </Field>
+          <DialogFooter className="border-t pt-4">
+            <Button type="button" variant="ghost" onClick={onClose}>取消</Button>
+            <Button type="submit" disabled={saving}>添加</Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  )
+}
 
-          <Field label="价格">
-            <Input type="number" step="0.01" value={form.price ?? 0} onChange={(e) => set("price", Number(e.target.value))} />
-          </Field>
-          <Field label="货币">
-            <Select value={form.currency} onValueChange={(v) => set("currency", v)}>
-              <SelectTrigger><SelectValue /></SelectTrigger>
-              <SelectContent>
-                {["USD", "CNY", "EUR", "GBP", "JPY"].map((c) => (
-                  <SelectItem key={c} value={c}>{c}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </Field>
+function NodeForm({ node, onClose, onSaved }: {
+  node: Node
+  onClose: () => void
+  onSaved: () => void
+}) {
+  const [form, setForm] = useState(node)
+  const [limitGib, setLimitGib] = useState(String(node.traffic_limit / GIB || ""))
+  const [saving, setSaving] = useState(false)
+  const gib = (bytes: number) => String(Number((bytes / GIB).toFixed(3)))
+  const [traffic, setTraffic] = useState(() =>
+    Object.fromEntries(TRAFFIC_FIELDS.map(([k]) => [k, gib(node[k])])) as Record<string, string>,
+  )
+  // Compared as typed, not as bytes: rounding to GiB would otherwise look like
+  // an edit and zero out a node that has only moved a few MiB.
+  const pristine = useRef(traffic)
+  const set = <K extends keyof Node>(k: K, v: Node[K]) => setForm((f) => ({ ...f, [k]: v }))
 
-          <Field label="付款周期">
-            <Select value={form.billing_cycle} onValueChange={(v) => set("billing_cycle", v)}>
-              <SelectTrigger><SelectValue /></SelectTrigger>
-              <SelectContent>
-                {Object.entries(CYCLES).map(([k, v]) => (
-                  <SelectItem key={k} value={k}>{v}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </Field>
-          <Field label="到期时间">
-            <Input type="date" value={form.expires_at ?? ""} onChange={(e) => set("expires_at", e.target.value)} />
-          </Field>
+  async function save() {
+    if (!form.name.trim()) return toast.error("请填写节点名称")
+    setSaving(true)
+    try {
+      if (TRAFFIC_FIELDS.some(([k]) => traffic[k] !== pristine.current[k])) {
+        await api(`/nodes/${node.id}/traffic`, {
+          method: "PUT",
+          body: JSON.stringify(
+            Object.fromEntries(TRAFFIC_FIELDS.map(([k]) => [k, Math.round((Number(traffic[k]) || 0) * GIB)])),
+          ),
+        })
+      }
+      await api(`/nodes/${node.id}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          ...form,
+          name: form.name.trim(),
+          traffic_limit: Math.round((Number(limitGib) || 0) * GIB),
+          traffic_reset_day: Math.min(31, Math.max(1, Number(form.traffic_reset_day) || 1)),
+        }),
+      })
+      toast.success("节点设置已保存")
+      onClose()
+      onSaved()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setSaving(false)
+    }
+  }
 
-          <Field label="每月流量额度 (GiB)" hint="留空或 0 表示不限">
-            <Input type="number" value={limitGib} onChange={(e) => setLimitGib(e.target.value)} placeholder="1024" />
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="sm:max-w-xl">
+        <DialogHeader>
+          <DialogTitle>{node.name}</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-5">
+          <Field label="名称">
+            <Input value={form.name} onChange={(e) => set("name", e.target.value)} />
           </Field>
-          <Field label="流量计算方式">
-            <Select value={form.traffic_mode} onValueChange={(v) => set("traffic_mode", v)}>
-              <SelectTrigger><SelectValue /></SelectTrigger>
-              <SelectContent>
-                {Object.entries(TRAFFIC_MODES).map(([k, v]) => (
-                  <SelectItem key={k} value={k}>{v}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </Field>
-
-          <Field label="每月重置日" hint="商家的流量重置日，1–31">
-            <Input
-              type="number" min={1} max={31}
-              value={form.traffic_reset_day ?? 1}
-              onChange={(e) => set("traffic_reset_day", Number(e.target.value))}
-            />
-          </Field>
-          <div className="flex items-end pb-1.5">
-            <label className="flex cursor-pointer items-center gap-2 text-sm">
-              <Switch checked={form.public ?? true} onCheckedChange={(v) => set("public", v)} />
-              在公开页显示
-            </label>
-          </div>
-
-          <div className="sm:col-span-2">
-            <Field label="备注" hint="仅管理员可见，不会出现在公开页">
-              <Input value={form.remark ?? ""} onChange={(e) => set("remark", e.target.value)} />
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="每月流量额度 (GiB)" hint="留空或 0 表示不限">
+              <Input type="number" value={limitGib} onChange={(e) => setLimitGib(e.target.value)} placeholder="1024" />
+            </Field>
+            <Field label="流量计算方式">
+              <Select value={form.traffic_mode} onValueChange={(v) => set("traffic_mode", v)}>
+                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {Object.entries(TRAFFIC_MODES).map(([k, v]) => (
+                    <SelectItem key={k} value={k}>{v}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </Field>
           </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="每月重置日" hint="1–31。改了之后本月流量按新周期从头计，总流量不受影响">
+              <Input type="number" min={1} max={31} value={form.traffic_reset_day} onChange={(e) => set("traffic_reset_day", Number(e.target.value))} />
+            </Field>
+            <Field label="备注" hint="仅管理员可见">
+              <Input value={form.remark ?? ""} onChange={(e) => set("remark", e.target.value)} placeholder="商家、用途或其它说明" />
+            </Field>
+          </div>
+          <details className="rounded-lg border bg-muted/30 px-3 py-2.5">
+            <summary className="cursor-pointer text-sm font-medium">流量校正</summary>
+            <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+              换了机器或重装系统后，hub 会把新机器的历史计数当成一次增量记进来。这里按 GiB 改成正确的数字。
+            </p>
+            <div className="mt-3 grid gap-4 sm:grid-cols-2">
+              {TRAFFIC_FIELDS.map(([key, label]) => (
+                <Field key={key} label={`${label} (GiB)`}>
+                  <Input
+                    type="number"
+                    step="0.001"
+                    value={traffic[key]}
+                    onChange={(e) => setTraffic((t) => ({ ...t, [key]: e.target.value }))}
+                  />
+                </Field>
+              ))}
+            </div>
+          </details>
+          <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
+            <span>
+              <span className="block font-medium">公开显示</span>
+              <span className="mt-0.5 block text-xs text-muted-foreground">关闭后只在管理后台可见</span>
+            </span>
+            <Switch checked={form.public} onCheckedChange={(v) => set("public", v)} />
+          </label>
         </div>
-
         <DialogFooter>
           <Button variant="ghost" onClick={onClose}>取消</Button>
           <Button onClick={save} disabled={saving}>保存</Button>
@@ -181,20 +242,138 @@ function NodeForm({ node, onClose, onSaved }: {
   )
 }
 
-function InstallDialog({ install, onClose }: { install: string; onClose: () => void }) {
+function BillingForm({ node, onClose, onSaved }: {
+  node: Node
+  onClose: () => void
+  onSaved: () => void
+}) {
+  const [form, setForm] = useState(node)
+  const [saving, setSaving] = useState(false)
+  const set = <K extends keyof Node>(k: K, v: Node[K]) => setForm((f) => ({ ...f, [k]: v }))
+
+  async function save() {
+    setSaving(true)
+    try {
+      await api(`/nodes/${node.id}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          ...form,
+          price: Number(form.price) || 0,
+          expires_at: form.expires_at || null,
+        }),
+      })
+      toast.success("续费设置已保存")
+      onClose()
+      onSaved()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="sm:max-w-2xl">
+      <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>在目标 VPS 上执行</DialogTitle>
+          <DialogTitle>{node.name}</DialogTitle>
         </DialogHeader>
-        <pre className="overflow-x-auto rounded-md bg-muted p-3 text-xs leading-relaxed select-all">{install}</pre>
-        <p className="text-xs text-muted-foreground">
-          Token 只显示这一次。若丢失，可在节点列表重新生成 —— 重新生成会立刻让旧 token 失效。
-        </p>
+        <div className="space-y-5">
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="价格">
+              <Input type="number" min="0" step="0.01" value={form.price} onChange={(e) => set("price", Number(e.target.value))} />
+            </Field>
+            <Field label="货币">
+              <Select value={form.currency} onValueChange={(v) => set("currency", v)}>
+                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {["USD", "CNY", "EUR", "GBP", "JPY"].map((c) => (
+                    <SelectItem key={c} value={c}>{c}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </Field>
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="付款周期">
+              <Select value={form.billing_cycle} onValueChange={(v) => set("billing_cycle", v)}>
+                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {Object.entries(CYCLES).map(([k, v]) => (
+                    <SelectItem key={k} value={k}>{v}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </Field>
+            <Field label="到期时间">
+              <Input type="date" value={form.expires_at ?? ""} onChange={(e) => set("expires_at", e.target.value)} />
+            </Field>
+          </div>
+        </div>
         <DialogFooter>
-          <Button onClick={() => copy(install)}>
-            <Copy /> 复制命令
+          <Button variant="ghost" onClick={onClose}>取消</Button>
+          <Button onClick={save} disabled={saving}>保存</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function shellArg(value: string) {
+  return `'${value.replaceAll("'", `'"'"'`)}'`
+}
+
+type Install = { install: string }
+
+function InstallDialog({ node, onClose }: { node: Node; onClose: () => void }) {
+  const [details, setDetails] = useState<Install | null>(null)
+  const [interval, setInterval] = useState("1")
+  const [githubProxy, setGithubProxy] = useState("")
+
+  useEffect(() => {
+    let cancelled = false
+    api<Install>(`/nodes/${node.id}/token`, { method: "POST" })
+      .then((d) => {
+        if (!cancelled) setDetails(d)
+      })
+      .catch((e) => toast.error((e as Error).message))
+    return () => {
+      cancelled = true
+    }
+  }, [node.id])
+
+  const seconds = Math.min(3600, Math.max(1, Math.round(Number(interval) || 1)))
+  const args = ["--interval", String(seconds)]
+  const proxy = githubProxy.trim()
+  if (proxy) args.push("--github-proxy", shellArg(proxy.includes("://") ? proxy : `https://${proxy}`))
+  const command = details ? `${details.install} ${args.join(" ")}` : ""
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="sm:max-w-xl">
+        <DialogHeader>
+          <DialogTitle>{node.name}</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-5">
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="上报间隔（秒）" hint="1–3600，默认 1 秒">
+              <Input type="number" min={1} max={3600} value={interval} onChange={(e) => setInterval(e.target.value)} />
+            </Field>
+            <Field label="GitHub 代理" hint="仅代理 GitHub Release">
+              <Input value={githubProxy} onChange={(e) => setGithubProxy(e.target.value)} placeholder="https://ghfast.top" />
+            </Field>
+          </div>
+          <div className="space-y-2">
+            <Label className="text-sm font-medium">安装命令</Label>
+            <pre className="h-28 overflow-auto whitespace-pre-wrap break-all rounded-lg border bg-muted/40 p-3 text-xs leading-relaxed select-all">
+              {details ? command : "正在生成…"}
+            </pre>
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="ghost" onClick={onClose}>取消</Button>
+          <Button onClick={() => copy(command)} disabled={!details}>
+            <Copy className="size-4" /> 复制
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -203,34 +382,70 @@ function InstallDialog({ install, onClose }: { install: string; onClose: () => v
 }
 
 function Nodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
-  const [editing, setEditing] = useState<Partial<Node> | null>(null)
-  const [install, setInstall] = useState<string | null>(null)
+  const [creating, setCreating] = useState(false)
+  const [editing, setEditing] = useState<Node | null>(null)
+  const [billing, setBilling] = useState<Node | null>(null)
+  const [installing, setInstalling] = useState<Node | null>(null)
+  const [deleting, setDeleting] = useState<Node | null>(null)
+  const [removing, setRemoving] = useState(false)
+  const [manualOrder, setManualOrder] = useState<number[]>([])
+  const [dragging, setDragging] = useState<number | null>(null)
+  const orderBeforeDrag = useRef<number[]>([])
+  const byId = new Map(nodes.map((node) => [node.id, node]))
+  const orderedIds = new Set(manualOrder)
+  const order = [
+    ...manualOrder.map((id) => byId.get(id)).filter((node): node is Node => Boolean(node)),
+    ...nodes.filter((node) => !orderedIds.has(node.id)),
+  ]
 
-  async function remove(node: Node) {
-    if (!confirm(`删除节点「${node.name}」？历史数据和流量记录会一并删除，且无法恢复。`)) return
+  async function remove() {
+    if (!deleting) return
+    setRemoving(true)
     try {
-      await api(`/nodes/${node.id}`, { method: "DELETE" })
+      await api(`/nodes/${deleting.id}`, { method: "DELETE" })
       toast.success("已删除")
+      setDeleting(null)
       refresh()
     } catch (e) {
       toast.error((e as Error).message)
+    } finally {
+      setRemoving(false)
     }
   }
 
-  async function reissue(node: Node) {
-    if (!confirm(`为「${node.name}」重新生成 token？旧 token 会立即失效，该节点需要重装 agent。`)) return
-    try {
-      const { install } = await api<{ install: string }>(`/nodes/${node.id}/token`, { method: "POST" })
-      setInstall(install)
-    } catch (e) {
-      toast.error((e as Error).message)
-    }
+  /// Rows make way while the pointer is still down; the order is only saved
+  /// once it is dropped.
+  function move(from: number, to: number) {
+    if (from < 0 || to < 0 || to >= order.length || from === to) return
+    const next = [...order]
+    next.splice(to, 0, ...next.splice(from, 1))
+    const ids = next.map((node) => node.id)
+    animate(() => setManualOrder(ids))
+    return ids
+  }
+
+  /// Dropped outside the table, or cancelled with Escape: back where it was.
+  function cancel() {
+    setDragging(null)
+    const rollback = orderBeforeDrag.current
+    if (rollback.length) animate(() => setManualOrder(rollback))
+  }
+
+  function save(ids: number[]) {
+    setDragging(null)
+    const rollback = orderBeforeDrag.current
+    if (!rollback.length || ids.join() === rollback.join()) return
+    orderBeforeDrag.current = ids
+    api("/nodes/order", { method: "PUT", body: JSON.stringify({ ids }) }).then(refresh, (e: Error) => {
+      setManualOrder(rollback)
+      toast.error(e.message)
+    })
   }
 
   return (
     <div className="space-y-4">
       <div className="flex justify-end">
-        <Button onClick={() => setEditing(BLANK)}>
+        <Button onClick={() => setCreating(true)}>
           <Plus /> 添加节点
         </Button>
       </div>
@@ -248,11 +463,48 @@ function Nodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {nodes.map((n) => (
-              <TableRow key={n.id}>
+            {order.map((n, index) => (
+              <TableRow
+                key={n.id}
+                style={{ viewTransitionName: `node-${n.id}` }}
+                data-dragging={dragging === n.id || undefined}
+                className="transition-opacity data-[dragging]:opacity-40"
+                onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move" }}
+                onDragEnter={() => dragging !== null && move(order.findIndex((node) => node.id === dragging), index)}
+                onDrop={(e) => { e.preventDefault(); save(order.map((node) => node.id)) }}
+              >
                 <TableCell>
-                  <div className="font-medium">{n.name}</div>
-                  <div className="text-xs text-muted-foreground">{n.ip || "—"}</div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      draggable
+                      className="cursor-grab touch-none rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground active:cursor-grabbing"
+                      title="拖动排序"
+                      aria-label={`拖动 ${n.name} 排序`}
+                      onDragStart={(e) => {
+                        orderBeforeDrag.current = order.map((node) => node.id)
+                        setDragging(n.id)
+                        e.dataTransfer.effectAllowed = "move"
+                        // Firefox refuses to start a drag without payload.
+                        e.dataTransfer.setData("text/plain", String(n.id))
+                      }}
+                      onDragEnd={(e) => (e.dataTransfer.dropEffect === "none" ? cancel() : save(order.map((node) => node.id)))}
+                      onKeyDown={(e) => {
+                        const delta = e.key === "ArrowUp" ? -1 : e.key === "ArrowDown" ? 1 : 0
+                        if (!delta) return
+                        e.preventDefault()
+                        orderBeforeDrag.current = order.map((node) => node.id)
+                        const ids = move(index, index + delta)
+                        if (ids) save(ids)
+                      }}
+                    >
+                      <GripVertical className="size-4" />
+                    </button>
+                    <div>
+                      <div className="font-medium">{n.name}</div>
+                      <div className="text-xs text-muted-foreground">{n.ip || "—"}</div>
+                    </div>
+                  </div>
                 </TableCell>
                 <TableCell>
                   <Badge variant={n.online ? "default" : "secondary"} className="font-normal">
@@ -271,13 +523,16 @@ function Nodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
                 </TableCell>
                 <TableCell className="text-sm">{n.expires_at || "—"}</TableCell>
                 <TableCell className="text-right whitespace-nowrap">
-                  <Button variant="ghost" size="icon" onClick={() => reissue(n)} title="重新生成 token">
-                    <KeyRound />
+                  <Button variant="ghost" size="icon" onClick={() => setInstalling(n)} title="安装 Agent" aria-label="安装 Agent">
+                    <Download />
                   </Button>
-                  <Button variant="ghost" size="icon" onClick={() => setEditing(n)} title="编辑">
+                  <Button variant="ghost" size="icon" onClick={() => setEditing(n)} title="编辑节点" aria-label="编辑节点">
                     <Pencil />
                   </Button>
-                  <Button variant="ghost" size="icon" onClick={() => remove(n)} title="删除">
+                  <Button variant="ghost" size="icon" onClick={() => setBilling(n)} title="续费设置" aria-label="续费设置">
+                    <CalendarClock />
+                  </Button>
+                  <Button variant="ghost" size="icon" onClick={() => setDeleting(n)} title="删除节点" aria-label="删除节点">
                     <Trash2 className="text-destructive" />
                   </Button>
                 </TableCell>
@@ -294,17 +549,33 @@ function Nodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
         </Table>
       </Card>
 
+      {creating && (
+        <CreateNode
+          onClose={() => setCreating(false)}
+          onSaved={refresh}
+        />
+      )}
       {editing && (
         <NodeForm
           node={editing}
           onClose={() => setEditing(null)}
-          onSaved={(created) => {
-            refresh()
-            if (created) setInstall(created.install)
-          }}
+          onSaved={refresh}
         />
       )}
-      {install && <InstallDialog install={install} onClose={() => setInstall(null)} />}
+      {billing && (
+        <BillingForm node={billing} onClose={() => setBilling(null)} onSaved={refresh} />
+      )}
+      {installing && <InstallDialog node={installing} onClose={() => setInstalling(null)} />}
+      {deleting && (
+        <ConfirmDialog
+          title={`删除节点「${deleting.name}」？`}
+          description="历史指标、流量记录和节点凭证都会一并删除，且无法恢复。"
+          confirmLabel="删除节点"
+          busy={removing}
+          onClose={() => setDeleting(null)}
+          onConfirm={remove}
+        />
+      )}
     </div>
   )
 }
@@ -312,12 +583,17 @@ function Nodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
 function Ping({ nodes }: { nodes: Node[] }) {
   const [tasks, setTasks] = useState<PingTask[]>([])
   const [editing, setEditing] = useState<Partial<PingTask> | null>(null)
+  const [deleting, setDeleting] = useState<PingTask | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [removing, setRemoving] = useState(false)
 
   const load = () => api<{ tasks: PingTask[] }>("/ping-tasks").then((d) => setTasks(d.tasks)).catch(() => {})
   useEffect(() => { load() }, [])
 
   async function save() {
     if (!editing) return
+    if (!editing.name?.trim() || !editing.target?.trim()) return toast.error("请填写名称和目标")
+    setSaving(true)
     try {
       await api("/ping-tasks", { method: "POST", body: JSON.stringify(editing) })
       toast.success("已保存，正在下发到 agent")
@@ -325,13 +601,24 @@ function Ping({ nodes }: { nodes: Node[] }) {
       load()
     } catch (e) {
       toast.error((e as Error).message)
+    } finally {
+      setSaving(false)
     }
   }
 
-  async function remove(task: PingTask) {
-    if (!confirm(`删除监控「${task.name}」及其历史记录？`)) return
-    await api(`/ping-tasks/${task.id}`, { method: "DELETE" })
-    load()
+  async function remove() {
+    if (!deleting) return
+    setRemoving(true)
+    try {
+      await api(`/ping-tasks/${deleting.id}`, { method: "DELETE" })
+      toast.success("监控已删除")
+      setDeleting(null)
+      load()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setRemoving(false)
+    }
   }
 
   const toggle = (id: number) =>
@@ -368,8 +655,8 @@ function Ping({ nodes }: { nodes: Node[] }) {
                 <TableCell className="tnum text-sm">{t.interval}s</TableCell>
                 <TableCell className="text-sm text-muted-foreground">{t.nodes.length} 个</TableCell>
                 <TableCell className="text-right whitespace-nowrap">
-                  <Button variant="ghost" size="icon" onClick={() => setEditing(t)}><Pencil /></Button>
-                  <Button variant="ghost" size="icon" onClick={() => remove(t)}>
+                  <Button variant="ghost" size="icon" onClick={() => setEditing(t)} title="编辑监控" aria-label="编辑监控"><Pencil /></Button>
+                  <Button variant="ghost" size="icon" onClick={() => setDeleting(t)} title="删除监控" aria-label="删除监控">
                     <Trash2 className="text-destructive" />
                   </Button>
                 </TableCell>
@@ -388,41 +675,52 @@ function Ping({ nodes }: { nodes: Node[] }) {
 
       {editing && (
         <Dialog open onOpenChange={(open) => !open && setEditing(null)}>
-          <DialogContent className="max-h-[92vh] overflow-y-auto sm:max-w-lg">
+          <DialogContent className="sm:max-w-xl">
             <DialogHeader>
               <DialogTitle>{editing.id ? "编辑监控" : "添加监控"}</DialogTitle>
             </DialogHeader>
-            <Field label="名称">
-              <Input value={editing.name ?? ""} onChange={(e) => setEditing({ ...editing, name: e.target.value })} placeholder="Cloudflare" />
-            </Field>
-            <Field label="目标" hint="必须是 host:port，例如 1.1.1.1:443 或 www.google.com:80">
-              <Input value={editing.target ?? ""} onChange={(e) => setEditing({ ...editing, target: e.target.value })} placeholder="1.1.1.1:443" />
-            </Field>
-            <Field label="间隔（秒）" hint="5 到 3600">
-              <Input type="number" value={editing.interval ?? 60} onChange={(e) => setEditing({ ...editing, interval: Number(e.target.value) })} />
-            </Field>
-            <Field label="应用到节点">
-              <div className="max-h-48 space-y-1 overflow-y-auto rounded-md border p-2">
-                {nodes.map((n) => (
-                  <label key={n.id} className="flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 text-sm hover:bg-muted">
-                    <input
-                      type="checkbox"
-                      checked={editing.nodes?.includes(n.id) ?? false}
-                      onChange={() => toggle(n.id)}
-                      className="accent-primary"
-                    />
-                    {n.name}
-                  </label>
-                ))}
-                {nodes.length === 0 && <p className="p-2 text-xs text-muted-foreground">先添加节点</p>}
+            <div className="space-y-5">
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Field label="名称">
+                  <Input value={editing.name ?? ""} onChange={(e) => setEditing({ ...editing, name: e.target.value })} placeholder="Cloudflare" />
+                </Field>
+                <Field label="间隔（秒）" hint="5–3600">
+                  <Input type="number" min="5" max="3600" value={editing.interval ?? 60} onChange={(e) => setEditing({ ...editing, interval: Number(e.target.value) })} />
+                </Field>
               </div>
-            </Field>
+              <Field label="目标地址" hint="host:port">
+                <Input value={editing.target ?? ""} onChange={(e) => setEditing({ ...editing, target: e.target.value })} placeholder="1.1.1.1:443" />
+              </Field>
+              <div className="space-y-2">
+                <Label className="text-sm font-medium">运行节点</Label>
+                <div className="max-h-48 space-y-1 overflow-y-auto rounded-lg border bg-muted/20 p-2">
+                  {nodes.map((n) => (
+                    <label key={n.id} className="flex cursor-pointer items-center gap-2 rounded-md px-2.5 py-2 text-sm hover:bg-background">
+                      <input type="checkbox" checked={editing.nodes?.includes(n.id) ?? false} onChange={() => toggle(n.id)} className="accent-primary" />
+                      {n.name}
+                    </label>
+                  ))}
+                  {nodes.length === 0 && <p className="p-2 text-xs text-muted-foreground">先添加节点</p>}
+                </div>
+                <p className="text-xs text-muted-foreground">选择由哪些 Agent 执行</p>
+              </div>
+            </div>
             <DialogFooter>
               <Button variant="ghost" onClick={() => setEditing(null)}>取消</Button>
-              <Button onClick={save}>保存</Button>
+              <Button onClick={save} disabled={saving}>保存</Button>
             </DialogFooter>
           </DialogContent>
         </Dialog>
+      )}
+      {deleting && (
+        <ConfirmDialog
+          title={`删除监控「${deleting.name}」？`}
+          description="该监控及其历史延迟记录都会一并删除，且无法恢复。"
+          confirmLabel="删除监控"
+          busy={removing}
+          onClose={() => setDeleting(null)}
+          onConfirm={remove}
+        />
       )}
     </div>
   )

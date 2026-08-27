@@ -99,3 +99,19 @@
 
 /* Tabular figures keep live numbers from twitching as they update. */
 .tnum { font-variant-numeric: tabular-nums; }
+
+/* Reordering animates the rows themselves; the rest of the page just swaps. */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+}
+
+::view-transition-group(*) {
+  animation-duration: 150ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(*) {
+    animation: none;
+  }
+}

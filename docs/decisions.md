@@ -146,6 +146,48 @@ GitHub OAuth 就是两个 HTTP 请求。`oauth2` crate 带一堆用不上的 flo
 
 用不到的组件删掉了（dropdown-menu / progress / tooltip / sonner 的 wrapper）。
 
+### 节点接入分两步 **[用户]**
+
+首次添加只填名称，不立刻打断用户配置 Agent。需要部署时再点节点旁的下载按钮，调整 agent 已经支持且
+实际有用的参数：上报间隔（默认 1 秒），以及仅用于下载 GitHub Release 的代理。
+
+节点的展示/流量设置留在普通编辑里，价格、付款周期、到期日放在独立的「续费设置」里。
+
+**额外排除的网卡前缀已经删掉** **[用户]**：agent 内置的虚拟网卡前缀列表够用，多一个输入框、
+多一条 install.sh 分支、多一路 agent 参数，只为一个没人填的框。hub、install.sh、agent 三边一起删。
+
+### hub 自己转发 agent 二进制 **[用户]**
+
+`install.sh` 默认从 `<hub>/agent/<arch>` 下载，hub 去 GitHub Release 取回来再转发。起因是一台
+IPv6-only 的 Alpine 机器：github.com 没有 AAAA 记录，试过的三个加速站里只有一个能用（还要 10 秒），
+但它访问 hub 只要 0.6 秒——既然节点本来就得连上 hub 才有意义，就让 hub 顺手把二进制递过去。
+
+`--github-proxy` 保留，作为 hub 自己拉不到 release 时的退路。**否决**：hub 侧缓存二进制（安装是低频
+操作，1.6 MB 直接转发就够）、把二进制打进 hub（每次发 agent 都要重发 hub）。
+
+### install.sh 支持 OpenRC **[用户]**
+
+agent 本来就是 musl 静态二进制，Alpine 上跑得了，缺的只是 init 脚本。systemd 那套加固
+（`DynamicUser`、`ProtectSystem`）在 OpenRC 下没有对应物，用 `supervise-daemon` 拿到等价的自动重启。
+
+### 面板可以手改流量计数 **[用户]**
+
+`PUT /api/nodes/{id}/traffic` 一直都在，只是没有入口。节点换了机器，boot_id 变化会让 hub 把新机器的
+历史计数当成一次增量记进来（见 [traffic.md](traffic.md)），编辑弹窗里的「流量校正」就是给这种情况准备的。
+按 GiB 填写；没动过输入框就不发这个请求，免得四舍五入把几百 KB 抹成 0。
+
+### 到期日自动顺延 **[用户]**
+
+过期当天还在上报的节点，显然是续过费了，只是没人回来改日期。hub 每小时巡检一次：节点在线、
+到期日已过、付款周期不是「一次性」，就按周期整月往后推，一直推到今天之后（`src/main.rs` 的
+`renewed()`）。月末日期由 chrono 的 `checked_add_months` 收敛到下月最后一天，1 月 31 日续成 2 月 28 日。
+
+只动日期，不碰钱：仍然不做自动扣款，也不给离线节点顺延——节点掉线才是真到期的信号。
+**否决**：每个节点一个开关（还没人需要按节点关掉）、到期通知（用户明确砍掉了通知）。
+
+节点 token 仍然只存哈希。生成安装命令时会换 token，并立刻使旧 agent 失效；
+不为了复刻 Komari 的随时查看命令而降低这个安全边界。
+
 ### recharts **[用户]**
 
 打包后 774 kB（gzip 232 kB），大头是它。用户在"保留 / 换 uPlot / 自己写 SVG"里选了保留——理由是主流选择，且用户自己的原则是"不要自己造轮子"。带 hash 的资源设了 immutable 缓存头，只加载一次。

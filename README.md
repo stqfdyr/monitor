@@ -50,12 +50,16 @@ cargo build --release
 首次启动会打印一次性应急密码。用它登录 `/admin`，然后：
 
 1. **设置** 里配好 GitHub OAuth（回调填 `https://hub.example.com/api/auth/github/callback`）和允许登录的用户名，改掉应急密码
-2. **节点** 里添加一台机器，填价格、到期、每月流量额度和重置日
-3. 复制弹出的安装命令，粘到目标 VPS 上执行
+2. **节点** 里只填名称创建一台机器
+3. 点击节点旁的下载按钮，按需调整上报间隔或 GitHub 代理，再生成命令到目标 VPS 执行（systemd 或 OpenRC 都行；二进制由 hub 转发，节点不用够得着 GitHub）
+4. 拖动节点名称旁的手柄排序；展示/流量信息与续费设置分别编辑
+5. 续费设置里的到期日会自动顺延：过了期还在上报的节点，每小时巡检时按付款周期整月往后推
 
 ```bash
 curl -fsSL https://hub.example.com/install.sh | sh -s -- --server https://hub.example.com --token xxx
 ```
+
+GitHub 访问受限时可加 `--github-proxy https://ghfast.top`；它只用于下载 agent 的 Release 二进制。
 
 装完是一个 systemd 服务，token 存在 `/etc/monitor/agent.env`（0600，不进 journal）。
 
@@ -85,7 +89,7 @@ monitor-hub --listen 127.0.0.1:8080 --db /var/lib/monitor/monitor.db --site http
 
 - GitHub SSO 为主，本地 argon2 密码为辅——GitHub 挂了不至于把自己锁在外面
 - 密码登录按来源地址限流（15 分钟 5 次）
-- 节点 token 只存 sha256，明文只在创建时显示一次，可随时重新生成
+- 节点 token 只存 sha256，明文只进入一次性生成的安装命令，可随时重新生成
 - 公开状态页可按节点开关，且永远不会输出 IP、主机名和备注
 - OAuth 回调校验 state；session cookie 是 HttpOnly + SameSite=Lax + Secure
 

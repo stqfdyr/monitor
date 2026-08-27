@@ -16,11 +16,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Result;
-use axum::extract::State;
-use axum::http::header;
+use axum::extract::{Path, State};
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
+use chrono::{Months, NaiveDate, Utc};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -83,6 +84,31 @@ impl App {
 async fn install_script(State(app): State<Shared>) -> Response {
     let script = include_str!("../install.sh").replace("@@REPO@@", &app.repo());
     ([(header::CONTENT_TYPE, "text/x-shellscript")], script).into_response()
+}
+
+/// Hands out the agent binary from the hub itself. A node that can reach the
+/// hub can now install, even when it cannot reach GitHub at all: IPv6-only
+/// machines never resolve github.com, and neither do blocked networks.
+async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Response {
+    if !matches!(arch.as_str(), "x86_64" | "aarch64") {
+        return (StatusCode::NOT_FOUND, "unknown architecture").into_response();
+    }
+    let url = format!(
+        "https://github.com/{}/releases/latest/download/monitor-agent-{arch}-unknown-linux-musl",
+        app.repo()
+    );
+    // The default client timeout is tuned for API calls, not a 1.6 MB download.
+    let fetched = app.http.get(&url).timeout(std::time::Duration::from_secs(120)).send().await;
+    match fetched {
+        Ok(res) if res.status().is_success() => match res.bytes().await {
+            Ok(body) => ([(header::CONTENT_TYPE, "application/octet-stream")], body).into_response(),
+            Err(e) => (StatusCode::BAD_GATEWAY, format!("release download failed: {e}")).into_response(),
+        },
+        Ok(res) => {
+            (StatusCode::BAD_GATEWAY, format!("release download failed: {}", res.status())).into_response()
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("release download failed: {e}")).into_response(),
+    }
 }
 
 impl App {
@@ -161,6 +187,7 @@ async fn main() -> Result<()> {
         // Agents.
         .route("/api/agent/ws", get(agent_ws::handler))
         .route("/install.sh", get(install_script))
+        .route("/agent/{arch}", get(agent_binary))
         // Read paths; the public page reaches these unauthenticated.
         .route("/api/me", get(api::me))
         .route("/api/nodes", get(api::nodes))
@@ -173,6 +200,7 @@ async fn main() -> Result<()> {
         .route("/api/auth/github/callback", get(auth::github_callback))
         // Panel.
         .route("/api/nodes", post(api::create_node))
+        .route("/api/nodes/order", put(api::reorder_nodes))
         .route("/api/nodes/{id}", put(api::update_node).delete(api::delete_node))
         .route("/api/nodes/{id}/token", post(api::reset_token))
         .route("/api/nodes/{id}/traffic", put(api::patch_traffic))
@@ -239,7 +267,48 @@ fn first_run(app: &App) -> Result<()> {
     Ok(())
 }
 
-/// Expires sessions and trims history once an hour.
+/// Billing cycles as whole months. `once` has none, so it never rolls over.
+fn cycle_months(cycle: &str) -> Option<u32> {
+    Some(match cycle {
+        "monthly" => 1,
+        "quarterly" => 3,
+        "semiannual" => 6,
+        "yearly" => 12,
+        "biennial" => 24,
+        "triennial" => 36,
+        _ => return None,
+    })
+}
+
+/// A node still reporting after its expiry date was plainly renewed, so roll
+/// the date forward by whole cycles until it is in the future again.
+fn renewed(expires: NaiveDate, cycle: &str, today: NaiveDate) -> Option<NaiveDate> {
+    let months = Months::new(cycle_months(cycle)?);
+    let mut next = expires;
+    while next < today {
+        next = next.checked_add_months(months)?;
+    }
+    (next != expires).then_some(next)
+}
+
+fn renew_online_nodes(app: &App) -> Result<()> {
+    let today = Utc::now().date_naive();
+    let online: Vec<i64> = app.live.read().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
+    for node in app.db.nodes()? {
+        if !online.contains(&node.id) {
+            continue;
+        }
+        let Some(expires) = node.expires_at.as_deref().and_then(|d| d.parse::<NaiveDate>().ok()) else {
+            continue;
+        };
+        let Some(next) = renewed(expires, &node.billing_cycle, today) else { continue };
+        app.db.set_expiry(node.id, &next.to_string())?;
+        info!("node {} is still up past {expires}, expiry rolled to {next}", node.name);
+    }
+    Ok(())
+}
+
+/// Expires sessions, trims history and rolls over expiry dates once an hour.
 async fn housekeeping(app: Shared) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3_600));
     loop {
@@ -252,6 +321,9 @@ async fn housekeeping(app: Shared) {
         if let Err(e) = app.db.expire_sessions() {
             warn!("expiring sessions failed: {e:#}");
         }
+        if let Err(e) = renew_online_nodes(&app) {
+            warn!("rolling expiry dates failed: {e:#}");
+        }
     }
 }
 
@@ -262,6 +334,18 @@ mod tests {
 
     fn app(site: &str) -> App {
         App::new(Db::open(":memory:").unwrap(), site.into(), PathBuf::from("themes"))
+    }
+
+    #[test]
+    fn an_expired_node_that_is_still_up_rolls_forward_whole_cycles() {
+        let d = |s: &str| s.parse::<NaiveDate>().unwrap();
+        // One day past a monthly expiry: next natural month, clamped to its last day.
+        assert_eq!(renewed(d("2026-01-31"), "monthly", d("2026-02-01")), Some(d("2026-02-28")));
+        // Years overdue: keep adding cycles until the date is ahead of today.
+        assert_eq!(renewed(d("2024-03-10"), "yearly", d("2026-08-28")), Some(d("2027-03-10")));
+        // Not due yet, and one-off billing: left alone.
+        assert_eq!(renewed(d("2026-09-01"), "monthly", d("2026-08-28")), None);
+        assert_eq!(renewed(d("2020-01-01"), "once", d("2026-08-28")), None);
     }
 
     #[test]

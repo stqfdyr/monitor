@@ -3,6 +3,7 @@
 // ponytail: single global connection; move to a read pool if the dashboard ever
 // blocks behind ingest.
 
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 use anyhow::Result;
@@ -231,8 +232,7 @@ impl Db {
             .optional()?)
     }
 
-    /// Creates a node and returns its id. The caller keeps the plaintext token;
-    /// only its hash is ever stored.
+    /// Creates a node and returns its id. Only a token hash is stored.
     pub fn create_node(&self, n: &Node, token_hash: &str) -> Result<i64> {
         let conn = self.conn();
         conn.execute(
@@ -281,6 +281,31 @@ impl Db {
                 n.traffic_reset_day
             ],
         )?;
+        Ok(())
+    }
+
+    pub fn set_expiry(&self, id: i64, date: &str) -> Result<()> {
+        self.conn().execute("UPDATE node SET expires_at=?2 WHERE id=?1", params![id, date])?;
+        Ok(())
+    }
+
+    pub fn reorder_nodes(&self, ids: &[i64]) -> Result<()> {
+        let unique: HashSet<_> = ids.iter().collect();
+        if unique.len() != ids.len() {
+            anyhow::bail!("node order contains duplicates");
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let count: i64 = tx.query_row("SELECT COUNT(*) FROM node", [], |r| r.get(0))?;
+        if count as usize != ids.len() {
+            anyhow::bail!("node order must include every node");
+        }
+        for (sort, id) in ids.iter().enumerate() {
+            if tx.execute("UPDATE node SET sort=?2 WHERE id=?1", params![id, sort as i64])? != 1 {
+                anyhow::bail!("node order contains an unknown node");
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -763,6 +788,16 @@ mod tests {
         assert!(db.node(id).unwrap().is_none());
         assert_eq!(db.metrics(id, 0).unwrap().len(), 0);
         assert_eq!(db.traffic(id).total_rx, 0);
+    }
+
+    #[test]
+    fn nodes_can_be_reordered_atomically() {
+        let db = db();
+        let (a, b, c) = (node(&db, 1), node(&db, 1), node(&db, 1));
+        db.reorder_nodes(&[c, a, b]).unwrap();
+        assert_eq!(db.nodes().unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), vec![c, a, b]);
+        assert!(db.reorder_nodes(&[a, a, c]).is_err());
+        assert_eq!(db.nodes().unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), vec![c, a, b]);
     }
 
     #[test]
