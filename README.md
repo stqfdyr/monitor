@@ -1,103 +1,112 @@
 # monitor
 
-一个轻量的服务器探针的 **hub**：Rust 编写，前端 React + shadcn/ui，编译成单个二进制。
+轻量的服务器探针 hub。Rust + SQLite，编译为单个二进制。
 
-agent 在 [独立仓库](https://github.com/stqfdyr/agent)，内置默认主题也在
-[独立仓库](https://github.com/stqfdyr/monitor-theme-default)。
+节点状态、流量统计、TCP 延迟、续费成本，仅此四项。
 
-只做四件事：看状态、看流量、看延迟、算成本。没有通知、没有远程 SSH、没有插件系统。
+## 特性
 
-## 为什么不是 komari
+- 单二进制，零配置启动，全部设置存在 SQLite 里
+- 内存与磁盘口径对齐 `free(1)` / `df(1)`
+- 总流量跨 VPS 重启、hub 重启、agent 掉线持续累加
+- 在线节点过期后，到期日按付款周期自动顺延
+- 公开状态页可换主题，主题在运行时从磁盘加载
+- GitHub SSO 登录，本地应急密码作为备用入口
+- agent 静态链接单文件，支持 systemd 与 OpenRC
 
-三处数据口径上的差异：
+不做：通知、远程 SSH、插件系统、ICMP / HTTP 探测。
 
-| | komari / Scout | monitor |
-|---|---|---|
-| 内存 | `total - free`，把 page cache 算成已用 | `total - MemAvailable`，与 `free -h` 的 used 列一致 |
-| 硬盘 | `total - available`，把 ext4 的 5% 保留块算成已用 | `total - f_bfree`，与 `df` 完全一致 |
-| 总流量 | agent 上报网卡计数器，VPS 一重启就归零 | hub 侧累加，用 `boot_id` 识别重启，一直往上加 |
+## 组成
 
-另外多了一个「本月流量」：按商家的重置日单独计一份，用圆环显示还剩多少额度。这和总流量是两回事。
-
-## 架构
+| 仓库 | 说明 |
+|---|---|
+| [monitor](https://github.com/stqfdyr/monitor) | hub：后台、API、公开页宿主 |
+| [agent](https://github.com/stqfdyr/agent) | Linux agent |
+| [monitor-theme-default](https://github.com/stqfdyr/monitor-theme-default) | 内置默认主题 |
 
 ```
-agent (Linux)  ──WebSocket + JSON-RPC 2.0──▶  hub (axum + SQLite)  ──▶  后台 / 可换主题的状态页
-   读 /proc                Bearer token              单二进制 + SQLite
+agent (Linux)  ──WebSocket / JSON-RPC 2.0──▶  hub (axum + SQLite)  ──▶  后台 + 状态页
 ```
 
-- **[agent](https://github.com/stqfdyr/agent)** 只支持 Linux，直接读 `/proc` 和 `statvfs`，不依赖 sysinfo。静态链接后是一个几 MB 的单文件。
-- **hub** 零配置启动。后台和默认主题嵌进二进制；公开页也能从磁盘加载第三方主题。
-- **通信** WebSocket 承载 JSON-RPC 2.0 通知，token 走 `Authorization` 头（不进反代日志）。
+## 构建
 
-主题只负责公开状态页；登录和 `/admin/*` 后台固定内置，主题作者不需要重做节点管理与设置。
-
-## 跑起来
+需要 Rust stable 与 Node.js。
 
 ```bash
-# 后台
 cd web-admin && npm ci && npm run build && cd ..
-
-# 内置默认主题（开发时检出；release CI 会自动 clone）
 git clone https://github.com/stqfdyr/monitor-theme-default web-theme
 cd web-theme && npm ci && npm run build && cd ..
-
-# hub
 cargo build --release
-./target/release/monitor-hub --listen 0.0.0.0:8080 --site https://hub.example.com
 ```
 
-首次启动会打印一次性应急密码。用它登录 `/admin`，然后：
+后台与默认主题在编译期嵌入二进制。
 
-1. **设置** 里配好 GitHub OAuth（回调填 `https://hub.example.com/api/auth/github/callback`）和允许登录的用户名，改掉应急密码
-2. **节点** 里只填名称创建一台机器
-3. 点击节点旁的下载按钮，按需调整上报间隔或 GitHub 代理，再生成命令到目标 VPS 执行（systemd 或 OpenRC 都行；二进制由 hub 转发，节点不用够得着 GitHub）
-4. 拖动节点名称旁的手柄排序；展示/流量信息与续费设置分别编辑
-5. 续费设置里的到期日会自动顺延：过了期还在上报的节点，每小时巡检时按付款周期整月往后推
+## 运行
 
 ```bash
-curl -fsSL https://hub.example.com/install.sh | sh -s -- --server https://hub.example.com --token xxx
+monitor-hub --site https://monitor.example.com
 ```
 
-GitHub 访问受限时可加 `--github-proxy https://ghfast.top`；它只用于下载 agent 的 Release 二进制。
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--listen` | `0.0.0.0:8080` | 监听地址 |
+| `--db` | `monitor.db` | SQLite 路径 |
+| `--site` | 由 `--listen` 推导 | 对外地址，决定安装命令与 cookie 的 `Secure` 标志 |
+| `--themes` | 数据库同级 `themes/` | 外部主题目录 |
 
-装完是一个 systemd 服务，token 存在 `/etc/monitor/agent.env`（0600，不进 journal）。
+首次启动打印一次性应急密码，用它登录 `/admin`：
 
-`--site` 请在上了 TLS 之后设成 https 地址：它决定安装命令里的地址，也决定 session cookie 要不要带 `Secure`。
-
-主题默认放在数据库旁的 `themes/`，也可用 `--themes /path/to/themes` 指定。主题目录复制进去后，在后台「主题」页切换；选中的主题损坏或被删时自动回落到内置默认主题。
-
-### 放在反代或隧道后面
-
-nginx / Caddy / Cloudflare Tunnel 后面，**hub 只监听回环地址**，不要暴露到 `0.0.0.0`：
+1. **设置** 配置 GitHub OAuth（回调 `<site>/api/auth/github/callback`）与允许登录的用户名，修改应急密码
+2. **节点** 添加节点，点下载按钮生成安装命令，在目标主机执行
+3. 拖动手柄排序；展示与流量设置、续费设置分别编辑
 
 ```bash
-monitor-hub --listen 127.0.0.1:8080 --db /var/lib/monitor/monitor.db --site https://monitor.example.com
+curl -fsSL https://monitor.example.com/install.sh | sh -s -- \
+  --server https://monitor.example.com --token <token>
 ```
 
-`--listen` 是本机监听的地址，`--site` 是外面看到的地址，两者不是一回事。反代那边要注意：
+agent 二进制由 hub 转发，节点无需直连 GitHub。hub 自身无法访问 GitHub 时，可给安装命令加
+`--github-proxy https://ghfast.top`，由节点直连镜像下载。
 
-- **两个 WebSocket 端点**：`/api/agent/ws`（agent）和 `/api/ws`（面板实时刷新），都要转发 `Upgrade` / `Connection` 头，关掉 proxy buffering，并把读写超时调到远大于 60 秒
-- **不要限制 HTTP 方法**：面板要用 POST / PUT / DELETE
-- **要透传客户端 IP**：`X-Forwarded-For`。不透传的话所有请求在 hub 看来都来自反代，登录失败限流会把所有人一起锁掉
+## 反向代理
 
-## 延迟监控
+置于反向代理之后时，用 `--listen 127.0.0.1:8080` 限制监听，并注意：
 
-只有 TCP ping（砍掉了 ICMP 和 HTTP）。在 **延迟监控** 里加一个目标 `host:port`，勾选要跑的节点，改动会立刻下发到在线 agent，不用等重连。
+- 转发 `/api/agent/ws` 与 `/api/ws` 的 `Upgrade` / `Connection` 头，关闭缓冲，读写超时设为远大于 60 秒
+- 放行 `POST` / `PUT` / `DELETE`
+- 透传 `X-Forwarded-For`，否则登录限流会按代理地址计数
+- `--site` 填写对外地址，与 `--listen` 无关
+
+## 主题
+
+主题目录复制到 `--themes` 指向的位置后，在后台「主题」页切换，无需重启。选中的主题缺失或损坏时回落到内置默认主题。主题包格式见
+[monitor-theme-default](https://github.com/stqfdyr/monitor-theme-default)。
 
 ## 安全
 
-- GitHub SSO 为主，本地 argon2 密码为辅——GitHub 挂了不至于把自己锁在外面
-- 密码登录按来源地址限流（15 分钟 5 次）
-- 节点 token 只存 sha256，明文只进入一次性生成的安装命令，可随时重新生成
-- 公开状态页可按节点开关，且永远不会输出 IP、主机名和备注
-- OAuth 回调校验 state；session cookie 是 HttpOnly + SameSite=Lax + Secure
+- 节点 token 只存 sha256，明文仅出现在一次性生成的安装命令中，可随时重置
+- 密码登录按来源地址限流，15 分钟 5 次
+- 公开状态页按节点开关，且不输出 IP、主机名与备注
+- OAuth 回调校验 state；session cookie 为 HttpOnly + SameSite=Lax + Secure
+
+详见 [docs/security.md](docs/security.md)。
+
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | 路由表、协议、数据表 |
+| [docs/traffic.md](docs/traffic.md) | 流量累加与周期重置 |
+| [docs/security.md](docs/security.md) | 鉴权、API 边界、公开页 |
+| [docs/decisions.md](docs/decisions.md) | 技术选型与被否决的方案 |
+| [docs/development.md](docs/development.md) | 开发流程 |
 
 ## 开发
 
 ```bash
 cargo test
-cd web-admin && npm run dev     # 后台热更新，API 代理到 127.0.0.1:9911
+cargo clippy --all-targets
+cd web-admin && npm run dev
 ```
 
 ## 许可
