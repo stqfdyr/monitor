@@ -67,6 +67,16 @@ if month_start != period {
 
 测试：`month_counter_restarts_but_total_keeps_climbing`。
 
+### 4. 今日计数器同理，但按本地时区跨天
+
+`day_rx` / `day_tx` 和月度计数器结构一样，只是比较的是日期：`day_start != 今天` 就从这次上报的增量重新开始。
+
+跨天用的是 **hub 所在机器的本地时区**，不是 UTC——"今天"是给人看的词，UTC+8 的用户在早上八点看到计数归零会莫名其妙。月度周期仍然走 UTC，改它会让所有节点的 `month_start` 变一次，白白触发一轮月度重置。
+
+历史明细里没有累计量，所以这个计数器上线当天只能从上线那一刻开始算，补不出当天早些时候的量。
+
+测试：`day_counter_restarts_at_midnight_without_touching_the_others`。
+
 ## 月度周期
 
 每个节点有自己的 `traffic_reset_day`（1–31，商家的流量重置日）。`db::period_start(today, reset_day)` 算出当前周期的起始日期：

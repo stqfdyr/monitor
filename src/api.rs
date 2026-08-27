@@ -77,6 +77,10 @@ fn node_view(app: &App, node: &Node, full: bool) -> Value {
         "month_rx": traffic.month_rx,
         "month_tx": traffic.month_tx,
         "month_start": traffic.month_start,
+        // Same nature as the month and lifetime figures next to it, which the
+        // public page already shows, so this one is public too.
+        "day_rx": traffic.day_rx,
+        "day_tx": traffic.day_tx,
     });
     // Raw kernel counters are a wire-protocol detail: the hub's accumulated
     // figures above are the truth, and the raw ones expose a machine's whole

@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 
 use anyhow::Result;
-use chrono::{Datelike, NaiveDate, Utc};
+use chrono::{Datelike, Local, NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -57,7 +57,10 @@ CREATE TABLE IF NOT EXISTS traffic (
   total_tx INTEGER NOT NULL DEFAULT 0,
   month_rx INTEGER NOT NULL DEFAULT 0,
   month_tx INTEGER NOT NULL DEFAULT 0,
-  month_start TEXT NOT NULL DEFAULT ''
+  month_start TEXT NOT NULL DEFAULT '',
+  day_rx INTEGER NOT NULL DEFAULT 0,
+  day_tx INTEGER NOT NULL DEFAULT 0,
+  day_start TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS metric (
@@ -172,6 +175,8 @@ pub struct Traffic {
     pub month_rx: i64,
     pub month_tx: i64,
     pub month_start: String,
+    pub day_rx: i64,
+    pub day_tx: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -190,6 +195,15 @@ impl Db {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
+        // SQLite has no ADD COLUMN IF NOT EXISTS, and an existing column is
+        // exactly the case where this migration has nothing left to do.
+        for column in [
+            "day_rx INTEGER NOT NULL DEFAULT 0",
+            "day_tx INTEGER NOT NULL DEFAULT 0",
+            "day_start TEXT NOT NULL DEFAULT ''",
+        ] {
+            let _ = conn.execute(&format!("ALTER TABLE traffic ADD COLUMN {column}"), []);
+        }
         Ok(Self(Mutex::new(conn)))
     }
 
@@ -360,7 +374,8 @@ impl Db {
     pub fn traffic(&self, node_id: i64) -> Traffic {
         self.conn()
             .query_row(
-                "SELECT total_rx, total_tx, month_rx, month_tx, month_start FROM traffic WHERE node_id=?1",
+                "SELECT total_rx, total_tx, month_rx, month_tx, month_start, day_rx, day_tx
+                     FROM traffic WHERE node_id=?1",
                 [node_id],
                 |r| {
                     Ok(Traffic {
@@ -369,6 +384,8 @@ impl Db {
                         month_rx: r.get(2)?,
                         month_tx: r.get(3)?,
                         month_start: r.get(4)?,
+                        day_rx: r.get(5)?,
+                        day_tx: r.get(6)?,
                     })
                 },
             )
@@ -399,8 +416,12 @@ impl Db {
             mut month_rx,
             mut month_tx,
             month_start,
+            mut day_rx,
+            mut day_tx,
+            day_start,
         ) = conn.query_row(
-            "SELECT boot_id, last_rx, last_tx, total_rx, total_tx, month_rx, month_tx, month_start
+            "SELECT boot_id, last_rx, last_tx, total_rx, total_tx, month_rx, month_tx, month_start,
+                    day_rx, day_tx, day_start
                  FROM traffic WHERE node_id=?1",
             [node_id],
             |r| {
@@ -413,6 +434,9 @@ impl Db {
                     r.get::<_, i64>(5)?,
                     r.get::<_, i64>(6)?,
                     r.get::<_, String>(7)?,
+                    r.get::<_, i64>(8)?,
+                    r.get::<_, i64>(9)?,
+                    r.get::<_, String>(10)?,
                 ))
             },
         )?;
@@ -426,6 +450,8 @@ impl Db {
         total_tx += d_tx;
         month_rx += d_rx;
         month_tx += d_tx;
+        day_rx += d_rx;
+        day_tx += d_tx;
 
         let period = period_start(Utc::now().date_naive(), reset_day).to_string();
         if month_start != period {
@@ -433,13 +459,24 @@ impl Db {
             month_rx = d_rx;
             month_tx = d_tx;
         }
+        // "Today" is a human word, so it follows the hub's own timezone rather
+        // than UTC, which would roll over mid-morning for anyone east of it.
+        let today = Local::now().date_naive().to_string();
+        if day_start != today {
+            day_rx = d_rx;
+            day_tx = d_tx;
+        }
 
         conn.execute(
             "UPDATE traffic SET boot_id=?2, last_rx=?3, last_tx=?4, total_rx=?5, total_tx=?6,
-                                month_rx=?7, month_tx=?8, month_start=?9 WHERE node_id=?1",
-            params![node_id, boot_id, rx, tx, total_rx, total_tx, month_rx, month_tx, period],
+                                month_rx=?7, month_tx=?8, month_start=?9, day_rx=?10, day_tx=?11,
+                                day_start=?12 WHERE node_id=?1",
+            params![
+                node_id, boot_id, rx, tx, total_rx, total_tx, month_rx, month_tx, period, day_rx, day_tx,
+                today
+            ],
         )?;
-        Ok(Traffic { total_rx, total_tx, month_rx, month_tx, month_start: period })
+        Ok(Traffic { total_rx, total_tx, month_rx, month_tx, month_start: period, day_rx, day_tx })
     }
 
     /// Lets the panel correct a total, e.g. after moving a node to new hardware.
@@ -759,6 +796,22 @@ mod tests {
         db.conn().execute("UPDATE traffic SET month_start='1999-01-01' WHERE node_id=?1", [id]).unwrap();
         let t = db.accumulate(id, "boot-a", 9_500, 9_500, 1).unwrap();
         assert_eq!(t.month_rx, 1_500, "new period counts only this report's delta");
+        assert_eq!(t.total_rx, 9_500, "lifetime total is untouched by the rollover");
+    }
+
+    #[test]
+    fn day_counter_restarts_at_midnight_without_touching_the_others() {
+        let db = db();
+        let id = node(&db, 1);
+        db.accumulate(id, "boot-a", 0, 0, 1).unwrap();
+        let t = db.accumulate(id, "boot-a", 8_000, 4_000, 1).unwrap();
+        assert_eq!((t.day_rx, t.day_tx), (8_000, 4_000));
+
+        // Force yesterday's date, as it would look after midnight passed.
+        db.conn().execute("UPDATE traffic SET day_start='1999-01-01' WHERE node_id=?1", [id]).unwrap();
+        let t = db.accumulate(id, "boot-a", 9_500, 4_600, 1).unwrap();
+        assert_eq!((t.day_rx, t.day_tx), (1_500, 600), "a new day counts only this report's delta");
+        assert_eq!(t.month_rx, 9_500, "the month is not a day");
         assert_eq!(t.total_rx, 9_500, "lifetime total is untouched by the rollover");
     }
 
