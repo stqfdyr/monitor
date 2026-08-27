@@ -165,8 +165,8 @@ async fn main() -> Result<()> {
     let args = parse_args()?;
     let app = Arc::new(App::new(Db::open(&args.database)?, args.site.clone()));
     first_run(&app)?;
-    if app.secure_cookies() && args.site.starts_with("http://") {
-        warn!("--site is plain HTTP; sessions and agent tokens will travel in the clear");
+    if exposed_over_plain_http(&args.site) {
+        warn!("--site is plain HTTP on a remote host; sessions and agent tokens will travel in the clear");
     }
 
     tokio::spawn(housekeeping(app.clone()));
@@ -206,6 +206,32 @@ async fn main() -> Result<()> {
         })
         .await?;
     Ok(())
+}
+
+/// True when `--site` would send cookies and tokens over the wire in the clear.
+/// Plain HTTP to a loopback address is just local development; plain HTTP to
+/// anything else means the session cookie is readable by every hop in between.
+///
+/// A hub behind a TLS-terminating proxy or a Cloudflare tunnel is *not* this
+/// case: there `--site` is the https:// address, even though the listener
+/// itself speaks plain HTTP on loopback.
+fn exposed_over_plain_http(site: &str) -> bool {
+    let Some(rest) = site.strip_prefix("http://") else {
+        return false;
+    };
+    !host_is_loopback(rest)
+}
+
+/// Loopback test over an `authority` like `example.com:8080` or `[::1]:8080`.
+/// IPv6 literals are bracketed, so the port cannot simply be split off at the
+/// first colon.
+fn host_is_loopback(authority: &str) -> bool {
+    let authority = authority.split('/').next().unwrap_or("");
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
+    };
+    host.is_empty() || host == "localhost" || host == "::1" || host.starts_with("127.")
 }
 
 /// Prints a one-time admin password the first time the database is created.
@@ -251,6 +277,19 @@ mod tests {
         let db = || Db::open(":memory:").unwrap();
         assert!(!App::new(db(), "http://127.0.0.1:8080".into()).secure_cookies());
         assert!(App::new(db(), "https://hub.example.com".into()).secure_cookies());
+    }
+
+    #[test]
+    fn plain_http_warning_fires_for_remote_hosts_only() {
+        // Local development: no warning.
+        assert!(!exposed_over_plain_http("http://127.0.0.1:8080"));
+        assert!(!exposed_over_plain_http("http://localhost:8080"));
+        assert!(!exposed_over_plain_http("http://[::1]:8080"));
+        // Behind TLS, including a tunnel that forwards to a loopback listener.
+        assert!(!exposed_over_plain_http("https://m.example.com"));
+        // Genuinely in the clear over the network.
+        assert!(exposed_over_plain_http("http://203.0.113.10:8080"));
+        assert!(exposed_over_plain_http("http://hub.example.com"));
     }
 
     #[test]

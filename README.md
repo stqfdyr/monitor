@@ -52,6 +52,20 @@ curl -fsSL https://hub.example.com/install.sh | sh -s -- --server https://hub.ex
 
 `--site` 请在上了 TLS 之后设成 https 地址：它决定安装命令里的地址，也决定 session cookie 要不要带 `Secure`。
 
+### 放在反代或隧道后面
+
+nginx / Caddy / Cloudflare Tunnel 后面，**hub 只监听回环地址**，不要暴露到 `0.0.0.0`：
+
+```bash
+monitor-hub --listen 127.0.0.1:25775 --db /var/lib/monitor/monitor.db --site https://m.example.com
+```
+
+`--listen` 是本机监听的地址，`--site` 是外面看到的地址，两者不是一回事。反代那边要注意：
+
+- **两个 WebSocket 端点**：`/api/agent/ws`（agent）和 `/api/ws`（面板实时刷新），都要转发 `Upgrade` / `Connection` 头，关掉 proxy buffering，并把读写超时调到远大于 60 秒
+- **不要限制 HTTP 方法**：面板要用 POST / PUT / DELETE
+- **要透传客户端 IP**：`X-Forwarded-For`。不透传的话所有请求在 hub 看来都来自反代，登录失败限流会把所有人一起锁掉
+
 ## 延迟监控
 
 只有 TCP ping（砍掉了 ICMP 和 HTTP）。在 **延迟监控** 里加一个目标 `host:port`，勾选要跑的节点，改动会立刻下发到在线 agent，不用等重连。

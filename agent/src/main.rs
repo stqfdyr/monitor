@@ -73,9 +73,15 @@ fn ws_url(server: &str) -> Result<String> {
     Ok(format!("{base}/api/agent/ws"))
 }
 
+/// IPv6 literals are bracketed, so the port cannot simply be split off at the
+/// first colon.
 fn is_loopback(url: &str) -> bool {
-    let host = url.split("://").nth(1).unwrap_or("").split(['/', ':']).next().unwrap_or("");
-    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") || host.starts_with("127.")
+    let authority = url.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("");
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
+    };
+    host == "localhost" || host == "::1" || host.starts_with("127.")
 }
 
 #[derive(Deserialize)]
@@ -227,6 +233,8 @@ mod tests {
         // Bare host defaults to TLS rather than silently leaking the token.
         assert!(ws_url("hub.example.com").unwrap().starts_with("wss://"));
         assert!(ws_url("http://hub.example.com").is_err());
+        // Bracketed IPv6 loopback must be recognised, not treated as remote.
+        assert_eq!(ws_url("http://[::1]:8080").unwrap(), "ws://[::1]:8080/api/agent/ws");
         // No token anywhere in the URL: it rides in a header instead.
         assert!(!ws_url("https://hub.example.com").unwrap().contains("token"));
     }
