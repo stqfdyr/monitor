@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react"
-import { LayoutDashboard, LogOut, Moon, Sun } from "lucide-react"
+import { LayoutDashboard, LogOut, Moon, Sun, Wrench } from "lucide-react"
 import { Toaster } from "sonner"
 
 import { Admin } from "@/components/Admin"
@@ -14,18 +14,29 @@ import { api, useNodes, type Node, type PingTask } from "@/lib/api"
 type Me = { authed: boolean; github: boolean; site_name: string; public_page: boolean }
 
 /** Two routes and a login screen do not need a router. */
+/// `/admin` on its own is not a page; normalise it to the first section so a
+/// bookmark, an OAuth redirect and the nav all land somewhere real.
+function normalise(p: string) {
+  return p === "/admin" || p === "/admin/" ? "/admin/nodes" : p.replace(/\/$/, "") || "/"
+}
+
 function usePath() {
-  const [path, setPath] = useState(location.pathname)
+  const [path, setPath] = useState(() => {
+    const start = normalise(location.pathname)
+    if (start !== location.pathname) history.replaceState({}, "", start + location.search)
+    return start
+  })
   useEffect(() => {
-    const sync = () => setPath(location.pathname)
+    const sync = () => setPath(normalise(location.pathname))
     addEventListener("popstate", sync)
     return () => removeEventListener("popstate", sync)
   }, [])
   return [
     path,
     useCallback((next: string) => {
-      history.pushState({}, "", next)
-      setPath(next)
+      const to = normalise(next)
+      history.pushState({}, "", to)
+      setPath(to)
     }, []),
   ] as const
 }
@@ -61,17 +72,17 @@ export default function App() {
 
   if (!me) return <div className="grid min-h-svh place-items-center text-sm text-muted-foreground">加载中…</div>
 
-  const needsLogin = path === "/admin" ? !me.authed : !me.public_page && !me.authed
+  const isAdmin = path.startsWith("/admin")
+  const needsLogin = isAdmin ? !me.authed : !me.public_page && !me.authed
   if (needsLogin) {
     return (
       <>
-        <Login github={me.github} onDone={() => { loadMe(); refresh(); go("/admin") }} />
+        <Login github={me.github} onDone={() => { loadMe(); refresh(); go("/admin/nodes") }} />
         <Toaster position="top-center" theme={dark ? "dark" : "light"} />
       </>
     )
   }
 
-  const isAdmin = path === "/admin"
   const sorted = [...(nodes ?? [])].sort((a, b) => a.sort - b.sort || a.id - b.id)
   const selected = sorted.find((n) => n.id === open)
 
@@ -91,8 +102,13 @@ export default function App() {
           </button>
           <div className="flex-1" />
           {me.authed && (
-            <Button variant={isAdmin ? "secondary" : "ghost"} size="sm" onClick={() => go(isAdmin ? "/" : "/admin")}>
-              <LayoutDashboard /> {isAdmin ? "状态页" : "管理"}
+            <Button
+              variant={isAdmin ? "secondary" : "ghost"}
+              size="sm"
+              onClick={() => go(isAdmin ? "/" : "/admin/nodes")}
+            >
+              {isAdmin ? <LayoutDashboard /> : <Wrench />}
+              {isAdmin ? "状态面板" : "进入后台"}
             </Button>
           )}
           <Button variant="ghost" size="icon" onClick={toggleTheme} title="切换主题">
@@ -103,12 +119,12 @@ export default function App() {
               <LogOut />
             </Button>
           ) : (
-            <Button variant="ghost" size="sm" onClick={() => go("/admin")}>登录</Button>
+            <Button variant="ghost" size="sm" onClick={() => go("/admin/nodes")}>登录</Button>
           )}
         </div>
       </header>
 
-      <main className="mx-auto max-w-6xl space-y-5 px-4 py-6">
+      <main className={`mx-auto space-y-5 px-4 py-6 ${isAdmin ? "max-w-7xl" : "max-w-6xl"}`}>
         {error && <p className="text-sm text-destructive">{error}</p>}
 
         {!nodes ? (
@@ -116,13 +132,13 @@ export default function App() {
             {[0, 1, 2].map((i) => <Skeleton key={i} className="h-72" />)}
           </div>
         ) : isAdmin ? (
-          <Admin nodes={sorted} refresh={refresh} site={location.origin} />
+          <Admin path={path} go={go} nodes={sorted} refresh={refresh} site={location.origin} />
         ) : (
           <>
             <Summary nodes={sorted} />
             {sorted.length === 0 ? (
               <p className="py-16 text-center text-sm text-muted-foreground">
-                还没有节点{me.authed ? "，去「管理」添加一个" : ""}
+                还没有节点{me.authed ? "，去「进入后台」添加一个" : ""}
               </p>
             ) : (
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">

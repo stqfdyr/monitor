@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { Copy, KeyRound, Pencil, Plus, Trash2 } from "lucide-react"
+import { Copy, KeyRound, Pencil, Plus, Radio, Server, Settings, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -11,7 +11,6 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { TRAFFIC_MODES } from "@/components/NodeCard"
 import { api, type Node, type PingTask } from "@/lib/api"
 import { bytes, CYCLES } from "@/lib/format"
@@ -531,7 +530,7 @@ function SettingsTab({ site }: { site: string }) {
         <div>
           <h3 className="text-sm font-medium">应急密码</h3>
           <p className="mt-1 text-xs text-muted-foreground">
-            GitHub 不可用时的备用入口。修改后所有已登录会话会立即失效。
+            GitHub 不可用时的备用入口。修改后其它设备上的登录会立即失效，当前这台不受影响。
           </p>
         </div>
         <Field label="新密码" hint="至少 12 位">
@@ -551,17 +550,57 @@ function SettingsTab({ site }: { site: string }) {
   )
 }
 
-export function Admin({ nodes, refresh, site }: { nodes: Node[]; refresh: () => void; site: string }) {
+/// Each admin area is its own route rather than a tab, so a page can be
+/// linked to and survives a reload on the section you were actually in.
+export const ADMIN_SECTIONS = [
+  { path: "/admin/nodes", label: "节点", icon: Server },
+  { path: "/admin/ping", label: "延迟监控", icon: Radio },
+  { path: "/admin/settings", label: "设置", icon: Settings },
+] as const
+
+export function Admin({
+  path,
+  go,
+  nodes,
+  refresh,
+  site,
+}: {
+  path: string
+  go: (to: string) => void
+  nodes: Node[]
+  refresh: () => void
+  site: string
+}) {
   return (
-    <Tabs defaultValue="nodes" className="space-y-4">
-      <TabsList>
-        <TabsTrigger value="nodes">节点</TabsTrigger>
-        <TabsTrigger value="ping">延迟监控</TabsTrigger>
-        <TabsTrigger value="settings">设置</TabsTrigger>
-      </TabsList>
-      <TabsContent value="nodes"><Nodes nodes={nodes} refresh={refresh} /></TabsContent>
-      <TabsContent value="ping"><Ping nodes={nodes} /></TabsContent>
-      <TabsContent value="settings"><SettingsTab site={site} /></TabsContent>
-    </Tabs>
+    <div className="flex flex-col gap-6 md:flex-row">
+      <nav className="flex gap-1 overflow-x-auto md:w-44 md:shrink-0 md:flex-col md:overflow-visible">
+        {ADMIN_SECTIONS.map(({ path: to, label, icon: Icon }) => {
+          const active = path === to
+          return (
+            <button
+              key={to}
+              onClick={() => go(to)}
+              aria-current={active ? "page" : undefined}
+              className={`flex shrink-0 items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors ${
+                active ? "bg-secondary font-medium" : "text-muted-foreground hover:bg-muted"
+              }`}
+            >
+              <Icon className="size-4" />
+              {label}
+            </button>
+          )
+        })}
+      </nav>
+
+      <div className="min-w-0 flex-1">
+        {path === "/admin/ping" ? (
+          <Ping nodes={nodes} />
+        ) : path === "/admin/settings" ? (
+          <SettingsTab site={site} />
+        ) : (
+          <Nodes nodes={nodes} refresh={refresh} />
+        )}
+      </div>
+    </div>
   )
 }
