@@ -17,6 +17,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - run: git clone --depth 1 https://github.com/stqfdyr/monitor-theme-default web-theme
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
