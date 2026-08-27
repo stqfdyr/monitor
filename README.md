@@ -61,7 +61,7 @@ curl -fsSL https://hub.example.com/install.sh | sh -s -- --server https://hub.ex
 nginx / Caddy / Cloudflare Tunnel 后面，**hub 只监听回环地址**，不要暴露到 `0.0.0.0`：
 
 ```bash
-monitor-hub --listen 127.0.0.1:25775 --db /var/lib/monitor/monitor.db --site https://m.example.com
+monitor-hub --listen 127.0.0.1:8080 --db /var/lib/monitor/monitor.db --site https://monitor.example.com
 ```
 
 `--listen` 是本机监听的地址，`--site` 是外面看到的地址，两者不是一回事。反代那边要注意：
