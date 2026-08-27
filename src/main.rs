@@ -77,7 +77,7 @@ impl App {
 // ---- embedded frontend ----
 
 #[derive(rust_embed::Embed)]
-#[folder = "../web/dist"]
+#[folder = "web/dist"]
 struct Assets;
 
 async fn serve_asset(uri: Uri) -> Response {
@@ -115,13 +115,13 @@ fn is_api_path(path: &str) -> bool {
 
 /// The one-liner pasted onto a new VPS.
 async fn install_script(State(app): State<Shared>) -> Response {
-    let script = include_str!("../../install.sh").replace("@@REPO@@", &app.repo());
+    let script = include_str!("../install.sh").replace("@@REPO@@", &app.repo());
     ([(header::CONTENT_TYPE, "text/x-shellscript")], script).into_response()
 }
 
 impl App {
     fn repo(&self) -> String {
-        self.db.get("release_repo").unwrap_or_else(|| "stqfdyr/monitor".into())
+        self.db.get("release_repo").unwrap_or_else(|| "stqfdyr/agent".into())
     }
 }
 

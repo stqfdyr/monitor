@@ -19,7 +19,7 @@ agent 每次上报两样东西：
 - `net_rx_total` / `net_tx_total` — 内核 lifetime 计数器的当前值（原样，不加工）
 - `boot_id` — 来自 `/proc/sys/kernel/random/boot_id`，每次开机变一次
 
-hub 在 `db::accumulate()`（`hub/src/db.rs`）里做这件事：
+hub 在 `db::accumulate()`（`src/db.rs`）里做这件事：
 
 ```
 rebooted = (boot_id 变了) 或 (rx < last_rx) 或 (tx < last_tx)
@@ -107,7 +107,7 @@ agent 掉线期间产生的流量，重连后会被补上。因为读的是内�
 
 ## 怎么验证
 
-单元测试覆盖了逻辑（`hub/src/db.rs` 的 `tests` 模块，7 个）。要验真机行为：
+单元测试覆盖了逻辑（`src/db.rs` 的 `tests` 模块，7 个）。要验真机行为：
 
 ```bash
 # 记下当前累计值

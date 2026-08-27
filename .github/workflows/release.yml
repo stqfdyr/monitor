@@ -34,15 +34,12 @@ jobs:
       - run: cargo install --locked cross
       - run: cross build --release --locked --target ${{ matrix.target }}
 
-      - run: |
-          for bin in monitor-agent monitor-hub; do
-            cp "target/${{ matrix.target }}/release/$bin" "$bin-${{ matrix.target }}"
-          done
+      - run: cp "target/${{ matrix.target }}/release/monitor-hub" "monitor-hub-${{ matrix.target }}"
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: monitor-*-${{ matrix.target }}
+          path: monitor-hub-${{ matrix.target }}
 
   release:
     needs: build
@@ -53,5 +50,5 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          files: monitor-*
+          files: monitor-hub-*
           generate_release_notes: true

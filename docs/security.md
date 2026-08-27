@@ -20,7 +20,7 @@
 
 ### `Admin` 提取器
 
-`hub/src/api.rs` 里定义了一个 `Admin` 类型，实现了 `FromRequestParts`。任何写接口的 handler 签名里带 `_: Admin`，axum 就会在进入函数体之前先校验 session，不通过直接 401。
+`src/api.rs` 里定义了一个 `Admin` 类型，实现了 `FromRequestParts`。任何写接口的 handler 签名里带 `_: Admin`，axum 就会在进入函数体之前先校验 session，不通过直接 401。
 
 ```rust
 pub async fn delete_node(_: Admin, State(app): State<Shared>, ...) -> Response
@@ -43,7 +43,7 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, ...) -> Response
 
 ### GitHub OAuth
 
-`hub/src/auth.rs` 里手写的，约 40 行：
+`src/auth.rs` 里手写的，约 40 行：
 
 1. `/api/auth/github` 生成随机 state，塞进一个 10 分钟的 HttpOnly cookie，重定向到 GitHub
 2. `/api/auth/github/callback` **先校验 state 匹配**（不匹配直接 400），再拿 code 换 token，再拉用户信息
@@ -101,7 +101,7 @@ systemd 单元加固：`DynamicUser`、`NoNewPrivileges`、`ProtectSystem=strict
 **过滤在序列化的时候做，不是在前端做**：
 
 ```rust
-// hub/src/api.rs, node_view()
+// src/api.rs, node_view()
 if full {
     view["hostname"] = json!(node.hostname);
     view["ip"] = json!(node.ip);
@@ -125,7 +125,7 @@ if full {
 
 komari 用的是 `/api/oauth_callback`——从 komari 迁过来的人很容易照抄那个路径。抄错的表现极具迷惑性：GitHub 授权成功，浏览器回到站点看起来一切正常，但没登上，**且服务端没有任何日志**，因为那个路径压根没进任何 handler。
 
-（现在未匹配的 `/api/` 会返回 404 而不是 SPA，所以这个错误会立刻现形。见 `hub/src/main.rs` 的 `is_api_path()`。）
+（现在未匹配的 `/api/` 会返回 404 而不是 SPA，所以这个错误会立刻现形。见 `src/main.rs` 的 `is_api_path()`。）
 
 其余失败都会记进 journal：
 

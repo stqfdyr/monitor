@@ -1,19 +1,32 @@
-[workspace]
-members = ["agent", "hub"]
-resolver = "2"
-
-[workspace.package]
+[package]
+name = "monitor-hub"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+description = "Lightweight server monitoring hub"
+repository = "https://github.com/stqfdyr/monitor"
 
-[workspace.dependencies]
+[dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum = { version = "0.8", features = ["ws", "macros"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+argon2 = "0.5"
+rand = "0.9"
+sha2 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+rust-embed = "8"
+mime_guess = "2"
+tower-http = { version = "0.6", features = ["limit"] }
+
+[dev-dependencies]
+serde_urlencoded = "0.7"
 
 [profile.release]
 codegen-units = 1

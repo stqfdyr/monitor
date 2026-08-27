@@ -1,13 +1,15 @@
 # monitor
 
-Rust 服务器探针，一个 hub 带多个 agent。替代 komari，功能砍到只剩：看状态、看流量、看延迟、算成本。
+Rust 服务器探针的 **hub**，替代 komari，功能砍到只剩：看状态、看流量、看延迟、算成本。
+
+agent 在 [另一个仓库](https://github.com/stqfdyr/agent)。前端在 `web/`，由 `rust-embed` 编译进本二进制——**没有**单独的主题仓库，也不打算有。
 
 **动手之前先读 [docs/](docs/)**，尤其是 [docs/decisions.md](docs/decisions.md)——里面记了每个选择的理由和被否决的方案。
 
 ## 三条铁律
 
 1. **总流量永不回退。** VPS 重启、hub 重启、agent 掉线，累计值都要继续加。见 [docs/traffic.md](docs/traffic.md)
-2. **内存和硬盘必须和 `free` / `df` 对得上。** 见 [docs/data-accuracy.md](docs/data-accuracy.md)
+2. **内存和硬盘必须和 `free` / `df` 对得上。** 见 [agent 仓库的 data-accuracy.md](https://github.com/stqfdyr/agent/blob/main/docs/data-accuracy.md)
 3. **公开状态页永远不输出 IP、主机名、备注。** 见 [docs/security.md](docs/security.md)
 
 ## 明确不做的
@@ -24,10 +26,10 @@ Rust 服务器探针，一个 hub 带多个 agent。替代 komari，功能砍到
 ## 常用命令
 
 ```bash
-cargo test --workspace                        # 39 个测试
-cargo clippy --workspace --all-targets
+cargo test                        # 34 个测试
+cargo clippy --all-targets
 cd web && npm run build                       # hub 嵌入 web/dist，改前端后要重跑
-cargo run -p monitor-hub -- --listen 127.0.0.1:9911 --db /tmp/dev.db --site http://127.0.0.1:9911
+cargo run -- --listen 127.0.0.1:9911 --db /tmp/dev.db --site http://127.0.0.1:9911
 ```
 
 **别用 `pkill -f` 停进程**——会匹配到跑命令的 shell 自己。用 `ss -lptn "sport = :9911"` 拿 PID 再 kill。

@@ -9,18 +9,27 @@
    无状态                                          monitor.db
 ```
 
+## 两个仓库
+
+| 仓库 | 内容 |
+|---|---|
+| **monitor**（本仓库） | hub + 前端 + `install.sh` |
+| **[agent](https://github.com/stqfdyr/agent)** | Linux agent。发布自己的 musl 二进制，`install.sh` 从那边的 release 拉 |
+
+拆开是因为两者部署在不同机器上、发布节奏不同。前端**没有**单独仓库——它是 `rust-embed` 编译进 hub 二进制的，拆出去只会让构建变成三步而换不来任何能力。
+
 ## 源码地图
 
 | 文件 | 规模 | 职责 |
 |---|---|---|
-| `agent/src/collect.rs` | ~520 | **全部采集逻辑。** 读 `/proc` 和 `statvfs`。三个数据 bug 的修复都在这里 |
-| `agent/src/main.rs` | ~260 | CLI 参数、WebSocket 会话、重连退避、TCP ping |
-| `hub/src/db.rs` | ~810 | schema + 所有 SQL。**流量累加 `accumulate()` 在这里** |
-| `hub/src/agent_ws.rs` | ~275 | agent 侧 WebSocket、RPC 分发、实时状态 |
-| `hub/src/api.rs` | ~405 | 面板和公开页的 HTTP 接口、`Admin` 提取器 |
-| `hub/src/auth.rs` | ~330 | session、GitHub OAuth、argon2 密码、登录限流 |
-| `hub/src/main.rs` | ~285 | 启动、路由表、静态资源、首次运行、定时清理 |
+| `src/db.rs` | ~810 | schema + 所有 SQL。**流量累加 `accumulate()` 在这里** |
+| `src/agent_ws.rs` | ~275 | agent 侧 WebSocket、RPC 分发、实时状态 |
+| `src/api.rs` | ~405 | 面板和公开页的 HTTP 接口、`Admin` 提取器 |
+| `src/auth.rs` | ~330 | session、GitHub OAuth、argon2 密码、登录限流 |
+| `src/main.rs` | ~285 | 启动、路由表、静态资源、首次运行、定时清理 |
 | `web/src/` | ~1370 | 前端。`components/ui/` 下是 shadcn 生成的，不手改 |
+
+agent 的采集代码在 [另一个仓库](https://github.com/stqfdyr/agent)。改了它的上报字段就是改了协议，两边要同步。
 
 ## 线上协议
 
@@ -36,7 +45,7 @@ WebSocket 承载 **JSON-RPC 2.0 通知**（只有 `method` + `params`，没有 `
 | `report` | `Metrics`：见下 | 每 `interval` 秒 |
 | `ping.result` | `{task_id, latency_ms}`，`latency_ms` 为 `-1` 表示连不上 | 每个探测任务按自己的间隔 |
 
-`Metrics` 的字段（`agent/src/collect.rs` 的 `Metrics` struct 就是权威定义）：
+`Metrics` 的字段（[agent 仓库](https://github.com/stqfdyr/agent) 里 `src/collect.rs` 的 `Metrics` struct 就是权威定义）：
 
 ```
 boot_id  uptime  cpu  load[3]
@@ -58,7 +67,7 @@ agent 收到后会**保留没变化的任务**（同 id + 同 target + 同 inter
 
 ## 数据模型
 
-八张表，`hub/src/db.rs` 顶部的 `SCHEMA` 常量是权威定义。
+八张表，`src/db.rs` 顶部的 `SCHEMA` 常量是权威定义。
 
 | 表 | 作用 | 注意 |
 |---|---|---|
@@ -88,7 +97,7 @@ agent 收到后会**保留没变化的任务**（同 id + 同 target + 同 inter
 
 ## 请求路径
 
-`hub/src/main.rs` 的路由表是权威定义。
+`src/main.rs` 的路由表是权威定义。
 
 **agent**：`GET /api/agent/ws`（Bearer token）、`GET /install.sh`（公开，不含密钥）
 
@@ -112,5 +121,5 @@ agent 收到后会**保留没变化的任务**（同 id + 同 target + 同 inter
 
 源码里用 `ponytail:` 注释标出来了：
 
-- `hub/src/db.rs` — 单个 SQLite 写连接加互斥锁。几十个节点每 2 秒上报完全够用；真堵了再拆读连接池
-- `hub/src/api.rs` — 浏览器实时推送是每个连接自己跑 2 秒定时器，不是广播 fan-out。自用面板没必要
+- `src/db.rs` — 单个 SQLite 写连接加互斥锁。几十个节点每 2 秒上报完全够用；真堵了再拆读连接池
+- `src/api.rs` — 浏览器实时推送是每个连接自己跑 2 秒定时器，不是广播 fan-out。自用面板没必要

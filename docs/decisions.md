@@ -20,7 +20,7 @@
 
 komari 是 `?token=xxx`。query string 会进 nginx/caddy 的 access log。agent 不是浏览器，能设请求头，所以没有理由把 token 放 URL 里。
 
-改动位置：`agent/src/main.rs` 的 `session()`，`hub/src/agent_ws.rs` 的 `bearer()`。
+改动位置：[agent 仓库](https://github.com/stqfdyr/agent) 的 `src/main.rs` 的 `session()`，`src/agent_ws.rs` 的 `bearer()`。
 
 ---
 
@@ -76,7 +76,7 @@ komari-agent 能从 GitHub release 拉新二进制自替换。用户选了不做
 
 ### 历史明细每分钟一行，不做降采样 **[默认]**
 
-agent 每 2 秒上报（实时视图用），但 `metric` 表每节点每分钟只写一行（`hub/src/agent_ws.rs` 里 `now / 60` 变了才写）。超过保留天数直接删，不做多级降采样。
+agent 每 2 秒上报（实时视图用），但 `metric` 表每节点每分钟只写一行（`src/agent_ws.rs` 里 `now / 60` 变了才写）。超过保留天数直接删，不做多级降采样。
 
 **为什么能这么简单**：因为累计流量不是从 `metric` 算出来的，所以明细可以随便删。见 [traffic.md](traffic.md)。
 
@@ -116,7 +116,7 @@ agent 每 2 秒上报（实时视图用），但 `metric` 表每节点每分钟�
 
 用户在三个选项里选了"要，且默认开启"。可以在设置里全局关，也可以按节点关（`node.public`）。
 
-**公开视图永远不输出 `ip`、`hostname`、`remark`**——`hub/src/api.rs` 的 `node_view(app, node, full)` 里 `full=false` 时这三个字段根本不写进 JSON。有测试守着。
+**公开视图永远不输出 `ip`、`hostname`、`remark`**——`src/api.rs` 的 `node_view(app, node, full)` 里 `full=false` 时这三个字段根本不写进 JSON。有测试守着。
 
 ### 手写 OAuth，不用 oauth2 crate **[默认]**
 

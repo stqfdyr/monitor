@@ -22,8 +22,8 @@ cargo build --release
 ## 测试
 
 ```bash
-cargo test --workspace          # 39 个
-cargo clippy --workspace --all-targets
+cargo test          # 34 个
+cargo clippy --all-targets
 cargo fmt --all
 ```
 
@@ -31,13 +31,11 @@ cargo fmt --all
 
 | 位置 | 数量 | 覆盖什么 |
 |---|---|---|
-| `agent/src/collect.rs` | 9 | 内存/硬盘/CPU/网络的口径，挂载点去重 |
-| `agent/src/main.rs` | 3 | URL 拼接与明文拒绝、tcp ping、探测任务增量更新 |
-| `hub/src/db.rs` | 7 | **流量累加与月度周期**、级联删除、prune |
-| `hub/src/auth.rs` | 6 | 密码哈希、限流、cookie、转发头 |
-| `hub/src/agent_ws.rs` | 6 | RPC 分发、每分钟落盘、header 鉴权 |
-| `hub/src/api.rs` | 4 | 公开视图过滤、读权限、密钥不回读 |
-| `hub/src/main.rs` | 4 | cookie 安全标志、安装命令、首次运行 |
+| `src/db.rs` | 7 | **流量累加与月度周期**、级联删除、prune |
+| `src/auth.rs` | 6 | 密码哈希、限流、cookie、转发头 |
+| `src/agent_ws.rs` | 6 | RPC 分发、每分钟落盘、header 鉴权 |
+| `src/api.rs` | 4 | 公开视图过滤、读权限、密钥不回读 |
+| `src/main.rs` | 4 | cookie 安全标志、安装命令、首次运行 |
 
 写测试的原则（用户明确要求不要过度测试）：**一段非平凡逻辑留一个能跑的检查就够**，不要每个函数一个测试。优先测边界和不变量，不测 getter。
 
@@ -45,17 +43,18 @@ cargo fmt --all
 
 ```bash
 # hub
-cargo run -p monitor-hub -- --listen 127.0.0.1:9911 --db /tmp/dev.db --site http://127.0.0.1:9911
+cargo run -- --listen 127.0.0.1:9911 --db /tmp/dev.db --site http://127.0.0.1:9911
 # 记下打印出来的一次性密码
 
 # 前端热更新（API 代理到 9911，vite.config.ts 里配好了）
 cd web && npm run dev
 ```
 
-登录后建一个节点，拿到 token，在本机跑 agent 指向自己：
+登录后建一个节点，拿到 token，在 [agent 仓库](https://github.com/stqfdyr/agent) 里跑一个指向自己的 agent：
 
 ```bash
-cargo run -p monitor-agent -- --server http://127.0.0.1:9911 --token <token> --interval 1
+cd /path/to/agent
+cargo run -- --server http://127.0.0.1:9911 --token <token> --interval 1
 ```
 
 `http://` 只对回环地址放行，正好够本地调试。
@@ -84,7 +83,7 @@ assert all(k not in n for k in ("ip","remark","hostname")), "泄露了敏感字�
 print("公开视图 OK")'
 
 # 4. 数据口径对得上系统工具
-cargo test -p monitor-agent crosscheck -- --nocapture
+cd /path/to/agent && cargo test crosscheck -- --nocapture
 free -b | awk 'NR==2{printf "free used=%.2fG\n", $3/1073741824}'
 df -B1 --output=size,used / | tail -1
 
@@ -106,7 +105,7 @@ CHROME=$(find /root/.cache/puppeteer/chrome -name chrome -type f | head -1)
 
 ## 发布
 
-推一个 `v*` tag 触发 `.github/workflows/release.yml`，用 `cross` 构建 x86_64 和 aarch64 的 musl 静态二进制并附到 release 上。
+推一个 `v*` tag 触发 `.github/workflows/release.yml`，构建 hub 的 musl 静态二进制。agent 的二进制由它自己的仓库发布，两者版本独立。
 
 `install.sh` 从 `https://github.com/{release_repo}/releases/latest/download/monitor-agent-{arch}-unknown-linux-musl` 下载，`release_repo` 默认 `stqfdyr/monitor`，存在 `setting` 表里。
 

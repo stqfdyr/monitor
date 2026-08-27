@@ -1,6 +1,8 @@
 # monitor
 
-一个轻量的服务器探针：一个 hub，多个 agent。Rust 编写，前端 React + shadcn/ui。
+一个轻量的服务器探针的 **hub**：Rust 编写，前端 React + shadcn/ui，编译成单个二进制。
+
+agent 在 [另一个仓库](https://github.com/stqfdyr/agent)——它部署在被监控的机器上，发布节奏和 hub 独立。
 
 只做四件事：看状态、看流量、看延迟、算成本。没有通知、没有远程 SSH、没有插件系统。
 
@@ -23,9 +25,11 @@ agent (Linux)  ──WebSocket + JSON-RPC 2.0──▶  hub (axum + SQLite)  ─
    读 /proc                Bearer token              内嵌前端，单文件
 ```
 
-- **agent** 只支持 Linux，直接读 `/proc` 和 `statvfs`，不依赖 sysinfo。静态链接后是一个几 MB 的单文件。
+- **[agent](https://github.com/stqfdyr/agent)** 只支持 Linux，直接读 `/proc` 和 `statvfs`，不依赖 sysinfo。静态链接后是一个几 MB 的单文件。
 - **hub** 零配置启动。除了监听地址和数据库路径，其它全在面板里配、存 SQLite。前端构建产物嵌进二进制。
 - **通信** WebSocket 承载 JSON-RPC 2.0 通知，token 走 `Authorization` 头（不进反代日志）。
+
+前端没有单独的仓库：它由 `rust-embed` 编译进 hub 二进制，拆出去只会让构建多两步，换不来换主题的能力。
 
 ## 跑起来
 
@@ -81,7 +85,7 @@ monitor-hub --listen 127.0.0.1:25775 --db /var/lib/monitor/monitor.db --site htt
 ## 开发
 
 ```bash
-cargo test                      # 39 个测试
+cargo test                      # 34 个测试
 cd web && npm run dev           # 前端热更新，API 代理到 127.0.0.1:9911
 ```
 
