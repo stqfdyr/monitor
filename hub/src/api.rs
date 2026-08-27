@@ -11,7 +11,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::auth::{authed, hash_password, random_token, sha256};
+use crate::auth::{authed, hash_password, issue_session, random_token, sha256, with_cookies};
 use crate::db::{Node, PingTask};
 use crate::{agent_ws, App, Shared};
 
@@ -295,6 +295,9 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
 
 pub async fn save_settings(_: Admin, State(app): State<Shared>, Json(body): Json<Value>) -> Response {
     let Some(map) = body.as_object() else { return bad("expected an object") };
+    // Set when the password changed, so the caller can be handed a fresh
+    // session instead of being logged out by their own password change.
+    let mut reissued = String::new();
     for (key, value) in map {
         let Some(value) = value.as_str() else { continue };
         let stored = match key.as_str() {
@@ -304,12 +307,17 @@ pub async fn save_settings(_: Admin, State(app): State<Shared>, Json(body): Json
                 if value.len() < 12 {
                     return bad("password must be at least 12 characters");
                 }
+                // Every existing session dies with the old password; the
+                // browser doing the change gets a replacement below.
                 match hash_password(value).and_then(|h| {
                     app.db.set("admin_password_hash", &h)?;
                     app.db.drop_all_sessions()?;
-                    Ok(())
+                    issue_session(&app)
                 }) {
-                    Ok(()) => continue,
+                    Ok(cookie) => {
+                        reissued = cookie;
+                        continue;
+                    }
                     Err(e) => return fail(e),
                 }
             }
@@ -319,7 +327,7 @@ pub async fn save_settings(_: Admin, State(app): State<Shared>, Json(body): Json
             return fail(e);
         }
     }
-    Json(json!({"ok": true})).into_response()
+    with_cookies(Json(json!({"ok": true})), [reissued])
 }
 
 #[cfg(test)]
@@ -388,6 +396,43 @@ mod tests {
         // Switching the public page off closes even the published node.
         app.db.set("public_page", "off").unwrap();
         assert!(!readable(&app, &anonymous, open));
+    }
+
+    #[tokio::test]
+    async fn changing_the_password_kills_other_sessions_but_not_the_caller() {
+        let app = std::sync::Arc::new(app());
+        let stale = random_token();
+        app.db.create_session(&sha256(&stale), Utc::now().timestamp() + 3_600).unwrap();
+
+        let body = Json(json!({"admin_password": "a-long-enough-password"}));
+        let response = save_settings(Admin, axum::extract::State(app.clone()), body).await;
+
+        assert!(!app.db.session_valid(&sha256(&stale)), "sessions must not outlive the old password");
+
+        // The browser that made the change is handed a replacement, so it is
+        // not logged out by its own password change.
+        let cookie = response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .expect("a replacement session")
+            .to_str()
+            .unwrap();
+        let token = cookie.split(';').next().unwrap().split('=').nth(1).unwrap();
+        assert!(app.db.session_valid(&sha256(token)), "the replacement session must work");
+    }
+
+    #[tokio::test]
+    async fn a_short_password_is_refused_and_changes_nothing() {
+        let app = std::sync::Arc::new(app());
+        let live = random_token();
+        app.db.create_session(&sha256(&live), Utc::now().timestamp() + 3_600).unwrap();
+
+        let body = Json(json!({"admin_password": "short"}));
+        let response = save_settings(Admin, axum::extract::State(app.clone()), body).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(app.db.get("admin_password_hash").is_none(), "the password must not have changed");
+        assert!(app.db.session_valid(&sha256(&live)), "a rejected change must not log anyone out");
     }
 
     #[tokio::test]

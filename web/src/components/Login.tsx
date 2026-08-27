@@ -17,9 +17,17 @@ function GithubMark() {
   )
 }
 
+/// The hub redirects a failed GitHub sign-in back here with the reason
+/// attached, so it is readable in context instead of as a bare 401 page.
+function callbackError(): string {
+  const reason = new URLSearchParams(location.search).get("login_error")
+  if (reason) history.replaceState({}, "", location.pathname)
+  return reason ?? ""
+}
+
 export function Login({ github, onDone }: { github: boolean; onDone: () => void }) {
   const [password, setPassword] = useState("")
-  const [error, setError] = useState("")
+  const [error, setError] = useState(callbackError)
   const [busy, setBusy] = useState(false)
 
   async function submit(e: React.FormEvent) {
@@ -40,6 +48,10 @@ export function Login({ github, onDone }: { github: boolean; onDone: () => void 
     <div className="grid min-h-svh place-items-center p-6">
       <Card className="w-full max-w-sm gap-5 p-6">
         <h1 className="text-lg font-semibold">登录后台</h1>
+
+        {error && (
+          <p className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p>
+        )}
 
         {github && (
           <>
@@ -69,7 +81,6 @@ export function Login({ github, onDone }: { github: boolean; onDone: () => void 
               autoFocus={!github}
             />
           </div>
-          {error && <p className="text-xs text-destructive">{error}</p>}
           <Button type="submit" className="w-full" disabled={busy || !password}>
             登录
           </Button>

@@ -500,8 +500,13 @@ function SettingsTab({ site }: { site: string }) {
             <Input type="password" placeholder={s.github_secret_set ? "••••••••" : ""} onChange={(e) => set("github_client_secret", e.target.value)} />
           </Field>
         </div>
-        <Field label="允许登录的 GitHub 用户名" hint="逗号分隔。留空则任何人都无法通过 GitHub 登录">
-          <Input value={String(s.github_allowed_users ?? "")} onChange={(e) => set("github_allowed_users", e.target.value)} placeholder="stqfdyr" />
+        {String(s.github_client_id ?? "") !== "" && String(s.github_allowed_users ?? "").trim() === "" && (
+          <p className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            白名单为空，GitHub 登录现在会拒绝所有人。填上你的 GitHub 用户名并保存后才能用。
+          </p>
+        )}
+        <Field label="允许登录的 GitHub 用户名" hint="逗号分隔。留空 = 拒绝所有人（不是放行所有人）">
+          <Input value={String(s.github_allowed_users ?? "")} onChange={(e) => set("github_allowed_users", e.target.value)} placeholder="你的 GitHub 用户名" />
         </Field>
         <div>
           <Button

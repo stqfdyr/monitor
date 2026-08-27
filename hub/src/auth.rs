@@ -106,7 +106,7 @@ fn set_cookie(name: &str, value: &str, max_age: i64, secure: bool) -> String {
     cookie
 }
 
-fn issue_session(app: &App) -> Result<String> {
+pub fn issue_session(app: &App) -> Result<String> {
     let token = random_token();
     app.db.create_session(&sha256(&token), Utc::now().timestamp() + SESSION_DAYS * 86_400)?;
     Ok(set_cookie(COOKIE, &token, SESSION_DAYS * 86_400, app.secure_cookies()))
@@ -136,7 +136,7 @@ pub async fn login(
     }
     app.throttle.clear(ip);
     match issue_session(&app) {
-        Ok(cookie) => ([(header::SET_COOKIE, cookie)], Json(serde_json::json!({"ok": true}))).into_response(),
+        Ok(cookie) => with_cookies(Json(serde_json::json!({"ok": true})), [cookie]),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -145,11 +145,7 @@ pub async fn logout(State(app): State<crate::Shared>, headers: HeaderMap) -> Res
     if let Some(token) = cookie_value(&headers, COOKIE) {
         let _ = app.db.drop_session(&sha256(&token));
     }
-    (
-        [(header::SET_COOKIE, set_cookie(COOKIE, "", 0, app.secure_cookies()))],
-        Json(serde_json::json!({"ok": true})),
-    )
-        .into_response()
+    with_cookies(Json(serde_json::json!({"ok": true})), [set_cookie(COOKIE, "", 0, app.secure_cookies())])
 }
 
 /// Step one of the OAuth dance: hand the browser a state nonce and send it to
@@ -162,8 +158,7 @@ pub async fn github_start(State(app): State<crate::Shared>) -> Response {
     let url = format!(
         "https://github.com/login/oauth/authorize?client_id={client_id}&scope=read:user&state={state}"
     );
-    ([(header::SET_COOKIE, set_cookie(STATE_COOKIE, &state, 600, app.secure_cookies()))], Redirect::to(&url))
-        .into_response()
+    with_cookies(Redirect::to(&url), [set_cookie(STATE_COOKIE, &state, 600, app.secure_cookies())])
 }
 
 #[derive(Deserialize)]
@@ -179,24 +174,61 @@ pub async fn github_callback(
 ) -> Response {
     // Reject a callback the browser did not initiate.
     if cookie_value(&headers, STATE_COOKIE).as_deref() != Some(query.state.as_str()) {
-        return (StatusCode::BAD_REQUEST, "state mismatch").into_response();
+        return sign_in_failed(&app, "state mismatch; start again from the sign-in page");
     }
-    match github_login(&app, &query.code).await {
-        Ok(()) => {}
-        Err(e) => return (StatusCode::UNAUTHORIZED, format!("GitHub sign-in failed: {e}")).into_response(),
+    if let Err(e) = github_login(&app, &query.code).await {
+        return sign_in_failed(&app, &e.to_string());
     }
     let session = match issue_session(&app) {
         Ok(cookie) => cookie,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return sign_in_failed(&app, &e.to_string()),
     };
-    (
-        [
-            (header::SET_COOKIE, set_cookie(STATE_COOKIE, "", 0, app.secure_cookies())),
-            (header::SET_COOKIE, session),
-        ],
-        Redirect::to("/admin"),
-    )
-        .into_response()
+    with_cookies(Redirect::to("/admin"), [clear_state(&app), session])
+}
+
+/// Sends the browser back to the sign-in page carrying the reason, so the
+/// failure is readable in the UI instead of being a bare plain-text 401 at a
+/// callback URL the user cannot navigate away from.
+fn sign_in_failed(app: &App, reason: &str) -> Response {
+    let target = format!("/admin?login_error={}", urlencode(reason));
+    with_cookies(Redirect::to(&target), [clear_state(app), String::new()])
+}
+
+fn clear_state(app: &App) -> String {
+    set_cookie(STATE_COOKIE, "", 0, app.secure_cookies())
+}
+
+/// Attaches several `Set-Cookie` headers to one response.
+///
+/// An array of header tuples cannot be used here: axum applies those with
+/// `HeaderMap::insert`, so a second `Set-Cookie` silently replaces the first
+/// rather than adding to it. Empty entries are skipped.
+pub fn with_cookies<const N: usize>(response: impl IntoResponse, cookies: [String; N]) -> Response {
+    let mut response = response.into_response();
+    for cookie in cookies {
+        if cookie.is_empty() {
+            continue;
+        }
+        match cookie.parse() {
+            Ok(value) => {
+                response.headers_mut().append(header::SET_COOKIE, value);
+            }
+            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "bad cookie").into_response(),
+        }
+    }
+    response
+}
+
+/// Percent-encodes everything outside the unreserved set, which is enough for
+/// dropping an arbitrary message into a query string.
+fn urlencode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 /// Exchanges the code for a token and checks the login against the allow list.
@@ -301,6 +333,29 @@ mod tests {
 
         t.clear(ip);
         assert!(!t.locked(ip));
+    }
+
+    #[test]
+    fn several_cookies_all_survive_on_one_response() {
+        // axum applies an array of header tuples with insert(), which silently
+        // drops all but the last Set-Cookie. This helper must append instead.
+        let response = with_cookies(StatusCode::OK, ["a=1".to_owned(), "b=2".to_owned()]);
+        let set: Vec<_> = response.headers().get_all(header::SET_COOKIE).iter().collect();
+        assert_eq!(set.len(), 2, "both cookies must reach the browser");
+        // Empty entries are skipped rather than emitting a blank header.
+        let response = with_cookies(StatusCode::OK, ["a=1".to_owned(), String::new()]);
+        assert_eq!(response.headers().get_all(header::SET_COOKIE).iter().count(), 1);
+    }
+
+    #[test]
+    fn a_failure_reason_survives_the_trip_through_the_query_string() {
+        assert_eq!(
+            urlencode("no allowed GitHub users configured"),
+            "no%20allowed%20GitHub%20users%20configured"
+        );
+        // Characters that would otherwise break out of the query string.
+        assert_eq!(urlencode("a&b=c#d"), "a%26b%3Dc%23d");
+        assert_eq!(urlencode("用户"), "%E7%94%A8%E6%88%B7");
     }
 
     #[test]
