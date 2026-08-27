@@ -136,6 +136,8 @@ fn readable(app: &App, headers: &HeaderMap, id: i64) -> bool {
 
 /// Live stream for the browser. Each connection runs its own timer, which is
 /// cheaper to reason about than a fan-out channel at this scale.
+// ponytail: per-connection timer rebuilds the snapshot for every viewer; switch
+// to one broadcast channel if this ever serves more than a handful of tabs.
 pub async fn live_ws(State(app): State<Shared>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
     let full = authed(&app, &headers);
     if !full && !app.public_page() {

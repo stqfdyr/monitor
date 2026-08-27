@@ -1,5 +1,5 @@
 //! Linux-only metric collection, straight from /proc and statvfs.
-//! No sysinfo: it gets memory and disk wrong for a probe (see docs/metrics.md).
+//! No sysinfo: it gets memory and disk wrong for a probe (see docs/data-accuracy.md).
 
 use std::collections::HashMap;
 use std::fs;

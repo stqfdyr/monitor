@@ -67,7 +67,7 @@ curl -fsSL https://hub.example.com/install.sh | sh -s -- --server https://hub.ex
 ## 开发
 
 ```bash
-cargo test                      # 38 个测试
+cargo test                      # 39 个测试
 cd web && npm run dev           # 前端热更新，API 代理到 127.0.0.1:9911
 ```
 
