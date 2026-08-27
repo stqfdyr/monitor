@@ -37,8 +37,8 @@ pub fn random_token() -> String {
 }
 
 pub fn hash_password(password: &str) -> Result<String> {
-    let salt = SaltString::encode_b64(&rand::random::<[u8; 16]>())
-        .map_err(|e| anyhow::anyhow!("salt: {e}"))?;
+    let salt =
+        SaltString::encode_b64(&rand::random::<[u8; 16]>()).map_err(|e| anyhow::anyhow!("salt: {e}"))?;
     Ok(Argon2::default()
         .hash_password(password.as_bytes(), &salt)
         .map_err(|e| anyhow::anyhow!("hash password: {e}"))?
@@ -162,10 +162,7 @@ pub async fn github_start(State(app): State<crate::Shared>) -> Response {
     let url = format!(
         "https://github.com/login/oauth/authorize?client_id={client_id}&scope=read:user&state={state}"
     );
-    (
-        [(header::SET_COOKIE, set_cookie(STATE_COOKIE, &state, 600, app.secure_cookies()))],
-        Redirect::to(&url),
-    )
+    ([(header::SET_COOKIE, set_cookie(STATE_COOKIE, &state, 600, app.secure_cookies()))], Redirect::to(&url))
         .into_response()
 }
 
@@ -204,15 +201,13 @@ pub async fn github_callback(
 
 /// Exchanges the code for a token and checks the login against the allow list.
 async fn github_login(app: &App, code: &str) -> Result<()> {
-    let (Some(id), Some(secret)) = (app.db.get("github_client_id"), app.db.get("github_client_secret")) else {
+    let (Some(id), Some(secret)) = (app.db.get("github_client_id"), app.db.get("github_client_secret"))
+    else {
         bail!("not configured");
     };
     let allowed = app.db.get("github_allowed_users").unwrap_or_default();
-    let allowed: Vec<String> = allowed
-        .split(',')
-        .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let allowed: Vec<String> =
+        allowed.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
     if allowed.is_empty() {
         // Without an allow list every GitHub account on earth could sign in.
         bail!("no allowed GitHub users configured");

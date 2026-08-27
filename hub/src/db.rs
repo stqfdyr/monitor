@@ -148,11 +148,21 @@ pub struct Node {
     pub ip: String,
 }
 
-fn yes() -> bool { true }
-fn usd() -> String { "USD".into() }
-fn monthly() -> String { "monthly".into() }
-fn sum() -> String { "sum".into() }
-fn one() -> u32 { 1 }
+fn yes() -> bool {
+    true
+}
+fn usd() -> String {
+    "USD".into()
+}
+fn monthly() -> String {
+    "monthly".into()
+}
+fn sum() -> String {
+    "sum".into()
+}
+fn one() -> u32 {
+    1
+}
 
 #[derive(Serialize, Debug, Clone, Default)]
 pub struct Traffic {
@@ -230,8 +240,18 @@ impl Db {
                                expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day, created_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
-                n.name, token_hash, n.sort, n.public, n.price, n.currency, n.billing_cycle,
-                n.expires_at, n.remark, n.traffic_limit, n.traffic_mode, n.traffic_reset_day,
+                n.name,
+                token_hash,
+                n.sort,
+                n.public,
+                n.price,
+                n.currency,
+                n.billing_cycle,
+                n.expires_at,
+                n.remark,
+                n.traffic_limit,
+                n.traffic_mode,
+                n.traffic_reset_day,
                 Utc::now().timestamp()
             ],
         )?;
@@ -247,8 +267,18 @@ impl Db {
                              traffic_reset_day=?12
              WHERE id=?1",
             params![
-                id, n.name, n.sort, n.public, n.price, n.currency, n.billing_cycle, n.expires_at,
-                n.remark, n.traffic_limit, n.traffic_mode, n.traffic_reset_day
+                id,
+                n.name,
+                n.sort,
+                n.public,
+                n.price,
+                n.currency,
+                n.billing_cycle,
+                n.expires_at,
+                n.remark,
+                n.traffic_limit,
+                n.traffic_mode,
+                n.traffic_reset_day
             ],
         )?;
         Ok(())
@@ -261,8 +291,7 @@ impl Db {
 
     /// Replaces a node's token, which immediately locks out the old one.
     pub fn reset_token(&self, id: i64, token_hash: &str) -> Result<()> {
-        self.conn()
-            .execute("UPDATE node SET token_hash=?2 WHERE id=?1", params![id, token_hash])?;
+        self.conn().execute("UPDATE node SET token_hash=?2 WHERE id=?1", params![id, token_hash])?;
         Ok(())
     }
 
@@ -283,9 +312,19 @@ impl Db {
                              agent_version=?12, ip=?13
              WHERE id=?1",
             params![
-                id, s("hostname"), s("os"), s("kernel"), s("arch"), s("virt"), s("cpu_name"),
-                n("cpu_cores"), n("mem_total"), n("swap_total"), n("disk_total"),
-                s("agent_version"), ip
+                id,
+                s("hostname"),
+                s("os"),
+                s("kernel"),
+                s("arch"),
+                s("virt"),
+                s("cpu_name"),
+                n("cpu_cores"),
+                n("mem_total"),
+                n("swap_total"),
+                n("disk_total"),
+                s("agent_version"),
+                ip
             ],
         )?;
         Ok(())
@@ -317,21 +356,41 @@ impl Db {
     /// started counting from zero again: the whole current reading is new
     /// traffic. This is what keeps the total from collapsing on every reboot,
     /// which is the behaviour komari has.
-    pub fn accumulate(&self, node_id: i64, boot_id: &str, rx: i64, tx: i64, reset_day: u32) -> Result<Traffic> {
+    pub fn accumulate(
+        &self,
+        node_id: i64,
+        boot_id: &str,
+        rx: i64,
+        tx: i64,
+        reset_day: u32,
+    ) -> Result<Traffic> {
         let conn = self.conn();
-        let (prev_boot, last_rx, last_tx, mut total_rx, mut total_tx, mut month_rx, mut month_tx, month_start) =
-            conn.query_row(
-                "SELECT boot_id, last_rx, last_tx, total_rx, total_tx, month_rx, month_tx, month_start
+        let (
+            prev_boot,
+            last_rx,
+            last_tx,
+            mut total_rx,
+            mut total_tx,
+            mut month_rx,
+            mut month_tx,
+            month_start,
+        ) = conn.query_row(
+            "SELECT boot_id, last_rx, last_tx, total_rx, total_tx, month_rx, month_tx, month_start
                  FROM traffic WHERE node_id=?1",
-                [node_id],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?,
-                        r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?,
-                        r.get::<_, i64>(6)?, r.get::<_, String>(7)?,
-                    ))
-                },
-            )?;
+            [node_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, String>(7)?,
+                ))
+            },
+        )?;
 
         let rebooted = prev_boot != boot_id || rx < last_rx || tx < last_tx;
         let (d_rx, d_tx) = if rebooted { (rx, tx) } else { (rx - last_rx, tx - last_tx) };
@@ -359,7 +418,14 @@ impl Db {
     }
 
     /// Lets the panel correct a total, e.g. after moving a node to new hardware.
-    pub fn set_traffic(&self, node_id: i64, total_rx: i64, total_tx: i64, month_rx: i64, month_tx: i64) -> Result<()> {
+    pub fn set_traffic(
+        &self,
+        node_id: i64,
+        total_rx: i64,
+        total_tx: i64,
+        month_rx: i64,
+        month_tx: i64,
+    ) -> Result<()> {
         self.conn().execute(
             "UPDATE traffic SET total_rx=?2, total_tx=?3, month_rx=?4, month_tx=?5 WHERE node_id=?1",
             params![node_id, total_rx, total_tx, month_rx, month_tx],
@@ -378,8 +444,18 @@ impl Db {
                (node_id, ts, cpu, load1, mem_used, swap_used, disk_used, net_rx, net_tx, tcp, udp, procs)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             params![
-                node_id, ts, f("cpu"), load1, n("mem_used"), n("swap_used"), n("disk_used"),
-                n("net_rx"), n("net_tx"), n("tcp"), n("udp"), n("procs")
+                node_id,
+                ts,
+                f("cpu"),
+                load1,
+                n("mem_used"),
+                n("swap_used"),
+                n("disk_used"),
+                n("net_rx"),
+                n("net_tx"),
+                n("tcp"),
+                n("udp"),
+                n("procs")
             ],
         )?;
         Ok(())
@@ -539,8 +615,7 @@ impl Db {
     }
 
     pub fn expire_sessions(&self) -> Result<()> {
-        self.conn()
-            .execute("DELETE FROM session WHERE expires_at <= ?1", [Utc::now().timestamp()])?;
+        self.conn().execute("DELETE FROM session WHERE expires_at <= ?1", [Utc::now().timestamp()])?;
         Ok(())
     }
 }
@@ -581,11 +656,12 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
 pub fn period_start(today: NaiveDate, reset_day: u32) -> NaiveDate {
     let day = reset_day.clamp(1, 31);
     let clamped = |y: i32, m: u32| {
-        let last = NaiveDate::from_ymd_opt(if m == 12 { y + 1 } else { y }, if m == 12 { 1 } else { m + 1 }, 1)
-            .unwrap()
-            .pred_opt()
-            .unwrap()
-            .day();
+        let last =
+            NaiveDate::from_ymd_opt(if m == 12 { y + 1 } else { y }, if m == 12 { 1 } else { m + 1 }, 1)
+                .unwrap()
+                .pred_opt()
+                .unwrap()
+                .day();
         NaiveDate::from_ymd_opt(y, m, day.min(last)).unwrap()
     };
     let this = clamped(today.year(), today.month());
@@ -655,9 +731,7 @@ mod tests {
         assert_eq!(t.month_rx, 8_000);
 
         // Force the stored period to look stale, as it would after a rollover.
-        db.conn()
-            .execute("UPDATE traffic SET month_start='1999-01-01' WHERE node_id=?1", [id])
-            .unwrap();
+        db.conn().execute("UPDATE traffic SET month_start='1999-01-01' WHERE node_id=?1", [id]).unwrap();
         let t = db.accumulate(id, "boot-a", 9_500, 9_500, 1).unwrap();
         assert_eq!(t.month_rx, 1_500, "new period counts only this report's delta");
         assert_eq!(t.total_rx, 9_500, "lifetime total is untouched by the rollover");
@@ -712,14 +786,22 @@ mod tests {
         let (a, b) = (node(&db, 1), node(&db, 1));
         let id = db
             .save_ping_task(&PingTask {
-                id: 0, name: "cf".into(), target: "1.1.1.1:443".into(), interval: 60, nodes: vec![a, b],
+                id: 0,
+                name: "cf".into(),
+                target: "1.1.1.1:443".into(),
+                interval: 60,
+                nodes: vec![a, b],
             })
             .unwrap();
         assert_eq!(db.ping_tasks_for(a).unwrap().len(), 1);
 
         // Reassigning to one node must drop the other's copy.
         db.save_ping_task(&PingTask {
-            id, name: "cf".into(), target: "1.1.1.1:443".into(), interval: 30, nodes: vec![a],
+            id,
+            name: "cf".into(),
+            target: "1.1.1.1:443".into(),
+            interval: 30,
+            nodes: vec![a],
         })
         .unwrap();
         assert_eq!(db.ping_tasks_for(b).unwrap().len(), 0);

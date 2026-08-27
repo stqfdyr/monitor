@@ -101,7 +101,9 @@ fn notify(method: &str, params: serde_json::Value) -> Message {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_env("MONITOR_LOG").add_directive("info".parse()?))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_env("MONITOR_LOG").add_directive("info".parse()?),
+        )
         .init();
 
     let args = parse_args()?;
@@ -176,7 +178,8 @@ fn respawn_ping_tasks(
     tx: &mpsc::Sender<Message>,
 ) {
     running.retain(|(task, handle)| {
-        let keep = wanted.iter().any(|w| w.id == task.id && w.target == task.target && w.interval == task.interval);
+        let keep =
+            wanted.iter().any(|w| w.id == task.id && w.target == task.target && w.interval == task.interval);
         if !keep {
             handle.abort();
         }
@@ -192,10 +195,8 @@ fn respawn_ping_tasks(
             loop {
                 ticker.tick().await;
                 let latency = tcp_ping(&spawned.target).await;
-                let msg = notify(
-                    "ping.result",
-                    serde_json::json!({"task_id": spawned.id, "latency_ms": latency}),
-                );
+                let msg =
+                    notify("ping.result", serde_json::json!({"task_id": spawned.id, "latency_ms": latency}));
                 if tx.send(msg).await.is_err() {
                     return;
                 }
@@ -252,7 +253,11 @@ mod tests {
         let first = running[0].1.id();
 
         // Task 1 unchanged, task 2 retargeted, task 3 added.
-        respawn_ping_tasks(&mut running, vec![task(1, "a:1", 60), task(2, "c:3", 60), task(3, "d:4", 60)], &tx);
+        respawn_ping_tasks(
+            &mut running,
+            vec![task(1, "a:1", 60), task(2, "c:3", 60), task(3, "d:4", 60)],
+            &tx,
+        );
         assert_eq!(running.len(), 3);
         assert_eq!(running[0].1.id(), first, "unchanged task must not be restarted");
     }

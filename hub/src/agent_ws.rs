@@ -116,11 +116,7 @@ fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<()> {
 
 fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()> {
     let now = Utc::now().timestamp();
-    let reset_day = app
-        .db
-        .node(node_id)?
-        .map(|n| n.traffic_reset_day)
-        .unwrap_or(1);
+    let reset_day = app.db.node(node_id)?.map(|n| n.traffic_reset_day).unwrap_or(1);
 
     let boot_id = metrics.get("boot_id").and_then(|v| v.as_str()).unwrap_or("").to_owned();
     let rx = metrics.get("net_rx_total").and_then(|v| v.as_i64()).unwrap_or(0);

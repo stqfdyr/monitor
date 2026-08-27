@@ -88,13 +88,7 @@ fn node_view(app: &App, node: &Node, full: bool) -> Value {
 }
 
 fn visible_nodes(app: &App, full: bool) -> Result<Vec<Value>, anyhow::Error> {
-    Ok(app
-        .db
-        .nodes()?
-        .iter()
-        .filter(|n| full || n.public)
-        .map(|n| node_view(app, n, full))
-        .collect())
+    Ok(app.db.nodes()?.iter().filter(|n| full || n.public).map(|n| node_view(app, n, full)).collect())
 }
 
 pub async fn nodes(State(app): State<Shared>, headers: HeaderMap) -> Response {
@@ -124,30 +118,20 @@ pub async fn metrics(
     Path(id): Path<i64>,
     Query(w): Query<Window>,
 ) -> Response {
-    match readable(&app, &headers, id) {
-        Err(r) => r,
-        Ok(()) => {
-            let since = Utc::now().timestamp() - w.hours.clamp(1, 24 * 90) * 3_600;
-            match (app.db.metrics(id, since), app.db.ping_records(id, since)) {
-                (Ok(m), Ok(p)) => Json(json!({"metrics": m, "ping": p})).into_response(),
-                (Err(e), _) | (_, Err(e)) => fail(e),
-            }
-        }
+    if !readable(&app, &headers, id) {
+        return (StatusCode::UNAUTHORIZED, "sign-in required").into_response();
+    }
+    let since = Utc::now().timestamp() - w.hours.clamp(1, 24 * 90) * 3_600;
+    match (app.db.metrics(id, since), app.db.ping_records(id, since)) {
+        (Ok(m), Ok(p)) => Json(json!({"metrics": m, "ping": p})).into_response(),
+        (Err(e), _) | (_, Err(e)) => fail(e),
     }
 }
 
 /// Guards a per-node read: the panel sees everything, the public page only
 /// sees nodes that were explicitly published.
-fn readable(app: &App, headers: &HeaderMap, id: i64) -> Result<(), Response> {
-    if authed(app, headers) {
-        return Ok(());
-    }
-    let public = app.public_page() && app.db.node(id).ok().flatten().is_some_and(|n| n.public);
-    if public {
-        Ok(())
-    } else {
-        Err((StatusCode::UNAUTHORIZED, "sign-in required").into_response())
-    }
+fn readable(app: &App, headers: &HeaderMap, id: i64) -> bool {
+    authed(app, headers) || (app.public_page() && app.db.node(id).ok().flatten().is_some_and(|n| n.public))
 }
 
 /// Live stream for the browser. Each connection runs its own timer, which is
@@ -195,7 +179,9 @@ pub async fn create_node(
     let token = random_token();
     match app.db.create_node(&node, &sha256(&token)) {
         // The plaintext token is shown exactly once, here.
-        Ok(id) => Json(json!({"id": id, "token": token, "install": app.install_command(&token)})).into_response(),
+        Ok(id) => {
+            Json(json!({"id": id, "token": token, "install": app.install_command(&token)})).into_response()
+        }
         Err(e) => fail(e),
     }
 }
@@ -290,20 +276,18 @@ pub async fn delete_ping_task(_: Admin, State(app): State<Shared>, Path(id): Pat
 
 /// Settings the panel may read. Secrets are deliberately absent: the client
 /// can set the GitHub secret but never read it back.
-const READABLE_SETTINGS: &[&str] = &[
-    "site_name",
-    "public_page",
-    "github_client_id",
-    "github_allowed_users",
-    "retention_days",
-];
+const READABLE_SETTINGS: &[&str] =
+    &["site_name", "public_page", "github_client_id", "github_allowed_users", "retention_days"];
 
 pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
     let mut out = serde_json::Map::new();
     for key in READABLE_SETTINGS {
         out.insert((*key).to_owned(), json!(app.db.get(key).unwrap_or_default()));
     }
-    out.insert("github_secret_set".into(), json!(app.db.get("github_client_secret").is_some_and(|v| !v.is_empty())));
+    out.insert(
+        "github_secret_set".into(),
+        json!(app.db.get("github_client_secret").is_some_and(|v| !v.is_empty())),
+    );
     Json(Value::Object(out))
 }
 
@@ -386,6 +370,22 @@ mod tests {
         assert_eq!(view["metrics"], Value::Null);
         assert_eq!(view["total_rx"], 800, "traffic is stored, not derived from the live state");
         assert_eq!(view["total_tx"], 400);
+    }
+
+    #[test]
+    fn per_node_reads_follow_the_public_flag_and_the_public_page_switch() {
+        let app = app();
+        let open = node(&app, "open", true);
+        let hidden = node(&app, "hidden", false);
+        let anonymous = HeaderMap::new();
+
+        assert!(readable(&app, &anonymous, open), "a published node is readable by anyone");
+        assert!(!readable(&app, &anonymous, hidden), "a private node is not");
+        assert!(!readable(&app, &anonymous, 9999), "an unknown id is not");
+
+        // Switching the public page off closes even the published node.
+        app.db.set("public_page", "off").unwrap();
+        assert!(!readable(&app, &anonymous, open));
     }
 
     #[tokio::test]

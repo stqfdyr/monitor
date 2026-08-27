@@ -9,15 +9,37 @@ use serde::Serialize;
 
 /// Interface name prefixes never counted as real traffic.
 const SKIP_IFACES: &[&str] = &[
-    "lo", "docker", "veth", "br-", "virbr", "vmbr", "tap", "tun", "cni", "flannel", "podman", "fwbr",
-    "fwpr", "kube", "cali", "nerdctl", "zt",
+    "lo", "docker", "veth", "br-", "virbr", "vmbr", "tap", "tun", "cni", "flannel", "podman", "fwbr", "fwpr",
+    "kube", "cali", "nerdctl", "zt",
 ];
 
 /// Pseudo/virtual filesystems that must not count toward disk totals.
 const SKIP_FSTYPES: &[&str] = &[
-    "tmpfs", "devtmpfs", "proc", "sysfs", "cgroup", "cgroup2", "devpts", "mqueue", "hugetlbfs",
-    "debugfs", "tracefs", "securityfs", "pstore", "bpf", "configfs", "fusectl", "binfmt_misc",
-    "autofs", "squashfs", "ramfs", "efivarfs", "nsfs", "overlay", "fuse.lxcfs", "rpc_pipefs",
+    "tmpfs",
+    "devtmpfs",
+    "proc",
+    "sysfs",
+    "cgroup",
+    "cgroup2",
+    "devpts",
+    "mqueue",
+    "hugetlbfs",
+    "debugfs",
+    "tracefs",
+    "securityfs",
+    "pstore",
+    "bpf",
+    "configfs",
+    "fusectl",
+    "binfmt_misc",
+    "autofs",
+    "squashfs",
+    "ramfs",
+    "efivarfs",
+    "nsfs",
+    "overlay",
+    "fuse.lxcfs",
+    "rpc_pipefs",
 ];
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -69,12 +91,7 @@ pub struct Collector {
 
 impl Collector {
     pub fn new(extra_skip_ifaces: Vec<String>) -> Self {
-        Self {
-            prev_cpu: None,
-            prev_net: None,
-            mounts: real_mount_points(),
-            skip_ifaces: extra_skip_ifaces,
-        }
+        Self { prev_cpu: None, prev_net: None, mounts: real_mount_points(), skip_ifaces: extra_skip_ifaces }
     }
 
     pub fn facts(&self) -> Facts {
@@ -260,8 +277,7 @@ fn parse_net_dev(text: &str, extra_skip: &[String]) -> (u64, u64) {
 }
 
 fn skip_iface(name: &str, extra_skip: &[String]) -> bool {
-    SKIP_IFACES.iter().any(|p| name.starts_with(p))
-        || extra_skip.iter().any(|p| name.starts_with(p.as_str()))
+    SKIP_IFACES.iter().any(|p| name.starts_with(p)) || extra_skip.iter().any(|p| name.starts_with(p.as_str()))
 }
 
 /// Mount points backed by something real, deduplicated by source device so a
@@ -319,10 +335,7 @@ fn conn_counts() -> (u32, u32) {
             .map(|t| t.lines().count().saturating_sub(1) as u32)
             .sum()
     };
-    (
-        count(["/proc/net/tcp", "/proc/net/tcp6"]),
-        count(["/proc/net/udp", "/proc/net/udp6"]),
-    )
+    (count(["/proc/net/tcp", "/proc/net/tcp6"]), count(["/proc/net/udp", "/proc/net/udp6"]))
 }
 
 fn proc_count() -> u32 {
@@ -352,8 +365,7 @@ fn os_pretty_name() -> String {
     fs::read_to_string("/etc/os-release")
         .ok()
         .and_then(|t| {
-            t.lines()
-                .find_map(|l| Some(l.strip_prefix("PRETTY_NAME=")?.trim_matches('"').to_owned()))
+            t.lines().find_map(|l| Some(l.strip_prefix("PRETTY_NAME=")?.trim_matches('"').to_owned()))
         })
         .unwrap_or_else(|| "Linux".into())
 }

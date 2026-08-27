@@ -70,10 +70,7 @@ impl App {
     }
 
     pub fn install_command(&self, token: &str) -> String {
-        format!(
-            "curl -fsSL {}/install.sh | sh -s -- --server {} --token {}",
-            self.site, self.site, token
-        )
+        format!("curl -fsSL {}/install.sh | sh -s -- --server {} --token {}", self.site, self.site, token)
     }
 }
 
@@ -89,7 +86,8 @@ async fn serve_asset(uri: Uri) -> Response {
     if let Some(file) = Assets::get(path) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
         // Hashed build assets are immutable; the entry HTML must not be cached.
-        let cache = if path.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
+        let cache =
+            if path.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
         return (
             [(header::CONTENT_TYPE, mime.as_ref()), (header::CACHE_CONTROL, cache)],
             file.data.into_owned(),
@@ -203,7 +201,9 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     info!("listening on {} (public URL {})", args.listen, args.site);
     axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(async { let _ = tokio::signal::ctrl_c().await; })
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
         .await?;
     Ok(())
 }
@@ -231,12 +231,8 @@ async fn housekeeping(app: Shared) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3_600));
     loop {
         ticker.tick().await;
-        let keep = app
-            .db
-            .get("retention_days")
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(30)
-            .clamp(1, 3_650);
+        let keep =
+            app.db.get("retention_days").and_then(|v| v.parse::<i64>().ok()).unwrap_or(30).clamp(1, 3_650);
         if let Err(e) = app.db.prune(keep) {
             warn!("pruning history failed: {e:#}");
         }
