@@ -88,7 +88,10 @@ if allowed.is_empty() {
 
 安装脚本把 token 写进 `/etc/monitor/agent.env`，`0600` + `umask 077`，目录 `0700`。**不写在 systemd unit 里**——unit 内容会出现在 `systemctl cat` 和 journal 里。
 
-systemd 单元加固：`DynamicUser`、`NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome`、`PrivateTmp`、`PrivateDevices`、`RestrictAddressFamilies=AF_INET AF_INET6`、`MemoryMax=64M`。
+systemd 单元加固：`DynamicUser`、`NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome`、`PrivateTmp`、`PrivateDevices`、`RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK`、`MemoryMax=64M`。
+
+`AF_NETLINK` 是 `getifaddrs(3)` 问内核"这台机器有哪些地址"的通道，agent 靠它上报自己的
+IPv4/IPv6。去掉它不会报错，只会让上报的地址一直是空字符串——这个坑踩过一次。
 
 ### agent 拒绝明文传输
 

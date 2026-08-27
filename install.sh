@@ -113,7 +113,9 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
-RestrictAddressFamilies=AF_INET AF_INET6
+# AF_NETLINK is how getifaddrs(3) asks the kernel for this box's own
+# addresses; without it the agent reports none at all.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
 MemoryMax=64M
 
 [Install]
@@ -121,5 +123,8 @@ WantedBy=multi-user.target
 UNIT
 
 systemctl daemon-reload
-systemctl enable --now monitor-agent
+systemctl enable monitor-agent >/dev/null
+# restart, not `enable --now`: --now leaves an already-running service alone,
+# so reinstalling on top of a live agent would keep the old binary running.
+systemctl restart monitor-agent
 echo "monitor-agent installed; follow it with: journalctl -u monitor-agent -f"
