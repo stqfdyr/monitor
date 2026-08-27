@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useState } from "react"
 
 export type Metrics = {
   uptime: number
@@ -84,7 +84,7 @@ export function useNodes() {
   const [nodes, setNodes] = useState<Node[] | null>(null)
   const [admin, setAdmin] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const reload = useRef(0)
+  const [reload, setReload] = useState(0)
 
   useEffect(() => {
     let socket: WebSocket | null = null
@@ -119,7 +119,7 @@ export function useNodes() {
       socket?.close()
       if (poll) clearInterval(poll)
     }
-  }, [reload.current])
+  }, [reload])
 
-  return { nodes, admin, error, refresh: () => reload.current++ }
+  return { nodes, admin, error, refresh: () => setReload((n) => n + 1) }
 }

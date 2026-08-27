@@ -8,15 +8,17 @@ mod agent_ws;
 mod api;
 mod auth;
 mod db;
+mod frontend;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Result;
 use axum::extract::State;
-use axum::http::{header, StatusCode, Uri};
-use axum::response::{Html, IntoResponse, Response};
+use axum::http::header;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
 use tokio::sync::mpsc;
@@ -37,10 +39,12 @@ pub struct App {
     pub http: reqwest::Client,
     /// Public base URL, used for install commands and to decide cookie flags.
     pub site: String,
+    /// Parent directory containing one folder per installed public theme.
+    pub themes: PathBuf,
 }
 
 impl App {
-    fn new(db: Db, site: String) -> Self {
+    fn new(db: Db, site: String, themes: PathBuf) -> Self {
         Self {
             db,
             live: RwLock::default(),
@@ -51,12 +55,13 @@ impl App {
                 .build()
                 .expect("http client"),
             site,
+            themes,
         }
     }
 
     #[cfg(test)]
     pub fn for_test(db: Db) -> Self {
-        Self::new(db, "http://localhost:8080".into())
+        Self::new(db, "http://localhost:8080".into(), PathBuf::from("themes"))
     }
 
     pub fn public_page(&self) -> bool {
@@ -72,45 +77,6 @@ impl App {
     pub fn install_command(&self, token: &str) -> String {
         format!("curl -fsSL {}/install.sh | sh -s -- --server {} --token {}", self.site, self.site, token)
     }
-}
-
-// ---- embedded frontend ----
-
-#[derive(rust_embed::Embed)]
-#[folder = "web/dist"]
-struct Assets;
-
-async fn serve_asset(uri: Uri) -> Response {
-    let path = uri.path().trim_start_matches('/');
-    if is_api_path(path) {
-        // An unmatched API path is a bug or a misconfiguration, never a
-        // client-side route. Answering it with the SPA turns a wrong URL into a
-        // silent 200 and hides the mistake completely — a GitHub OAuth app
-        // pointed at the wrong callback path looked exactly like "nothing
-        // happened", with no error anywhere.
-        return (StatusCode::NOT_FOUND, format!("no such endpoint: /{path}")).into_response();
-    }
-    let path = if path.is_empty() { "index.html" } else { path };
-    if let Some(file) = Assets::get(path) {
-        let mime = mime_guess::from_path(path).first_or_octet_stream();
-        // Hashed build assets are immutable; the entry HTML must not be cached.
-        let cache =
-            if path.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
-        return (
-            [(header::CONTENT_TYPE, mime.as_ref()), (header::CACHE_CONTROL, cache)],
-            file.data.into_owned(),
-        )
-            .into_response();
-    }
-    // Unknown paths fall through to the SPA so client-side routes work on reload.
-    match Assets::get("index.html") {
-        Some(index) => Html(index.data.into_owned()).into_response(),
-        None => (StatusCode::NOT_FOUND, "frontend not built; run `npm run build` in web/").into_response(),
-    }
-}
-
-fn is_api_path(path: &str) -> bool {
-    path == "api" || path.starts_with("api/")
 }
 
 /// The one-liner pasted onto a new VPS.
@@ -131,12 +97,14 @@ struct Args {
     listen: SocketAddr,
     database: String,
     site: String,
+    themes: PathBuf,
 }
 
 fn parse_args() -> Result<Args> {
     let mut listen = "0.0.0.0:8080".to_owned();
     let mut database = "monitor.db".to_owned();
     let mut site = String::new();
+    let mut themes = None;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || it.next().unwrap_or_default();
@@ -144,10 +112,12 @@ fn parse_args() -> Result<Args> {
             "--listen" => listen = value(),
             "--db" => database = value(),
             "--site" => site = value(),
+            "--themes" => themes = Some(PathBuf::from(value())),
             "-h" | "--help" => {
                 println!(
                     "monitor-hub {}\n\n\
-                     Usage: monitor-hub [--listen 0.0.0.0:8080] [--db monitor.db] [--site https://hub.example.com]\n\n\
+                     Usage: monitor-hub [--listen 0.0.0.0:8080] [--db monitor.db] [--themes themes] [--site https://hub.example.com]\n\n\
+                     --themes defaults to a themes/ directory beside the database.\n\
                      --site is the public URL agents and browsers reach this hub on. It is\n\
                      baked into install commands and decides whether session cookies are\n\
                      marked Secure, so set it once you are behind TLS.",
@@ -162,7 +132,10 @@ fn parse_args() -> Result<Args> {
     if site.is_empty() {
         site = format!("http://{listen}");
     }
-    Ok(Args { listen, database, site: site.trim_end_matches('/').to_owned() })
+    let themes = themes.unwrap_or_else(|| {
+        std::path::Path::new(&database).parent().unwrap_or_else(|| std::path::Path::new(".")).join("themes")
+    });
+    Ok(Args { listen, database, site: site.trim_end_matches('/').to_owned(), themes })
 }
 
 #[tokio::main]
@@ -175,7 +148,8 @@ async fn main() -> Result<()> {
         .init();
 
     let args = parse_args()?;
-    let app = Arc::new(App::new(Db::open(&args.database)?, args.site.clone()));
+    std::fs::create_dir_all(&args.themes)?;
+    let app = Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes));
     first_run(&app)?;
     if exposed_over_plain_http(&args.site) {
         warn!("--site is plain HTTP on a remote host; sessions and agent tokens will travel in the clear");
@@ -205,7 +179,8 @@ async fn main() -> Result<()> {
         .route("/api/ping-tasks", get(api::ping_tasks).post(api::save_ping_task))
         .route("/api/ping-tasks/{id}", delete(api::delete_ping_task))
         .route("/api/settings", get(api::settings).put(api::save_settings))
-        .fallback(serve_asset)
+        .route("/api/themes", get(api::themes))
+        .fallback(frontend::serve)
         // A report is a few hundred bytes; anything larger is not one.
         .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
         .with_state(app);
@@ -283,17 +258,22 @@ async fn housekeeping(app: Shared) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::{StatusCode, Uri};
+
+    fn app(site: &str) -> App {
+        App::new(Db::open(":memory:").unwrap(), site.into(), PathBuf::from("themes"))
+    }
 
     #[test]
     fn secure_cookies_track_the_public_scheme() {
-        let db = || Db::open(":memory:").unwrap();
-        assert!(!App::new(db(), "http://127.0.0.1:8080".into()).secure_cookies());
-        assert!(App::new(db(), "https://hub.example.com".into()).secure_cookies());
+        assert!(!app("http://127.0.0.1:8080").secure_cookies());
+        assert!(app("https://hub.example.com").secure_cookies());
     }
 
     #[tokio::test]
     async fn an_unknown_api_path_is_a_404_not_the_single_page_app() {
-        let spa = |p: &str| serve_asset(p.parse::<Uri>().unwrap());
+        let app = Arc::new(app("http://localhost:8080"));
+        let spa = |p: &str| frontend::serve(State(app.clone()), p.parse::<Uri>().unwrap());
 
         // The shape that hid a misconfigured OAuth callback for an entire
         // debugging session.
@@ -323,7 +303,7 @@ mod tests {
 
     #[test]
     fn the_install_command_carries_the_public_url_and_token() {
-        let app = App::new(Db::open(":memory:").unwrap(), "https://hub.example.com".into());
+        let app = app("https://hub.example.com");
         let command = app.install_command("tok123");
         assert!(command.contains("https://hub.example.com/install.sh"));
         assert!(command.contains("--server https://hub.example.com"));
@@ -332,7 +312,7 @@ mod tests {
 
     #[test]
     fn the_public_page_is_on_unless_it_is_switched_off() {
-        let app = App::new(Db::open(":memory:").unwrap(), "http://x".into());
+        let app = app("http://x");
         assert!(app.public_page());
         app.db.set("public_page", "off").unwrap();
         assert!(!app.public_page());
@@ -342,7 +322,7 @@ mod tests {
 
     #[test]
     fn first_run_sets_a_password_once_and_leaves_it_alone_after() {
-        let app = App::new(Db::open(":memory:").unwrap(), "http://x".into());
+        let app = app("http://x");
         first_run(&app).unwrap();
         let hash = app.db.get("admin_password_hash").unwrap();
         assert!(hash.starts_with("$argon2"));

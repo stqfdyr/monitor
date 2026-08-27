@@ -39,13 +39,14 @@ export default function App() {
     if (admin) api<{ tasks: PingTask[] }>("/ping-tasks").then((d) => setTasks(d.tasks)).catch(() => {})
   }, [admin])
 
+  useEffect(() => {
+    if (me && !me.public_page && !me.authed) location.href = "/admin/"
+  }, [me])
+
   if (!me) return <div className="grid min-h-svh place-items-center text-sm text-muted-foreground">加载中…</div>
 
   // The status page is closed and nobody is signed in: send them to the panel.
-  if (!me.public_page && !me.authed) {
-    location.href = "/admin/"
-    return null
-  }
+  if (!me.public_page && !me.authed) return null
 
   const sorted = [...(nodes ?? [])].sort((a, b) => a.sort - b.sort || a.id - b.id)
   const selected = sorted.find((n) => n.id === open)

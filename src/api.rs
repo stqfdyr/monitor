@@ -279,7 +279,14 @@ pub async fn delete_ping_task(_: Admin, State(app): State<Shared>, Path(id): Pat
 /// Settings the panel may read. Secrets are deliberately absent: the client
 /// can set the GitHub secret but never read it back.
 const READABLE_SETTINGS: &[&str] =
-    &["site_name", "public_page", "github_client_id", "github_allowed_users", "retention_days"];
+    &["site_name", "public_page", "github_client_id", "github_allowed_users", "retention_days", "theme"];
+
+pub async fn themes(_: Admin, State(app): State<Shared>) -> Response {
+    match crate::frontend::themes(&app) {
+        Ok(themes) => Json(json!({"themes": themes})).into_response(),
+        Err(e) => fail(e),
+    }
+}
 
 pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
     let mut out = serde_json::Map::new();
@@ -301,6 +308,7 @@ pub async fn save_settings(_: Admin, State(app): State<Shared>, Json(body): Json
     for (key, value) in map {
         let Some(value) = value.as_str() else { continue };
         let stored = match key.as_str() {
+            "theme" if !crate::frontend::selectable(&app, value) => return bad("theme is not installed"),
             k if READABLE_SETTINGS.contains(&k) || k == "github_client_secret" => value,
             // Changing the password logs every existing session out.
             "admin_password" => {

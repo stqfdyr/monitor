@@ -21,11 +21,15 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: web/package-lock.json
+          cache-dependency-path: |
+            web-admin/package-lock.json
+            web-theme/package-lock.json
 
-      # The hub embeds the built frontend, so it has to exist before cargo runs.
+      # The hub embeds both SPAs, so they have to exist before cargo runs.
       - run: npm ci && npm run build
-        working-directory: web
+        working-directory: web-admin
+      - run: npm ci && npm run build
+        working-directory: web-theme
 
       - uses: dtolnay/rust-toolchain@stable
         with:

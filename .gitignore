@@ -1,6 +1,8 @@
 /target
-/web/node_modules
-/web/dist
+/web-admin/node_modules
+/web-admin/dist
+/web-theme/node_modules
+/web-theme/dist
 *.db
 *.db-shm
 *.db-wal

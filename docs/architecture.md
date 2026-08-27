@@ -4,19 +4,22 @@
 ┌──────────────┐   WebSocket + JSON-RPC 2.0    ┌─────────────────────┐   HTTP + WS   ┌─────────┐
 │    agent     │ ─── Authorization: Bearer ──▶ │        hub          │ ◀──────────── │ 浏览器  │
 │  (Linux VPS) │ ◀──── ping.tasks 下发 ─────── │  axum + SQLite      │               │ React   │
-└──────────────┘                               │  前端嵌在二进制里   │               └─────────┘
+└──────────────┘                               │ 后台内置 / 主题可换 │               └─────────┘
    读 /proc                                    └─────────────────────┘
    无状态                                          monitor.db
 ```
 
-## 两个仓库
+## 三个仓库
 
 | 仓库 | 内容 |
 |---|---|
-| **monitor**（本仓库） | hub + 前端 + `install.sh` |
+| **monitor**（本仓库） | hub + 内置后台 + `install.sh` |
 | **[agent](https://github.com/stqfdyr/agent)** | Linux agent。发布自己的 musl 二进制，`install.sh` 从那边的 release 拉 |
+| **[monitor-theme-default](https://github.com/stqfdyr/monitor-theme-default)** | 默认公开页主题；hub release 构建时 clone、构建并嵌入 |
 
-拆开是因为两者部署在不同机器上、发布节奏不同。前端**没有**单独仓库——它是 `rust-embed` 编译进 hub 二进制的，拆出去只会让构建变成三步而换不来任何能力。
+agent 拆开是因为部署机器和发布节奏不同。默认主题拆开是为了让主题拥有独立契约、版本和开发流程；代价是 hub 的 release 构建多一个 clone 步骤。
+
+后台不属于主题。`/admin/*` 和登录页始终由 hub 内置的 `web-admin` 提供；主题只负责公开状态页。这样第三方主题不需要重做节点 CRUD、OAuth 和密码设置。
 
 ## 源码地图
 
@@ -26,8 +29,10 @@
 | `src/agent_ws.rs` | ~275 | agent 侧 WebSocket、RPC 分发、实时状态 |
 | `src/api.rs` | ~405 | 面板和公开页的 HTTP 接口、`Admin` 提取器 |
 | `src/auth.rs` | ~330 | session、GitHub OAuth、argon2 密码、登录限流 |
-| `src/main.rs` | ~285 | 启动、路由表、静态资源、首次运行、定时清理 |
-| `web/src/` | ~1370 | 前端。`components/ui/` 下是 shadcn 生成的，不手改 |
+| `src/main.rs` | ~290 | 启动、路由表、首次运行、定时清理 |
+| `src/frontend.rs` | ~200 | 双 SPA、主题扫描、磁盘安全读取与 fallback |
+| `web-admin/src/` | ~700 | 内置后台。`components/ui/` 下是 shadcn 生成的，不手改 |
+| `web-theme/` | 构建时检出 | 默认主题仓库的本地工作副本，不提交到 hub 仓库 |
 
 agent 的采集代码在 [另一个仓库](https://github.com/stqfdyr/agent)。改了它的上报字段就是改了协议，两边要同步。
 
@@ -94,6 +99,7 @@ agent 收到后会**保留没变化的任务**（同 id + 同 target + 同 inter
 | `github_client_id` / `github_client_secret` | 空 | OAuth App |
 | `github_allowed_users` | 空 | 逗号分隔的用户名白名单。**空 = 任何人都登不进来**（不是任何人都能进） |
 | `release_repo` | `stqfdyr/monitor` | `install.sh` 从哪个仓库拉二进制。目前没有 UI，只能改 DB |
+| `theme` | `default` | 公开页主题短名；空、无效或已删除时使用内置默认主题 |
 
 ## 请求路径
 
@@ -107,9 +113,17 @@ agent 收到后会**保留没变化的任务**（同 id + 同 target + 同 inter
 **登录**：`POST /api/auth/login`、`POST /api/auth/logout`、`GET /api/auth/github`、`GET /api/auth/github/callback`
 
 **面板**（全部要 `Admin` 提取器）：
-`POST /api/nodes`、`PUT|DELETE /api/nodes/{id}`、`POST /api/nodes/{id}/token`、`PUT /api/nodes/{id}/traffic`、`GET|POST /api/ping-tasks`、`DELETE /api/ping-tasks/{id}`、`GET|PUT /api/settings`
+`POST /api/nodes`、`PUT|DELETE /api/nodes/{id}`、`POST /api/nodes/{id}/token`、`PUT /api/nodes/{id}/traffic`、`GET|POST /api/ping-tasks`、`DELETE /api/ping-tasks/{id}`、`GET|PUT /api/settings`、`GET /api/themes`
 
-其余路径 fallback 到嵌入的前端，找不到就返回 `index.html`，让前端路由在刷新时也能工作。
+其余路径按下面顺序处理：
+
+```text
+/api/*           未匹配即 404，不回落 SPA
+/admin, /admin/* 内置后台；资源位于 /admin/assets/
+其它             当前磁盘主题；不可用时回落内置默认主题
+```
+
+主题内找不到的路径返回同一主题的 `index.html`，让客户端路由刷新可用。磁盘文件必须在规范化后仍位于 `<themes>/<short>/dist` 内，路径穿越和越界符号链接都会被拒绝。
 
 ## 实时状态放在内存里
 

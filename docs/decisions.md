@@ -54,7 +54,7 @@ komari-agent 能从 GitHub release 拉新二进制自替换。用户选了不做
 
 ### 零配置文件 **[默认]**
 
-只有三个命令行参数：`--listen`、`--db`、`--site`。其余全部存在 SQLite 的 `setting` 表里，在面板配置。
+只有四个命令行参数：`--listen`、`--db`、`--themes`、`--site`。`--themes` 默认是数据库旁的 `themes/`；其余全部存在 SQLite 的 `setting` 表里，在面板配置。
 
 **为什么**：少一个 TOML 解析、少一类"配置文件在哪/权限对不对/和 DB 不同步"的问题。密钥存在 DB 里也比存在明文配置文件里好。
 
@@ -62,11 +62,11 @@ komari-agent 能从 GitHub release 拉新二进制自替换。用户选了不做
 
 **`--site` 有两个作用**，改动时注意：安装命令里的地址，以及 session cookie 要不要带 `Secure`（`http://` 开头就不带，否则本地 HTTP 部署浏览器会拒绝存 cookie）。
 
-### 前端嵌进二进制 **[默认]**
+### 后台与默认主题嵌进二进制 **[默认]**
 
-`rust-embed` 把 `web/dist` 打进 hub。部署 = 一个二进制 + 一个 db 文件。
+`rust-embed` 把 `web-admin/dist` 和构建时检出的 `web-theme/dist` 打进 hub。没有安装第三方主题时，部署仍是一个二进制 + 一个 db 文件。
 
-注意：**debug 构建时 rust-embed 从磁盘读**，所以开发时改前端不用重新 `cargo build`；release 才真正嵌入。
+注意：**debug 构建时 rust-embed 从磁盘读**，所以开发时要保留两个 `dist/`；release 才真正嵌入。
 
 ### 单管理员，不做用户表 **[默认]**
 
@@ -94,7 +94,7 @@ agent 每 2 秒上报（实时视图用），但 `metric` 表每节点每分钟�
 
 用户明确说"这个和总流量不是一回事，要区分开"。
 
-`traffic` 表里 `total_rx/total_tx`（永不重置）和 `month_rx/month_tx`（按商家重置日重置）是两组独立的列，同一次上报同时更新。月流量在 UI 上用圆环显示（`web/src/components/TrafficRing.tsx`）。
+`traffic` 表里 `total_rx/total_tx`（永不重置）和 `month_rx/month_tx`（按商家重置日重置）是两组独立的列，同一次上报同时更新。月流量在默认主题里用圆环显示（开发检出路径 `web-theme/src/components/TrafficRing.tsx`）。
 
 ### 月度周期按商家重置日算 **[默认]**
 
@@ -130,9 +130,19 @@ GitHub OAuth 就是两个 HTTP 请求。`oauth2` crate 带一堆用不上的 flo
 
 ## 前端
 
+### 公开主题独立仓库，后台留在 hub **[用户]**
+
+用户在了解跨仓库构建代价后，明确要求像 komari 一样拆出主题，并能方便更换。主题只拥有公开状态页；登录页与 `/admin/*` 固定在 hub。
+
+真正的换主题能力来自 hub 运行时读取 `<themes>/<short>/dist`，不是拆仓库本身。选中主题缺失、损坏或被删除时自动回落内置默认主题，保证零配置启动和恢复入口可用。
+
+默认主题放在独立的 `monitor-theme-default` 仓库。hub release CI clone 并构建它，再作为内置 fallback 嵌入。这引入了一个明确接受的跨仓库构建依赖，换来独立的主题版本、契约和开发流程。
+
+**否决**：让主题接管后台——每个主题作者都会被迫实现节点 CRUD、OAuth、密码修改；zip 上传——需要额外依赖并扩大 zip-slip 攻击面，复制目录 + 面板选择已经够用。
+
 ### shadcn/ui **[用户]**
 
-用户指定的。`web/src/components/ui/` 下是 CLI 生成的组件，**不要手改**——要改样式改 `src/index.css` 里的 CSS 变量。
+用户指定的。`web-admin/src/components/ui/` 和主题的 `src/components/ui/` 是 CLI 生成的组件，**不要手改**——要改样式改各自 `src/index.css` 里的 CSS 变量。
 
 用不到的组件删掉了（dropdown-menu / progress / tooltip / sonner 的 wrapper）。
 
@@ -142,7 +152,7 @@ GitHub OAuth 就是两个 HTTP 请求。`oauth2` crate 带一堆用不上的 flo
 
 ### 不用 react-router **[默认]**
 
-两个路由加一个登录页。`web/src/App.tsx` 里 20 行的 `usePath()` 就够了，用 `history.pushState` + `popstate`。
+后台只有几个内部页面。`web-admin/src/App.tsx` 里的小型 `usePath()` 就够了，用 `history.pushState` + `popstate`。
 
 ---
 

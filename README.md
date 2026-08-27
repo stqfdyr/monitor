@@ -2,7 +2,8 @@
 
 一个轻量的服务器探针的 **hub**：Rust 编写，前端 React + shadcn/ui，编译成单个二进制。
 
-agent 在 [另一个仓库](https://github.com/stqfdyr/agent)——它部署在被监控的机器上，发布节奏和 hub 独立。
+agent 在 [独立仓库](https://github.com/stqfdyr/agent)，内置默认主题也在
+[独立仓库](https://github.com/stqfdyr/monitor-theme-default)。
 
 只做四件事：看状态、看流量、看延迟、算成本。没有通知、没有远程 SSH、没有插件系统。
 
@@ -21,21 +22,25 @@ agent 在 [另一个仓库](https://github.com/stqfdyr/agent)——它部署在�
 ## 架构
 
 ```
-agent (Linux)  ──WebSocket + JSON-RPC 2.0──▶  hub (axum + SQLite)  ──▶  面板 / 公开状态页
-   读 /proc                Bearer token              内嵌前端，单文件
+agent (Linux)  ──WebSocket + JSON-RPC 2.0──▶  hub (axum + SQLite)  ──▶  后台 / 可换主题的状态页
+   读 /proc                Bearer token              单二进制 + SQLite
 ```
 
 - **[agent](https://github.com/stqfdyr/agent)** 只支持 Linux，直接读 `/proc` 和 `statvfs`，不依赖 sysinfo。静态链接后是一个几 MB 的单文件。
-- **hub** 零配置启动。除了监听地址和数据库路径，其它全在面板里配、存 SQLite。前端构建产物嵌进二进制。
+- **hub** 零配置启动。后台和默认主题嵌进二进制；公开页也能从磁盘加载第三方主题。
 - **通信** WebSocket 承载 JSON-RPC 2.0 通知，token 走 `Authorization` 头（不进反代日志）。
 
-前端没有单独的仓库：它由 `rust-embed` 编译进 hub 二进制，拆出去只会让构建多两步，换不来换主题的能力。
+主题只负责公开状态页；登录和 `/admin/*` 后台固定内置，主题作者不需要重做节点管理与设置。
 
 ## 跑起来
 
 ```bash
-# 前端
-cd web && npm ci && npm run build && cd ..
+# 后台
+cd web-admin && npm ci && npm run build && cd ..
+
+# 内置默认主题（开发时检出；release CI 会自动 clone）
+git clone https://github.com/stqfdyr/monitor-theme-default web-theme
+cd web-theme && npm ci && npm run build && cd ..
 
 # hub
 cargo build --release
@@ -55,6 +60,8 @@ curl -fsSL https://hub.example.com/install.sh | sh -s -- --server https://hub.ex
 装完是一个 systemd 服务，token 存在 `/etc/monitor/agent.env`（0600，不进 journal）。
 
 `--site` 请在上了 TLS 之后设成 https 地址：它决定安装命令里的地址，也决定 session cookie 要不要带 `Secure`。
+
+主题默认放在数据库旁的 `themes/`，也可用 `--themes /path/to/themes` 指定。主题目录复制进去后，在后台「主题」页切换；选中的主题损坏或被删时自动回落到内置默认主题。
 
 ### 放在反代或隧道后面
 
@@ -85,8 +92,8 @@ monitor-hub --listen 127.0.0.1:8080 --db /var/lib/monitor/monitor.db --site http
 ## 开发
 
 ```bash
-cargo test                      # 34 个测试
-cd web && npm run dev           # 前端热更新，API 代理到 127.0.0.1:9911
+cargo test
+cd web-admin && npm run dev     # 后台热更新，API 代理到 127.0.0.1:9911
 ```
 
 ## 许可

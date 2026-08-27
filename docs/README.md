@@ -12,7 +12,6 @@
 | [data-accuracy.md](https://github.com/stqfdyr/agent/blob/main/docs/data-accuracy.md) | 碰 agent 采集代码之前。内存/硬盘/CPU 的口径和验证方法 |
 | [security.md](security.md) | 碰鉴权、API 边界、公开页之前 |
 | [development.md](development.md) | 要构建、测试、本地跑起来 |
-| **[wip-theme-system.md](wip-theme-system.md)** | **有未完成的工作。** 主题系统与前端拆分做到一半，接手前先读这个 |
 
 ## 30 秒版本
 
@@ -21,7 +20,7 @@
 - **agent** 只跑 Linux，直接读 `/proc` 和 `statvfs`，无状态、不落盘
 - **hub** 是 axum + SQLite，前端构建产物嵌进二进制，零配置文件启动
 - **通信** WebSocket 上跑 JSON-RPC 2.0 通知，token 走 `Authorization` 头
-- **前端** React + shadcn/ui + recharts
+- **前端** 内置后台与可替换公开主题都是 React + shadcn/ui；默认主题有独立仓库
 
 ## 三条铁律
 

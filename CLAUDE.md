@@ -2,11 +2,9 @@
 
 Rust 服务器探针的 **hub**，替代 komari，功能砍到只剩：看状态、看流量、看延迟、算成本。
 
-agent 在 [另一个仓库](https://github.com/stqfdyr/agent)。前端在 `web/`，由 `rust-embed` 编译进本二进制——**没有**单独的主题仓库，也不打算有。
-
-> ⚠️ **有一件事没做完**：主题系统与前端拆分，见
-> [docs/wip-theme-system.md](docs/wip-theme-system.md)。`web-admin/` 和 `web-theme/`
-> 两个目录已拆出但**从未构建验证过**，Rust 侧还没开始。`web/` 仍是当前生效的前端。
+agent 在 [独立仓库](https://github.com/stqfdyr/agent)。后台在 `web-admin/`；默认公开页主题在
+[monitor-theme-default](https://github.com/stqfdyr/monitor-theme-default)，开发时检出到被忽略的
+`web-theme/`，两份构建产物都由 `rust-embed` 编译进二进制。外部主题由 hub 在运行时从磁盘读取。
 
 **动手之前先读 [docs/](docs/)**，尤其是 [docs/decisions.md](docs/decisions.md)——里面记了每个选择的理由和被否决的方案。
 
@@ -30,10 +28,11 @@ agent 在 [另一个仓库](https://github.com/stqfdyr/agent)。前端在 `web/`
 ## 常用命令
 
 ```bash
-cargo test                        # 34 个测试
+cargo test
 cargo clippy --all-targets
-cd web && npm run build                       # hub 嵌入 web/dist，改前端后要重跑
-cargo run -- --listen 127.0.0.1:9911 --db /tmp/dev.db --site http://127.0.0.1:9911
+cd web-admin && npm run build
+cd web-theme && npm run build      # 先 clone monitor-theme-default 到这里
+cargo run -- --listen 127.0.0.1:9911 --db /tmp/dev.db --themes /tmp/themes --site http://127.0.0.1:9911
 ```
 
 **别用 `pkill -f` 停进程**——会匹配到跑命令的 shell 自己。用 `ss -lptn "sport = :9911"` 拿 PID 再 kill。

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { Copy, KeyRound, Pencil, Plus, Radio, Server, Settings, Trash2 } from "lucide-react"
+import { Copy, KeyRound, Palette, Pencil, Plus, Radio, Server, Settings, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -11,11 +11,16 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { TRAFFIC_MODES } from "@/components/NodeCard"
 import { api, type Node, type PingTask } from "@/lib/api"
 import { bytes, CYCLES } from "@/lib/format"
 
 const GIB = 1024 ** 3
+const TRAFFIC_MODES: Record<string, string> = {
+  sum: "上下行相加",
+  max: "取较大值",
+  up: "仅上行",
+  down: "仅下行",
+}
 
 function copy(text: string) {
   navigator.clipboard.writeText(text).then(
@@ -423,6 +428,61 @@ function Ping({ nodes }: { nodes: Node[] }) {
   )
 }
 
+type Theme = {
+  name: string
+  short: string
+  description: string
+  version: string
+  author: string
+  url: string
+  selected: boolean
+}
+
+function Themes() {
+  const [themes, setThemes] = useState<Theme[] | null>(null)
+
+  useEffect(() => {
+    api<{ themes: Theme[] }>("/themes").then((data) => setThemes(data.themes)).catch(() => setThemes([]))
+  }, [])
+
+  async function select(short: string) {
+    try {
+      await api("/settings", { method: "PUT", body: JSON.stringify({ theme: short }) })
+      setThemes((old) => old?.map((theme) => ({ ...theme, selected: theme.short === short })) ?? old)
+      toast.success("主题已切换")
+    } catch (e) {
+      toast.error((e as Error).message)
+    }
+  }
+
+  if (!themes) return null
+  return (
+    <div className="grid gap-3 sm:grid-cols-2">
+      {themes.map((theme) => (
+        <Card key={theme.short} className="gap-4 p-5">
+          <div className="flex items-start gap-3">
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2">
+                <h3 className="font-medium">{theme.name}</h3>
+                {theme.selected && <Badge>当前</Badge>}
+              </div>
+              <p className="mt-1 text-sm text-muted-foreground">{theme.description}</p>
+            </div>
+            <Button size="sm" variant={theme.selected ? "secondary" : "default"} disabled={theme.selected} onClick={() => select(theme.short)}>
+              {theme.selected ? "使用中" : "使用"}
+            </Button>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            {theme.author} · {theme.version}
+            {theme.url && <> · <a className="hover:underline" href={theme.url} target="_blank" rel="noreferrer">源码</a></>}
+          </p>
+        </Card>
+      ))}
+      {themes.length === 0 && <p className="text-sm text-muted-foreground">没有可用主题</p>}
+    </div>
+  )
+}
+
 type Settings = Record<string, string | boolean>
 
 function SettingsTab({ site }: { site: string }) {
@@ -552,9 +612,10 @@ function SettingsTab({ site }: { site: string }) {
 
 /// Each admin area is its own route rather than a tab, so a page can be
 /// linked to and survives a reload on the section you were actually in.
-export const ADMIN_SECTIONS = [
+const ADMIN_SECTIONS = [
   { path: "/admin/nodes", label: "节点", icon: Server },
   { path: "/admin/ping", label: "延迟监控", icon: Radio },
+  { path: "/admin/themes", label: "主题", icon: Palette },
   { path: "/admin/settings", label: "设置", icon: Settings },
 ] as const
 
@@ -595,6 +656,8 @@ export function Admin({
       <div className="min-w-0 flex-1">
         {path === "/admin/ping" ? (
           <Ping nodes={nodes} />
+        ) : path === "/admin/themes" ? (
+          <Themes />
         ) : path === "/admin/settings" ? (
           <SettingsTab site={site} />
         ) : (
