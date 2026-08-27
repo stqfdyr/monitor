@@ -12,6 +12,7 @@
 | [data-accuracy.md](https://github.com/stqfdyr/agent/blob/main/docs/data-accuracy.md) | 碰 agent 采集代码之前。内存/硬盘/CPU 的口径和验证方法 |
 | [security.md](security.md) | 碰鉴权、API 边界、公开页之前 |
 | [development.md](development.md) | 要构建、测试、本地跑起来 |
+| **[wip-theme-system.md](wip-theme-system.md)** | **有未完成的工作。** 主题系统与前端拆分做到一半，接手前先读这个 |
 
 ## 30 秒版本
 

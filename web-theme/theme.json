@@ -1,0 +1,8 @@
+{
+  "name": "默认主题",
+  "short": "default",
+  "description": "monitor 自带的状态面板，也是写新主题时的参考实现",
+  "version": "0.1.0",
+  "author": "stqfdyr",
+  "url": "https://github.com/stqfdyr/monitor-theme-default"
+}

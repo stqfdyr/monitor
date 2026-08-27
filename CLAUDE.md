@@ -4,6 +4,10 @@ Rust 服务器探针的 **hub**，替代 komari，功能砍到只剩：看状态
 
 agent 在 [另一个仓库](https://github.com/stqfdyr/agent)。前端在 `web/`，由 `rust-embed` 编译进本二进制——**没有**单独的主题仓库，也不打算有。
 
+> ⚠️ **有一件事没做完**：主题系统与前端拆分，见
+> [docs/wip-theme-system.md](docs/wip-theme-system.md)。`web-admin/` 和 `web-theme/`
+> 两个目录已拆出但**从未构建验证过**，Rust 侧还没开始。`web/` 仍是当前生效的前端。
+
 **动手之前先读 [docs/](docs/)**，尤其是 [docs/decisions.md](docs/decisions.md)——里面记了每个选择的理由和被否决的方案。
 
 ## 三条铁律
