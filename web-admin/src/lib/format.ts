@@ -49,3 +49,21 @@ export const CYCLES: Record<string, string> = {
 export function clock(ts: number): string {
   return new Date(ts * 1000).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })
 }
+
+/**
+ * Usage counted the way the plan bills it. The public page has always done
+ * this; the panel summed both directions regardless, so a node billed on
+ * upload alone was measured against its quota with the wrong number.
+ */
+export function monthUsage(node: { month_rx: number; month_tx: number; traffic_mode: string }): number {
+  switch (node.traffic_mode) {
+    case "up":
+      return node.month_tx
+    case "down":
+      return node.month_rx
+    case "max":
+      return Math.max(node.month_rx, node.month_tx)
+    default:
+      return node.month_rx + node.month_tx
+  }
+}

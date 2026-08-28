@@ -13,7 +13,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { api, type Node, type PingTask } from "@/lib/api"
-import { bytes, CYCLES } from "@/lib/format"
+import { bytes, CYCLES, monthUsage } from "@/lib/format"
 
 const GIB = 1024 ** 3
 /// Counters the panel can correct by hand, e.g. after a node moved to new
@@ -379,6 +379,12 @@ function InstallDialog({ node, onClose }: { node: Node; onClose: () => void }) {
       <DialogContent className="sm:max-w-xl">
         <DialogHeader>
           <DialogTitle>{node.name}</DialogTitle>
+          {/* Opening this dialog already rotated the token and cut the node's
+              running agent loose. Saying so beats letting someone wonder why
+              a node they only looked at just went offline. */}
+          <DialogDescription className="leading-relaxed">
+            已换发新凭证，这个节点上原来运行的 agent 随即掉线。用下面的命令重装即可恢复。
+          </DialogDescription>
         </DialogHeader>
         <div className="space-y-5">
           <div className="grid gap-4 sm:grid-cols-2">
@@ -540,8 +546,10 @@ function Nodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
                   </Badge>
                   {!n.public && <Badge variant="outline" className="ml-1 font-normal">不公开</Badge>}
                 </TableCell>
+                {/* Counted by the node's own billing rule, the same way the
+                    public page and the quota below it are. */}
                 <TableCell className="tnum text-sm">
-                  {bytes(n.month_rx + n.month_tx)}
+                  {bytes(monthUsage(n))}
                   <span className="text-muted-foreground">
                     {" / "}{n.traffic_limit > 0 ? bytes(n.traffic_limit) : "不限"}
                   </span>

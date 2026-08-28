@@ -91,6 +91,7 @@ export function useNodes() {
   useEffect(() => {
     let socket: WebSocket | null = null
     let poll: ReturnType<typeof setInterval> | null = null
+    let retry: ReturnType<typeof setTimeout> | null = null
     let closed = false
 
     const fetchOnce = () =>
@@ -105,21 +106,40 @@ export function useNodes() {
     fetchOnce()
 
     const url = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/ws`
-    try {
-      socket = new WebSocket(url)
-      socket.onmessage = (event) => setNodes(JSON.parse(event.data).nodes)
+    // A hub restart closes every stream. Reconnecting matters more than it
+    // looks: without it a page that outlived one deploy spent the rest of its
+    // life on the fallback poll, refreshing at a fifth of the live rate with
+    // nothing on screen to say so.
+    const connect = () => {
+      try {
+        socket = new WebSocket(url)
+      } catch {
+        poll ??= setInterval(fetchOnce, 5000)
+        return
+      }
+      socket.onmessage = (event) => {
+        setNodes(JSON.parse(event.data).nodes)
+        setError(null)
+        // The stream is back; the poll was only covering for it.
+        if (poll) {
+          clearInterval(poll)
+          poll = null
+        }
+      }
       socket.onerror = () => socket?.close()
       socket.onclose = () => {
-        if (!closed && !poll) poll = setInterval(fetchOnce, 5000)
+        if (closed) return
+        poll ??= setInterval(fetchOnce, 5000)
+        retry = setTimeout(connect, 5000)
       }
-    } catch {
-      poll = setInterval(fetchOnce, 5000)
     }
+    connect()
 
     return () => {
       closed = true
       socket?.close()
       if (poll) clearInterval(poll)
+      if (retry) clearTimeout(retry)
     }
   }, [reload])
 
