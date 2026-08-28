@@ -288,9 +288,14 @@ impl Db {
     }
 
     /// Creates a node and returns its id.
+    ///
+    /// Both rows or neither: a node whose `traffic` row went missing cannot
+    /// report at all, because `accumulate` reads that row on every report and
+    /// a failure there drops the whole message, live metrics included.
     pub fn create_node(&self, n: &Node, token: &str) -> Result<i64> {
-        let conn = self.conn();
-        conn.execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
             // A new node belongs at the end of the list. `sort` comes from the
             // caller as 0, which would otherwise tie it with whatever the last
             // manual reorder put first.
@@ -312,8 +317,9 @@ impl Db {
                 Utc::now().timestamp()
             ],
         )?;
-        let id = conn.last_insert_rowid();
-        conn.execute("INSERT INTO traffic (node_id) VALUES (?1)", [id])?;
+        let id = tx.last_insert_rowid();
+        tx.execute("INSERT INTO traffic (node_id) VALUES (?1)", [id])?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -506,12 +512,13 @@ impl Db {
             mut day_rx,
             mut day_tx,
             day_start,
-        ) = conn.prepare_cached(
-            "SELECT boot_id, last_rx, last_tx, total_rx, total_tx, month_rx, month_tx, month_start,
+        ) = conn
+            .prepare_cached(
+                "SELECT boot_id, last_rx, last_tx, total_rx, total_tx, month_rx, month_tx, month_start,
                     day_rx, day_tx, day_start
                  FROM traffic WHERE node_id=?1",
-        )?
-        .query_row([node_id], |r| {
+            )?
+            .query_row([node_id], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, i64>(1)?,
@@ -572,8 +579,7 @@ impl Db {
                                 day_start=?12 WHERE node_id=?1",
         )?
         .execute(params![
-            node_id, boot_id, rx, tx, total_rx, total_tx, month_rx, month_tx, period, day_rx, day_tx,
-            today
+            node_id, boot_id, rx, tx, total_rx, total_tx, month_rx, month_tx, period, day_rx, day_tx, today
         ])?;
         Ok(Traffic { total_rx, total_tx, month_rx, month_tx, month_start: period, day_rx, day_tx })
     }
@@ -677,25 +683,30 @@ impl Db {
             .collect()
     }
 
+    /// The assignments are replaced wholesale, so they go in one transaction:
+    /// failing between the delete and the inserts would silently unassign every
+    /// node from a probe that still lists them in the panel.
     pub fn save_ping_task(&self, t: &PingTask) -> Result<i64> {
-        let conn = self.conn();
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
         let id = if t.id > 0 {
-            conn.execute(
+            tx.execute(
                 "UPDATE ping_task SET name=?2, target=?3, interval=?4 WHERE id=?1",
                 params![t.id, t.name, t.target, t.interval],
             )?;
             t.id
         } else {
-            conn.execute(
+            tx.execute(
                 "INSERT INTO ping_task (name, target, interval) VALUES (?1,?2,?3)",
                 params![t.name, t.target, t.interval],
             )?;
-            conn.last_insert_rowid()
+            tx.last_insert_rowid()
         };
-        conn.execute("DELETE FROM ping_node WHERE task_id=?1", [id])?;
+        tx.execute("DELETE FROM ping_node WHERE task_id=?1", [id])?;
         for node in &t.nodes {
-            conn.execute("INSERT INTO ping_node (task_id, node_id) VALUES (?1,?2)", params![id, node])?;
+            tx.execute("INSERT INTO ping_node (task_id, node_id) VALUES (?1,?2)", params![id, node])?;
         }
+        tx.commit()?;
         Ok(id)
     }
 
