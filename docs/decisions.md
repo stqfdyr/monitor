@@ -167,6 +167,18 @@ GitHub OAuth 就是两个 HTTP 请求。`oauth2` crate 带一堆用不上的 flo
 
 **否决**：可逆加密（密钥还得存在同一个数据库旁边，只是把问题挪了个位置）。
 
+### release 用 runner 自带的 gh，不用第三方 action **[默认]**
+
+发布这一步拿着 `contents: write`，是整个 workflow 权限最高的地方。原先用
+`softprops/action-gh-release`，等于把这个 token 交给一个第三方仓库的 tag——tag 是可以被移动的。
+runner 本来就装了 `gh`，`gh release create ... --generate-notes` 一行做同样的事，还少一个供应链入口。
+
+同理，tag 守卫放在发布那一步而不是整个 job 上：`workflow_dispatch` 能完整跑一遍构建和产物收集，
+不会真的发出版本，改完 workflow 不用靠打 tag 来验证。
+
+**否决**：把第三方 action 钉到 commit SHA（能防 tag 被移动，但每次升级都要手动换 40 位哈希，
+而这里根本不需要这个 action）。
+
 ---
 
 ## 前端

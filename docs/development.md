@@ -2,7 +2,7 @@
 
 ## 环境
 
-Rust stable（1.98 验证过）、Node 22。
+Rust stable（1.98 验证过）、Node 24（CI 用的也是 24）。
 
 ```bash
 rustup component add clippy rustfmt
