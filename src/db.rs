@@ -10,6 +10,7 @@ use anyhow::Result;
 use chrono::{Datelike, Local, NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
 pub struct Db(Mutex<Connection>);
 
@@ -534,21 +535,30 @@ impl Db {
                 ))
             })?;
 
-        // Three cases, and only the middle one may book a whole reading as new
-        // bytes. A new boot_id means the kernel counters really did restart at
-        // zero. A reading that merely shrank under the *same* boot means the
-        // baseline shrank instead: an interface the sum counted has gone (wg0
-        // down, a tunnel stopped), so the reading is the rest of the machine's
-        // history, and booking it would count that history twice -- tens of
-        // gigabytes on a box that has been up a month. Re-align to the smaller
-        // baseline and skip the one sample instead; the worst that costs is a
-        // report interval of traffic, against a total that stays honest.
-        let (d_rx, d_tx) = if prev_boot.is_empty() {
-            // A brand new node has no baseline, so its first report would
-            // otherwise book the machine's entire lifetime traffic in one go.
+        // One rule: only bytes this hub watched a counter climb through are
+        // booked. Without a baseline under this exact boot there is nothing to
+        // subtract from, and a bare reading is not a delta -- it is the whole
+        // machine's history, which is why booking one is never safe.
+        //
+        // That covers all three ways a baseline goes missing. A node's first
+        // report has none yet. A reading that shrank under the *same* boot lost
+        // one: an interface the sum counted has gone (wg0 down, a tunnel
+        // stopped), so the reading is the rest of the machine's history and
+        // booking it would count that history twice. And a changed boot_id
+        // means the counters restarted -- or, indistinguishably from here, that
+        // a second machine is reporting under the same token, alternating
+        // boot_ids several times a second and adding its entire lifetime
+        // counter each time. Re-aligning costs the seconds between a reboot and
+        // the first report after it; guessing wrong the other way costs
+        // hundreds of gigabytes against a total that only ever climbs.
+        let (d_rx, d_tx) = if prev_boot.is_empty() || prev_boot != boot_id {
+            // Worth a line either way: on a healthy node this is a real reboot,
+            // and a node "rebooting" every few seconds is two machines sharing
+            // one token, which nothing else here would ever make visible.
+            if !prev_boot.is_empty() {
+                info!("node {node_id} reports a new boot; re-aligning to {rx} rx / {tx} tx");
+            }
             (0, 0)
-        } else if prev_boot != boot_id {
-            (rx, tx)
         } else {
             ((rx - last_rx).max(0), (tx - last_tx).max(0))
         };
@@ -906,14 +916,43 @@ mod tests {
         let t = db.accumulate(id, "boot-a", 9_000, 6_000, 1).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (4_000, 3_000));
 
-        // Reboot: new boot_id, counters restart near zero. The total must keep
-        // climbing rather than fall back to the fresh counter value.
+        // Reboot: new boot_id, counters restart near zero. What this guards is
+        // that the total does not fall back to the fresh counter value, which
+        // is the komari behaviour the project exists to fix. The 700 bytes the
+        // box moved before its first report are not booked -- there is no
+        // baseline to have measured them against.
         let t = db.accumulate(id, "boot-b", 700, 400, 1).unwrap();
-        assert_eq!((t.total_rx, t.total_tx), (4_700, 3_400));
+        assert_eq!((t.total_rx, t.total_tx), (4_000, 3_000), "a reboot must not reset the total");
 
+        // And counting resumes from the new baseline.
         let t = db.accumulate(id, "boot-b", 1_700, 900, 1).unwrap();
-        assert_eq!((t.total_rx, t.total_tx), (5_700, 3_900));
-        assert_eq!((t.month_rx, t.month_tx), (5_700, 3_900));
+        assert_eq!((t.total_rx, t.total_tx), (5_000, 3_500));
+        assert_eq!((t.month_rx, t.month_tx), (5_000, 3_500));
+    }
+
+    /// One install command pasted onto a second machine. Both agents answer to
+    /// the same node, evict each other from `App.agents` and reconnect, so the
+    /// hub sees two boot_ids alternating a few times a second -- each carrying
+    /// its own machine's lifetime counter. Booking those readings added ~180 GB
+    /// per swap to a total that only ever climbs and cannot be walked back.
+    #[test]
+    fn two_machines_sharing_one_token_cannot_inflate_the_total() {
+        let db = db();
+        let id = node(&db, 1);
+        let (a, b) = (100_000_000_000, 80_000_000_000); // two lifetime counters
+
+        db.accumulate(id, "boot-a", a, a, 1).unwrap();
+        let t = db.accumulate(id, "boot-a", a + 1_000, a + 1_000, 1).unwrap();
+        assert_eq!(t.total_rx, 1_000, "the real machine's own traffic still counts");
+
+        // Now they take turns. Every swap is a boot_id the hub has no baseline
+        // for, so every swap books nothing.
+        for round in 0..3 {
+            db.accumulate(id, "boot-b", b + round, b + round, 1).unwrap();
+            db.accumulate(id, "boot-a", a + 1_000 + round, a + 1_000 + round, 1).unwrap();
+        }
+        let t = db.traffic(id);
+        assert!(t.total_rx < 10_000, "six swaps booked {} bytes, not a lifetime counter", t.total_rx);
     }
 
     #[test]
@@ -935,14 +974,14 @@ mod tests {
         let t = db.accumulate(id, "boot-a", 900, 900, 1).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (2_400, 2_400));
 
-        // A new boot still books the whole reading: those counters did start at
-        // zero, so the reading really is traffic since the machine came up.
+        // A new boot re-aligns the same way, for the same reason: there is no
+        // baseline under it either.
         let t = db.accumulate(id, "boot-b", 300, 300, 1).unwrap();
-        assert_eq!((t.total_rx, t.total_tx), (2_700, 2_700));
+        assert_eq!((t.total_rx, t.total_tx), (2_400, 2_400));
 
         // One direction shrinking does not cost the other its increment.
         let t = db.accumulate(id, "boot-b", 100, 900, 1).unwrap();
-        assert_eq!((t.total_rx, t.total_tx), (2_700, 3_300));
+        assert_eq!((t.total_rx, t.total_tx), (2_400, 3_000));
     }
 
     /// The two counters that restart on their own schedule, against a total
