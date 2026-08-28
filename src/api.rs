@@ -141,8 +141,12 @@ pub async fn metrics(
         return (StatusCode::UNAUTHORIZED, "sign-in required").into_response();
     }
     let since = Utc::now().timestamp() - w.hours.clamp(1, 24 * 90) * 3_600;
+    // Probe names ride along with the samples they label, so the chart reads
+    // the same for a visitor as for the admin and the page needs no second
+    // request. Only the names: targets and assignments stay behind `Admin`.
+    let probes = app.db.ping_task_names().unwrap_or_else(|_| json!({}));
     match (app.db.metrics(id, since), app.db.ping_records(id, since)) {
-        (Ok(m), Ok(p)) => Json(json!({"metrics": m, "ping": p})).into_response(),
+        (Ok(m), Ok(p)) => Json(json!({"metrics": m, "ping": p, "probes": probes})).into_response(),
         (Err(e), _) | (_, Err(e)) => fail(e),
     }
 }

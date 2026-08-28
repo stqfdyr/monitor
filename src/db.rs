@@ -641,6 +641,21 @@ impl Db {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Probe names keyed by id, for labelling a latency chart. Names only:
+    /// what a probe is called says nothing a visitor could act on, while its
+    /// target and node assignments stay in the panel.
+    pub fn ping_task_names(&self) -> Result<serde_json::Value> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT id, name FROM ping_task")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut names = serde_json::Map::new();
+        for row in rows {
+            let (id, name) = row?;
+            names.insert(id.to_string(), serde_json::json!(name));
+        }
+        Ok(serde_json::Value::Object(names))
+    }
+
     pub fn insert_ping(&self, node_id: i64, task_id: i64, ts: i64, latency: i64) -> Result<()> {
         self.conn().execute(
             "INSERT OR REPLACE INTO ping_record (node_id, task_id, ts, latency) VALUES (?1,?2,?3,?4)",
