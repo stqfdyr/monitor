@@ -140,11 +140,16 @@ root-only 的 `/etc/monitor/agent.env` 里。
 
 `App.live: RwLock<HashMap<i64, Live>>` 存每个节点的当前指标。hub 重启后会在一个上报周期内重建，所以不落盘。
 
-**在线判定就是 WebSocket 连着**（`App.agents` 里有没有这个 node_id），不做超时心跳推断。断开时同时从 `live` 和 `agents` 里删掉。
+**在线判定就是 WebSocket 连着**（`App.agents` 里有没有这个 node_id）。断开时同时从 `live` 和 `agents` 里删掉。
+
+连着不等于活着：机器掉进网络黑洞、内核卡死、NAT 表项超时，TCP 连接会停在半开状态，`recv()`
+永远不返回，节点就一直是"在线"配一份冻在死亡瞬间的指标——直到内核几小时后放弃这条连接。
+所以 `src/agent_ws.rs` 每 30 秒发一个 WebSocket Ping，**任何入站帧**（包括 pong）都算活着的
+证据；连续 120 秒一帧不来就主动断开，agent 那边随即重连。判定离线最慢 150 秒。
 
 ## 已知的简化上限
 
 源码里用 `ponytail:` 注释标出来了：
 
 - `src/db.rs` — 单个 SQLite 写连接加互斥锁。几十个节点每 2 秒上报完全够用；真堵了再拆读连接池
-- `src/api.rs` — 浏览器实时推送是每个连接自己跑 2 秒定时器，不是广播 fan-out。自用面板没必要
+- `src/api.rs` — 浏览器实时推送是每个连接自己跑 2 秒定时器，不是广播 fan-out。定时器背后的快照是共享的（`live_snapshot`，公开/后台各一份，缓存 1.9 秒），所以多开几个标签页只多几次 socket 写，不会把查询量乘上观众数

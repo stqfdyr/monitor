@@ -34,8 +34,13 @@ pub struct App {
     pub db: Db,
     /// Current state per node, refreshed on every agent report.
     pub live: RwLock<HashMap<i64, Live>>,
-    /// Outbound channel per connected agent, used to push probe assignments.
-    pub agents: Mutex<HashMap<i64, mpsc::Sender<String>>>,
+    /// Outbound channel per connected agent, used to push probe assignments,
+    /// tagged with the session that opened it. See `agent_ws::serve`.
+    pub agents: Mutex<HashMap<i64, (u64, mpsc::Sender<String>)>>,
+    /// Last rendered node list per audience, `[public, admin]`, with the
+    /// millisecond it was built. Shared by every browser stream so viewers do
+    /// not multiply the query load. See `api::live_snapshot`.
+    pub snapshot: Mutex<[(i64, axum::extract::ws::Utf8Bytes); 2]>,
     pub throttle: auth::Throttle,
     pub http: reqwest::Client,
     /// Public base URL, used for install commands and to decide cookie flags.
@@ -50,6 +55,7 @@ impl App {
             db,
             live: RwLock::default(),
             agents: Mutex::default(),
+            snapshot: Mutex::new([(0, Default::default()), (0, Default::default())]),
             throttle: auth::Throttle::default(),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))

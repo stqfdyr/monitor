@@ -72,13 +72,21 @@ if allowed.is_empty() {
 
 `auth::Throttle`：同一来源地址 15 分钟内 5 次失败就锁死。成功登录清零。
 
-来源地址取 `X-Forwarded-For` 的第一跳，没有就用 peer 地址。**这个值只用于限流，绝不用于鉴权**——它是客户端可伪造的。
+来源地址取 `X-Forwarded-For` 的第一跳，没有就用 peer 地址。**这个值只用于限流和面板上显示的
+节点地址，绝不用于鉴权**——它是客户端可伪造的。
+
+**而且只在 peer 本身是本地地址（回环、私有网段、IPv6 ULA/link-local）时才采信**，也就是确实
+有反代在前面的情况。hub 直接暴露在公网时这个头就是攻击者自己写的：每个请求换一个伪造地址，
+既能绕开锁定，又能让 `Throttle` 的 map 无限长大。`auth::client_ip` 守着这条，
+`record_failure` 顺手清掉过窗口的条目，map 的大小由此有界。
 
 ## 节点 token
 
 - 256 位随机值，**数据库里只存 sha256**
 - 添加节点时 token 不离开服务端；点击生成安装命令时才换发 token，明文只在该响应中返回
-- 可以重新生成（`POST /api/nodes/{id}/token`），旧的立刻失效
+- 可以重新生成（`POST /api/nodes/{id}/token`），旧的立刻失效——包括**已经连上的那条连接**：
+  token 只在 WebSocket 握手时校验，所以换发时 hub 会从 `App.agents` 里删掉发送端，agent 的
+  循环随即结束，它拿旧 token 重连会吃到 401。少了这一步，泄露的 token 打开的会话能一直报下去
 - 走 `Authorization: Bearer` 头，不走 URL query——query 会进反代的 access log
 - 无效/缺失一律返回 401，不区分"格式不对"和"不存在"
 

@@ -1,7 +1,7 @@
 //! The panel and public-status HTTP surface.
 
 use axum::extract::rejection::JsonRejection;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
@@ -150,10 +150,34 @@ fn readable(app: &App, headers: &HeaderMap, id: i64) -> bool {
     authed(app, headers) || (app.public_page() && app.db.node(id).ok().flatten().is_some_and(|n| n.public))
 }
 
+/// How long one rendered snapshot is reused. Just under the push interval, so
+/// every tick still rebuilds once and no viewer is served a stale frame twice.
+const SNAPSHOT_TTL_MS: i64 = 1_900;
+
+/// The payload every browser stream sends, built at most once per tick no
+/// matter how many tabs are watching.
+///
+/// The public status page is open to anonymous visitors, so the old
+/// per-connection build made viewer count a multiplier on database work: each
+/// one queried every node's traffic row every two seconds, against the same
+/// connection the agents write through. Two slots, because the admin view
+/// carries fields the public one must never see.
+fn live_snapshot(app: &App, full: bool) -> Utf8Bytes {
+    let now = Utc::now().timestamp_millis();
+    let slot = usize::from(full);
+    let mut cache = app.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+    if now.saturating_sub(cache[slot].0) < SNAPSHOT_TTL_MS {
+        return cache[slot].1.clone();
+    }
+    let nodes = visible_nodes(app, full).unwrap_or_default();
+    let payload = Utf8Bytes::from(json!({"nodes": nodes}).to_string());
+    cache[slot] = (now, payload.clone());
+    payload
+}
+
 /// Live stream for the browser. Each connection runs its own timer, which is
-/// cheaper to reason about than a fan-out channel at this scale.
-// ponytail: per-connection timer rebuilds the snapshot for every viewer; switch
-// to one broadcast channel if this ever serves more than a handful of tabs.
+/// cheaper to reason about than a fan-out channel; the snapshot behind it is
+/// shared, so the timers cost nothing but a send.
 pub async fn live_ws(State(app): State<Shared>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
     let full = authed(&app, &headers);
     if !full && !app.public_page() {
@@ -166,9 +190,7 @@ async fn stream_live(app: Shared, mut socket: WebSocket, full: bool) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
     loop {
         ticker.tick().await;
-        let Ok(list) = visible_nodes(&app, full) else { break };
-        let payload = json!({"nodes": list}).to_string();
-        if socket.send(Message::Text(payload.into())).await.is_err() {
+        if socket.send(Message::Text(live_snapshot(&app, full))).await.is_err() {
             break;
         }
     }
@@ -257,6 +279,14 @@ pub async fn reset_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     if !updated {
         return (StatusCode::NOT_FOUND, "no such node").into_response();
     }
+    // The token is only checked during the handshake, so a session opened with
+    // the old one would otherwise keep reporting indefinitely — a rotation
+    // after a leak has to close the door that token already walked through.
+    // Dropping the sender ends the agent's loop; it reconnects and is refused.
+    // The live entry goes with it: that loop no longer owns it, so its own
+    // teardown will leave it alone.
+    app.agents.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    app.live.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
     match app.db.reset_token(id, &sha256(&token)) {
         // The plaintext token exists only inside this one-time command.
         Ok(()) => Json(json!({"token": token, "install": app.install_command(&token)})).into_response(),
@@ -440,6 +470,39 @@ mod tests {
         assert_eq!(admin.len(), 2);
         assert_eq!(admin[0]["ip"], "198.51.100.9");
         assert_eq!(admin[0]["remark"], "secret note");
+    }
+
+    #[tokio::test]
+    async fn rotating_a_token_closes_the_session_the_old_one_opened() {
+        let app = std::sync::Arc::new(app());
+        let id = node(&app, "n", true);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        app.agents.lock().unwrap().insert(id, (7, tx));
+        app.live.write().unwrap().insert(id, crate::agent_ws::Live::default());
+
+        let response = reset_token(Admin, axum::extract::State(app.clone()), Path(id)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // The agent loop selects on this receiver; None is how it learns to go.
+        assert!(rx.recv().await.is_none(), "the old agent's channel must be closed");
+        assert!(app.agents.lock().unwrap().is_empty());
+        assert!(app.live.read().unwrap().is_empty(), "the node must read as offline at once");
+    }
+
+    #[test]
+    fn the_shared_snapshot_keeps_the_two_audiences_apart() {
+        let app = app();
+        let open = node(&app, "open", true);
+        node(&app, "hidden", false);
+        app.db.save_facts(open, &json!({"hostname": "vps-1"}), "198.51.100.9").unwrap();
+
+        let public = live_snapshot(&app, false);
+        let admin = live_snapshot(&app, true);
+        // Caching must never let one audience's payload reach the other.
+        assert!(!public.as_str().contains("198.51.100.9"), "the public frame must carry no address");
+        assert!(!public.as_str().contains("hidden"), "the public frame must carry no private node");
+        assert!(admin.as_str().contains("198.51.100.9") && admin.as_str().contains("hidden"));
+        // A second read inside the window is the same frame, not a rebuild.
+        assert_eq!(live_snapshot(&app, false), public);
     }
 
     #[test]

@@ -1,6 +1,9 @@
 //! The agent side of the hub: one WebSocket per node carrying JSON-RPC 2.0
 //! notifications, the same transport komari and NodeGet settled on.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
@@ -12,8 +15,20 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::auth::sha256;
+use crate::auth::{client_ip, sha256};
 use crate::{App, Shared};
+
+/// How often a quiet agent is poked, and how long the hub waits for any frame
+/// at all before it gives up on the connection.
+const HEARTBEAT: Duration = Duration::from_secs(30);
+const SILENCE: Duration = Duration::from_secs(120);
+
+/// Tells one agent session on a node apart from the next. A connection can now
+/// outlive its usefulness by up to SILENCE, which is long enough for the agent
+/// to have given up and reconnected; without this tag the late teardown would
+/// remove the live session that replaced it and strand a node that is in fact
+/// reporting normally.
+static SESSION: AtomicU64 = AtomicU64::new(0);
 
 /// One node's current state. Lives in memory only: it is rebuilt within a
 /// report interval of a hub restart, so persisting it would buy nothing.
@@ -45,12 +60,7 @@ pub async fn handler(
         // Same response whether the token is malformed or simply unknown.
         return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
     };
-    let ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(|v| v.trim().to_owned())
-        .unwrap_or_else(|| peer.ip().to_string());
+    let ip = client_ip(&headers, peer.ip()).to_string();
 
     upgrade.on_upgrade(move |socket| async move {
         if let Err(e) = serve(app, node_id, ip, socket).await {
@@ -66,11 +76,16 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 
 async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<String>(16);
-    app.agents.lock().unwrap_or_else(|e| e.into_inner()).insert(node_id, tx);
+    let session = SESSION.fetch_add(1, Ordering::Relaxed);
+    app.agents.lock().unwrap_or_else(|e| e.into_inner()).insert(node_id, (session, tx));
     info!("node {node_id} connected from {ip}");
 
     // Tell the agent what to probe before the first report arrives.
     let _ = socket.send(Message::Text(ping_tasks_message(&app, node_id).into())).await;
+
+    let mut heartbeat = tokio::time::interval(HEARTBEAT);
+    heartbeat.tick().await; // The first tick completes immediately.
+    let mut last_frame = Instant::now();
 
     let outcome = loop {
         tokio::select! {
@@ -78,7 +93,22 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
                 Some(text) => socket.send(Message::Text(text.into())).await?,
                 None => break Ok(()),
             },
-            inbound = socket.recv() => match inbound {
+            // A machine that drops off the network without closing its socket
+            // leaves the hub waiting on a receive that will never return: the
+            // node reads as online with metrics frozen at the moment it died,
+            // until the kernel eventually gives up on the TCP session hours
+            // later. A ping every HEARTBEAT proves the path both ways, and any
+            // frame coming back — including the pong — counts as a sign of life.
+            _ = heartbeat.tick() => {
+                let quiet = last_frame.elapsed();
+                if quiet > SILENCE {
+                    break Err(anyhow::anyhow!("silent for {}s", quiet.as_secs()));
+                }
+                socket.send(Message::Ping(Vec::new().into())).await?;
+            }
+            inbound = socket.recv() => {
+                last_frame = Instant::now();
+                match inbound {
                 Some(Ok(Message::Text(text))) => {
                     if let Err(e) = dispatch(&app, node_id, &ip, &text) {
                         warn!("node {node_id} sent an unusable message: {e:#}");
@@ -87,14 +117,33 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
                 Some(Ok(Message::Close(_))) | None => break Ok(()),
                 Some(Ok(_)) => {}
                 Some(Err(e)) => break Err(e.into()),
-            },
+                }
+            }
         }
     };
 
-    app.agents.lock().unwrap_or_else(|e| e.into_inner()).remove(&node_id);
-    app.live.write().unwrap_or_else(|e| e.into_inner()).remove(&node_id);
-    info!("node {node_id} went offline");
+    if release(&app, node_id, session) {
+        info!("node {node_id} went offline");
+    }
     outcome
+}
+
+/// Drops a node's connection state, but only while `session` is still the one
+/// holding it. Returns whether anything was actually released.
+///
+/// A teardown can arrive late — up to SILENCE after the agent gave up — by
+/// which time a reconnect may already have installed a newer session under the
+/// same node id. Clearing that one would mark a node offline and cut it off
+/// from probe pushes while it is reporting perfectly well.
+fn release(app: &App, node_id: i64, session: u64) -> bool {
+    let mut agents = app.agents.lock().unwrap_or_else(|e| e.into_inner());
+    if !agents.get(&node_id).is_some_and(|(id, _)| *id == session) {
+        return false;
+    }
+    agents.remove(&node_id);
+    drop(agents);
+    app.live.write().unwrap_or_else(|e| e.into_inner()).remove(&node_id);
+    true
 }
 
 fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<()> {
@@ -159,13 +208,15 @@ fn ping_tasks_message(app: &App, node_id: i64) -> String {
 /// Pushes the current probe list to every connected agent. Called after the
 /// panel edits tasks so changes take effect without waiting for a reconnect.
 pub fn push_ping_tasks(app: &App) {
-    let connected: Vec<i64> = app.agents.lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
-    for node_id in connected {
-        let message = ping_tasks_message(app, node_id);
-        let sender = app.agents.lock().unwrap_or_else(|e| e.into_inner()).get(&node_id).cloned();
-        if let Some(sender) = sender {
-            let _ = sender.try_send(message);
-        }
+    let connected: Vec<(i64, mpsc::Sender<String>)> = app
+        .agents
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(id, (_, tx))| (*id, tx.clone()))
+        .collect();
+    for (node_id, sender) in connected {
+        let _ = sender.try_send(ping_tasks_message(app, node_id));
     }
 }
 
@@ -262,6 +313,33 @@ mod tests {
         assert_eq!(bearer(&h), None, "a bare value is not a bearer token");
         h.insert("authorization", "Bearer ".parse().unwrap());
         assert_eq!(bearer(&h), None, "an empty token is not accepted");
+    }
+
+    #[test]
+    fn a_late_teardown_leaves_the_reconnected_session_alone() {
+        let app = app();
+        let id = node(&app);
+        let live = || app.live.read().unwrap().contains_key(&id);
+        // release() reads the session tag, not the channel, so the receiver
+        // going away here changes nothing.
+        let connect = |session| {
+            let (tx, _) = mpsc::channel(1);
+            app.agents.lock().unwrap().insert(id, (session, tx));
+            app.live.write().unwrap().insert(id, Live::default());
+        };
+
+        // The ordinary case: the session that ends is the one on record.
+        connect(1);
+        assert!(release(&app, id, 1));
+        assert!(!live(), "its own teardown clears the node");
+
+        // The race: the agent gave up and reconnected while the old socket sat
+        // half-open, so session 2 is live when session 1 finally unwinds.
+        connect(1);
+        connect(2);
+        assert!(!release(&app, id, 1), "a stale session must release nothing");
+        assert!(live(), "the reconnected agent stays online");
+        assert!(app.agents.lock().unwrap().contains_key(&id), "and keeps receiving probe pushes");
     }
 
     #[test]

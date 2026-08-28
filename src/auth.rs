@@ -71,11 +71,10 @@ impl Throttle {
 
     fn record_failure(&self, ip: IpAddr) {
         let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = map.entry(ip).or_insert((0, Instant::now()));
-        if entry.1.elapsed() >= LOCKOUT {
-            *entry = (0, Instant::now());
-        }
-        entry.0 += 1;
+        // Addresses past their window are dropped here rather than left to
+        // accumulate, which also restarts the count for a returning one.
+        map.retain(|_, (_, since)| since.elapsed() < LOCKOUT);
+        map.entry(ip).or_insert((0, Instant::now())).0 += 1;
     }
 
     fn clear(&self, ip: IpAddr) {
@@ -315,15 +314,37 @@ async fn github_login(app: &App, code: &str) -> Result<()> {
     Ok(())
 }
 
-/// Peer address, or the first hop in X-Forwarded-For when a reverse proxy is
-/// trusted. Only consulted for throttling, never for authorization.
-fn client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
+/// Peer address, or the first hop in X-Forwarded-For when the request arrived
+/// through a local reverse proxy. Only consulted for throttling and for the
+/// address shown next to a node, never for authorization.
+///
+/// The header is honoured only when the peer itself is local. A hub reachable
+/// directly from the internet would otherwise let a caller mint a fresh
+/// identity on every request, which both walks straight past the lockout and
+/// grows the throttle map without bound.
+pub fn client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
+    if !behind_local_proxy(peer) {
+        return peer;
+    }
     headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.split(',').next())
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(peer)
+}
+
+/// Loopback or a private network: where a reverse proxy actually sits.
+fn behind_local_proxy(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        // Unique-local (fc00::/7) and link-local (fe80::/10). The stable
+        // standard library still has no predicate for either.
+        IpAddr::V6(v6) => {
+            let head = v6.segments()[0];
+            v6.is_loopback() || head & 0xfe00 == 0xfc00 || head & 0xffc0 == 0xfe80
+        }
+    }
 }
 
 #[cfg(test)]
@@ -425,11 +446,34 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_header_is_used_only_when_present() {
-        let peer: IpAddr = "10.0.0.1".parse().unwrap();
-        assert_eq!(client_ip(&HeaderMap::new(), peer), peer);
+    fn forwarded_header_is_trusted_only_behind_a_local_proxy() {
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", "198.51.100.9, 10.0.0.2".parse().unwrap());
-        assert_eq!(client_ip(&h, peer).to_string(), "198.51.100.9");
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+
+        // A proxy on loopback or in a private range: the header is the client.
+        assert_eq!(client_ip(&h, ip("127.0.0.1")).to_string(), "198.51.100.9");
+        assert_eq!(client_ip(&h, ip("10.0.0.1")).to_string(), "198.51.100.9");
+        assert_eq!(client_ip(&h, ip("::1")).to_string(), "198.51.100.9");
+        assert_eq!(client_ip(&h, ip("fd00::1")).to_string(), "198.51.100.9");
+        // Straight off the internet, the header is whatever the caller typed:
+        // honouring it would hand out a fresh identity per request and let the
+        // lockout be walked past for free.
+        assert_eq!(client_ip(&h, ip("203.0.113.5")), ip("203.0.113.5"));
+        assert_eq!(client_ip(&h, ip("2001:db8::5")), ip("2001:db8::5"));
+        // No header at all: the peer, wherever it is.
+        assert_eq!(client_ip(&HeaderMap::new(), ip("10.0.0.1")), ip("10.0.0.1"));
+    }
+
+    #[test]
+    fn the_throttle_map_does_not_grow_without_bound() {
+        // Every failure comes from a different address, as it would from a
+        // caller rotating a forged header or a botnet.
+        let t = Throttle::default();
+        for n in 0..500u32 {
+            t.record_failure(IpAddr::from([198, 51, 100, (n % 251) as u8]));
+        }
+        let held = t.0.lock().unwrap().len();
+        assert!(held <= 251, "one entry per distinct address, not per attempt: {held}");
     }
 }

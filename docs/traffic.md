@@ -103,7 +103,7 @@ if month_start != period {
 | `up` | 仅 tx | 只限上行 |
 | `down` | 仅 rx | 只限下行 |
 
-圆环组件是 `web-theme/src/components/TrafficRing.tsx`。`traffic_limit` 为 0 时显示"不限"，不画进度弧。
+画进度条的是 `web-theme/src/components/Meter.tsx`。`traffic_limit` 为 0 时百分比显示"—"，条留空，页脚写"不限"。
 
 ## 一个副作用（是特性不是 bug）
 

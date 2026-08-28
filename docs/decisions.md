@@ -94,7 +94,7 @@ agent 每 2 秒上报（实时视图用），但 `metric` 表每节点每分钟�
 
 用户明确说"这个和总流量不是一回事，要区分开"。
 
-`traffic` 表里 `total_rx/total_tx`（永不重置）和 `month_rx/month_tx`（按商家重置日重置）是两组独立的列，同一次上报同时更新。月流量在默认主题里用圆环显示（开发检出路径 `web-theme/src/components/TrafficRing.tsx`）。
+`traffic` 表里 `total_rx/total_tx`（永不重置）和 `month_rx/month_tx`（按商家重置日重置）是两组独立的列，同一次上报同时更新。月流量在默认主题里和 CPU、内存、硬盘共用同一个进度条组件（开发检出路径 `web-theme/src/components/Meter.tsx`），按节点的 `traffic_mode` 计量——面板的节点表用的是同一套口径。
 
 ### 月度周期按商家重置日算 **[默认]**
 
@@ -187,6 +187,10 @@ agent 本来就是 musl 静态二进制，Alpine 上跑得了，缺的只是 ini
 
 节点 token 仍然只存哈希。生成安装命令时会换 token，并立刻使旧 agent 失效；
 不为了复刻 Komari 的随时查看命令而降低这个安全边界。
+
+"立刻失效"要靠 hub 主动断开那条连接（`api::reset_token` 从 `App.agents` 里删掉发送端）：
+token 只在握手时校验一次，光换库里的哈希不会打扰已经连上的 agent。所以打开安装弹窗就会
+让这个节点掉线，弹窗里也这么写。
 
 ### recharts **[用户]**
 
