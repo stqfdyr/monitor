@@ -13,7 +13,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { api, type Node, type PingTask } from "@/lib/api"
-import { bytes, CYCLES, monthUsage } from "@/lib/format"
+import { bytes, CYCLES, money, monthUsage } from "@/lib/format"
 
 const GIB = 1024 ** 3
 /// Counters the panel can correct by hand, e.g. after a node moved to new
@@ -202,7 +202,7 @@ function NodeForm({ node, onClose, onSaved }: {
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="sm:max-w-xl">
+      <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-xl">
         <DialogHeader>
           <DialogTitle>{node.name}</DialogTitle>
         </DialogHeader>
@@ -300,7 +300,7 @@ function BillingForm({ node, onClose, onSaved }: {
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>{node.name}</DialogTitle>
         </DialogHeader>
@@ -390,7 +390,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="sm:max-w-xl">
+      <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-xl">
         <DialogHeader>
           <DialogTitle>{node.name}</DialogTitle>
           <DialogDescription className="leading-relaxed">
@@ -519,13 +519,16 @@ function Nodes({ nodes, refresh, site }: { nodes: Node[]; refresh: () => void; s
       <Card className="overflow-x-auto p-0">
         <Table>
           <TableHeader>
+            {/* Percentages, so the columns keep an even rhythm instead of the
+                address column swallowing every spare pixel and pushing status
+                across the table. */}
             <TableRow>
-              <TableHead>名称</TableHead>
-              <TableHead>IP</TableHead>
-              <TableHead>状态</TableHead>
-              <TableHead>本月 / 额度</TableHead>
-              <TableHead>价格</TableHead>
-              <TableHead>到期</TableHead>
+              <TableHead className="w-[20%]">名称</TableHead>
+              <TableHead className="w-[22%]">IP</TableHead>
+              <TableHead className="w-[12%]">状态</TableHead>
+              <TableHead className="w-[16%]">流量</TableHead>
+              <TableHead className="w-[10%]">价格</TableHead>
+              <TableHead className="w-[12%]">到期</TableHead>
               <TableHead className="text-right">操作</TableHead>
             </TableRow>
           </TableHeader>
@@ -589,7 +592,7 @@ function Nodes({ nodes, refresh, site }: { nodes: Node[]; refresh: () => void; s
                   </span>
                 </TableCell>
                 <TableCell className="tnum text-sm">
-                  {n.price > 0 ? `${n.price} ${n.currency}` : "—"}
+                  {n.price > 0 ? money(n.price, n.currency) : "—"}
                 </TableCell>
                 <TableCell className="text-sm">{n.expires_at || "—"}</TableCell>
                 <TableCell className="text-right whitespace-nowrap">
@@ -717,10 +720,10 @@ function Ping({ nodes }: { nodes: Node[] }) {
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead>名称</TableHead>
-              <TableHead>目标</TableHead>
-              <TableHead>间隔</TableHead>
-              <TableHead>节点</TableHead>
+              <TableHead className="w-[24%]">名称</TableHead>
+              <TableHead className="w-[40%]">目标</TableHead>
+              <TableHead className="w-[12%]">间隔</TableHead>
+              <TableHead className="w-[12%]">节点</TableHead>
               <TableHead className="text-right">操作</TableHead>
             </TableRow>
           </TableHeader>
@@ -752,14 +755,16 @@ function Ping({ nodes }: { nodes: Node[] }) {
 
       {editing && (
         <Dialog open onOpenChange={(open) => !open && setEditing(null)}>
-          <DialogContent className="sm:max-w-xl">
+          <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-xl">
             <DialogHeader>
               <DialogTitle>{editing.id ? "编辑监控" : "添加监控"}</DialogTitle>
             </DialogHeader>
             <div className="space-y-5">
               <div className="grid gap-4 sm:grid-cols-2">
                 <Field label="名称">
-                  <Input value={editing.name ?? ""} onChange={(e) => setEditing({ ...editing, name: e.target.value })} placeholder="Cloudflare" />
+                  {/* A new monitor starts empty, so the cursor belongs here;
+                      editing an existing one starts with nothing selected. */}
+                  <Input autoFocus={!editing.id} value={editing.name ?? ""} onChange={(e) => setEditing({ ...editing, name: e.target.value })} placeholder="Cloudflare" />
                 </Field>
                 <Field label="间隔（秒）" hint="5–3600">
                   <Input type="number" min="5" max="3600" value={editing.interval ?? 60} onChange={(e) => setEditing({ ...editing, interval: Number(e.target.value) })} />

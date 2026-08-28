@@ -94,6 +94,9 @@
 
 @layer base {
   * { @apply border-border outline-ring/50; }
+  /* Reserve the scrollbar's width on every page: without it a route
+     whose content clears the fold widens the page as you leave it. */
+  html { scrollbar-gutter: stable; }
   body { @apply bg-background text-foreground; }
 }
 

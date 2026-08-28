@@ -82,7 +82,11 @@ export default function App() {
     <div className="min-h-svh">
       <header className="sticky top-0 z-10 border-b bg-background/80 backdrop-blur">
         <div className="mx-auto flex max-w-7xl items-center gap-3 px-4 py-3">
-          <span className="font-semibold">{me.site_name || "Monitor"}</span>
+          {/* The site name is the way back to the status page, the same as it
+              is in the theme's own header. */}
+          <a href="/" className="font-semibold transition-opacity hover:opacity-70">
+            {me.site_name || "Monitor"}
+          </a>
           <span className="text-xs text-muted-foreground">后台</span>
           <div className="flex-1" />
           {/* The status page is a separate app now, so this is a real navigation. */}
