@@ -40,8 +40,8 @@ function animate(update: () => void) {
 
 function copy(text: string) {
   navigator.clipboard.writeText(text).then(
-    () => toast.success("已复制到剪贴板"),
-    () => toast.error("复制失败，请手动选择"),
+    () => toast.success("已复制"),
+    () => toast.error("复制失败"),
   )
 }
 
@@ -211,7 +211,7 @@ function NodeForm({ node, onClose, onSaved }: {
             <Input value={form.name} onChange={(e) => set("name", e.target.value)} />
           </Field>
           <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="每月流量额度 (GiB)" hint="留空或 0 表示不限">
+            <Field label="每月流量额度 (GiB)" hint="留空或 0 不限">
               <Input type="number" value={limitGib} onChange={(e) => setLimitGib(e.target.value)} placeholder="1024" />
             </Field>
             <Field label="流量计算方式">
@@ -226,17 +226,17 @@ function NodeForm({ node, onClose, onSaved }: {
             </Field>
           </div>
           <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="每月重置日" hint="1–31。改了之后本月流量按新周期从头计，总流量不受影响">
+            <Field label="每月重置日" hint="1–31。本月流量按新周期重算，总流量不变">
               <Input type="number" min={1} max={31} value={form.traffic_reset_day} onChange={(e) => set("traffic_reset_day", Number(e.target.value))} />
             </Field>
             <Field label="备注" hint="仅管理员可见">
-              <Input value={form.remark ?? ""} onChange={(e) => set("remark", e.target.value)} placeholder="商家、用途或其它说明" />
+              <Input value={form.remark ?? ""} onChange={(e) => set("remark", e.target.value)} placeholder="商家、用途" />
             </Field>
           </div>
           <details className="rounded-lg border bg-muted/30 px-3 py-2.5">
             <summary className="cursor-pointer text-sm font-medium">流量校正</summary>
             <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-              换了机器或重装系统后，hub 会把新机器的历史计数当成一次增量记进来。这里按 GiB 改成正确的数字。
+              换机或重装后，新机器的历史计数会被记成一次增量。按 GiB 填入正确值。
             </p>
             <div className="mt-3 grid gap-4 sm:grid-cols-2">
               {TRAFFIC_FIELDS.map(([key, label]) => (
@@ -379,7 +379,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
       const fresh = await api<{ token: string }>(`/nodes/${node.id}/token`, { method: "POST" })
       setToken(fresh.token)
       setConfirmRotate(false)
-      toast.success("凭证已换发，用新命令重装 agent")
+      toast.success("凭证已换发，需用新命令重装")
       onRotated()
     } catch (e) {
       toast.error((e as Error).message)
@@ -393,9 +393,6 @@ function InstallDialog({ node, site, onClose, onRotated }: {
       <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-xl">
         <DialogHeader>
           <DialogTitle>{node.name}</DialogTitle>
-          <DialogDescription className="leading-relaxed">
-            这条命令随时可以再来看，凭证不会因为你打开这个窗口而改变。
-          </DialogDescription>
         </DialogHeader>
         <div className="space-y-5">
           <div className="grid gap-4 sm:grid-cols-2">
@@ -411,14 +408,14 @@ function InstallDialog({ node, site, onClose, onRotated }: {
             <pre className="h-28 overflow-auto whitespace-pre-wrap break-all rounded-lg border bg-muted/40 p-3 text-xs leading-relaxed select-all">
               {/* A node added before the hub kept the token has nothing to show
                   until its agent reconnects and hands it back. */}
-              {command || "这个节点的凭证是旧版本创建的，等它的 agent 连上一次就会显示；或者现在换发一个新的。"}
+              {command || "旧版本创建的凭证不可读取，换发后显示"}
             </pre>
           </div>
           <div className="flex items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
             <span>
               <span className="block font-medium">换发凭证</span>
               <span className="mt-0.5 block text-xs text-muted-foreground">
-                旧凭证立刻作废，这台机器上正在跑的 agent 会掉线，需要用新命令重装
+                旧凭证立即作废，agent 掉线，需用新命令重装
               </span>
             </span>
             <Button variant="outline" size="sm" disabled={rotating} onClick={() => setConfirmRotate(true)}>
@@ -436,7 +433,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
       {confirmRotate && (
         <ConfirmDialog
           title={`给「${node.name}」换发凭证？`}
-          description="旧凭证立刻作废，这台机器上正在运行的 agent 会立即掉线，必须用新的安装命令重装才能恢复。只在凭证可能泄露时才需要这么做。"
+          description="旧凭证立即作废，agent 掉线，必须用新命令重装。仅在凭证可能泄露时使用。"
           confirmLabel="换发凭证"
           busy={rotating}
           onClose={() => setConfirmRotate(false)}
@@ -614,7 +611,7 @@ function Nodes({ nodes, refresh, site }: { nodes: Node[]; refresh: () => void; s
             {nodes.length === 0 && (
               <TableRow>
                 <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
-                  还没有节点，点右上角添加一个
+                  还没有节点，右上角添加
                 </TableCell>
               </TableRow>
             )}
@@ -649,7 +646,7 @@ function Nodes({ nodes, refresh, site }: { nodes: Node[]; refresh: () => void; s
       {deleting && (
         <ConfirmDialog
           title={`删除节点「${deleting.name}」？`}
-          description="历史指标、流量记录和节点凭证都会一并删除，且无法恢复。"
+          description="历史指标、流量记录和凭证一并删除，不可恢复。"
           confirmLabel="删除节点"
           busy={removing}
           onClose={() => setDeleting(null)}
@@ -676,7 +673,7 @@ function Ping({ nodes }: { nodes: Node[] }) {
     setSaving(true)
     try {
       await api("/ping-tasks", { method: "POST", body: JSON.stringify(editing) })
-      toast.success("已保存，正在下发到 agent")
+      toast.success("已保存，正在下发")
       setEditing(null)
       load()
     } catch (e) {
@@ -745,7 +742,7 @@ function Ping({ nodes }: { nodes: Node[] }) {
             {tasks.length === 0 && (
               <TableRow>
                 <TableCell colSpan={5} className="py-10 text-center text-sm text-muted-foreground">
-                  还没有延迟监控。添加后每个节点会独立 TCP 连接目标端口并上报耗时。
+                  还没有延迟监控。每个节点独立 TCP 连接目标端口并上报耗时。
                 </TableCell>
               </TableRow>
             )}
@@ -784,7 +781,6 @@ function Ping({ nodes }: { nodes: Node[] }) {
                   ))}
                   {nodes.length === 0 && <p className="p-2 text-xs text-muted-foreground">先添加节点</p>}
                 </div>
-                <p className="text-xs text-muted-foreground">选择由哪些 Agent 执行</p>
               </div>
             </div>
             <DialogFooter>
@@ -797,7 +793,7 @@ function Ping({ nodes }: { nodes: Node[] }) {
       {deleting && (
         <ConfirmDialog
           title={`删除监控「${deleting.name}」？`}
-          description="该监控及其历史延迟记录都会一并删除，且无法恢复。"
+          description="该监控及其历史延迟记录一并删除，不可恢复。"
           confirmLabel="删除监控"
           busy={removing}
           onClose={() => setDeleting(null)}
@@ -892,7 +888,7 @@ function SettingsTab({ site }: { site: string }) {
           <Field label="站点名称">
             <Input value={String(s.site_name ?? "")} onChange={(e) => set("site_name", e.target.value)} placeholder="Monitor" />
           </Field>
-          <Field label="历史数据保留天数" hint="超出的明细会被自动清理；累计流量不受影响">
+          <Field label="历史数据保留天数" hint="超出的明细自动清理，累计流量不受影响">
             <Input
               type="number"
               value={String(s.retention_days ?? "")}
@@ -906,7 +902,7 @@ function SettingsTab({ site }: { site: string }) {
             checked={s.public_page !== "off"}
             onCheckedChange={(v) => set("public_page", v ? "on" : "off")}
           />
-          开放公开状态页（关闭后所有页面都需要登录）
+          开放公开状态页，关闭后所有页面需登录
         </label>
         <div>
           <Button
@@ -928,24 +924,24 @@ function SettingsTab({ site }: { site: string }) {
         <div>
           <h3 className="text-sm font-medium">GitHub 单点登录</h3>
           <p className="mt-1 text-xs text-muted-foreground">
-            在 GitHub 建一个 OAuth App，回调地址填 <code className="rounded bg-muted px-1">{callback}</code>
+            OAuth App 回调地址 <code className="rounded bg-muted px-1">{callback}</code>
           </p>
         </div>
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label="Client ID">
             <Input value={String(s.github_client_id ?? "")} onChange={(e) => set("github_client_id", e.target.value)} />
           </Field>
-          <Field label="Client Secret" hint={s.github_secret_set ? "已设置；留空则保持不变" : "尚未设置"}>
+          <Field label="Client Secret" hint={s.github_secret_set ? "已设置，留空不变" : "未设置"}>
             <Input type="password" placeholder={s.github_secret_set ? "••••••••" : ""} onChange={(e) => set("github_client_secret", e.target.value)} />
           </Field>
         </div>
         {String(s.github_client_id ?? "") !== "" && String(s.github_allowed_users ?? "").trim() === "" && (
           <p className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">
-            白名单为空，GitHub 登录现在会拒绝所有人。填上你的 GitHub 用户名并保存后才能用。
+            白名单为空，GitHub 登录拒绝所有人。填入用户名并保存后生效。
           </p>
         )}
-        <Field label="允许登录的 GitHub 用户名" hint="逗号分隔。留空 = 拒绝所有人（不是放行所有人）">
-          <Input value={String(s.github_allowed_users ?? "")} onChange={(e) => set("github_allowed_users", e.target.value)} placeholder="你的 GitHub 用户名" />
+        <Field label="允许登录的 GitHub 用户名" hint="逗号分隔。留空 = 拒绝所有人，不是放行所有人">
+          <Input value={String(s.github_allowed_users ?? "")} onChange={(e) => set("github_allowed_users", e.target.value)} placeholder="GitHub 用户名" />
         </Field>
         <div>
           <Button
@@ -970,7 +966,7 @@ function SettingsTab({ site }: { site: string }) {
         <div>
           <h3 className="text-sm font-medium">应急密码</h3>
           <p className="mt-1 text-xs text-muted-foreground">
-            GitHub 不可用时的备用入口。修改后其它设备上的登录会立即失效，当前这台不受影响。
+            GitHub 不可用时的备用入口。修改后其它设备登录立即失效，当前设备不受影响。
           </p>
         </div>
         <Field label="新密码" hint="至少 12 位">
