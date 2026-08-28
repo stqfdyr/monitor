@@ -77,7 +77,7 @@ agent 收到后会**保留没变化的任务**（同 id + 同 target + 同 inter
 | 表 | 作用 | 注意 |
 |---|---|---|
 | `setting` | key/value 配置 | 替代配置文件。见下方设置键列表 |
-| `node` | 节点配置 + agent 上报的静态信息 | `token_hash` 是 sha256，明文不存 |
+| `node` | 节点配置 + agent 上报的静态信息 | `token` 存明文，面板要能重新显示安装命令；只在 `full` 视图输出 |
 | `traffic` | **单调递增的流量累计** | 1:1 于 node，但生命周期完全不同（每次上报都写） |
 | `metric` | 历史明细，**每节点每分钟一行** | `WITHOUT ROWID`，按保留天数定期删 |
 | `ping_task` / `ping_node` | 探测任务及其节点分配 | 多对多 |

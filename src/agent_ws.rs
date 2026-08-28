@@ -15,7 +15,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::auth::{client_ip, sha256};
+use crate::auth::client_ip;
 use crate::{App, Shared};
 
 /// How often a quiet agent is poked, and how long the hub waits for any frame
@@ -56,7 +56,7 @@ pub async fn handler(
     let Some(token) = bearer(&headers) else {
         return (StatusCode::UNAUTHORIZED, "missing token").into_response();
     };
-    let Ok(Some(node_id)) = app.db.node_by_token(&sha256(token)) else {
+    let Ok(Some(node_id)) = app.db.node_by_token(token) else {
         // Same response whether the token is malformed or simply unknown.
         return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
     };
@@ -231,7 +231,7 @@ mod tests {
 
     fn node(app: &App) -> i64 {
         app.db
-            .create_node(&Node { name: "n".into(), traffic_reset_day: 1, ..Default::default() }, "hash")
+            .create_node(&Node { name: "n".into(), traffic_reset_day: 1, ..Default::default() }, "tok")
             .unwrap()
     }
 

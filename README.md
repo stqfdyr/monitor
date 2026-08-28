@@ -84,7 +84,7 @@ agent 二进制由 hub 转发，节点无需直连 GitHub。hub 自身无法访�
 
 ## 安全
 
-- 节点 token 只存 sha256，明文仅出现在一次性生成的安装命令中，可随时重置
+- 节点 token 只在登录后的面板视图里出现，公开页拿不到；可随时换发，换发即踢掉旧 agent
 - 密码登录按来源地址限流，15 分钟 5 次
 - 公开状态页按节点开关，且不输出 IP、主机名与备注
 - OAuth 回调校验 state；session cookie 为 HttpOnly + SameSite=Lax + Secure

@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { api, useNodes } from "@/lib/api"
 
-type Me = { authed: boolean; github: boolean; site_name: string; public_page: boolean }
+type Me = { authed: boolean; github: boolean; site_name: string; public_page: boolean; site: string }
 
 /// `/admin` on its own is not a page; normalise it to the first section so a
 /// bookmark and the OAuth redirect both land somewhere real.
@@ -105,7 +105,16 @@ export default function App() {
         {!nodes ? (
           <Skeleton className="h-64" />
         ) : (
-          <Admin path={path} go={go} nodes={sorted} refresh={refresh} site={location.origin} />
+          <Admin
+            path={path}
+            go={go}
+            nodes={sorted}
+            refresh={refresh}
+            // The hub's own public URL, not this browser's address: the panel
+            // is often reached over a loopback port behind a proxy, and both
+            // the install command and the OAuth callback need the real one.
+            site={me.site || location.origin}
+          />
         )}
       </main>
 

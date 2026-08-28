@@ -57,6 +57,8 @@ export type Node = {
   ipv4?: string
   ipv6?: string
   remark?: string
+  /** Panel only. Empty for nodes created before the hub kept a copy. */
+  token?: string
 }
 
 export type PingTask = { id: number; name: string; target: string; interval: number; nodes: number[] }

@@ -349,41 +349,52 @@ function shellArg(value: string) {
   return `'${value.replaceAll("'", `'"'"'`)}'`
 }
 
-type Install = { install: string }
+/// Built here rather than fetched: the node list already carries the token, so
+/// looking at an install command is a read, not an act. Reissuing one to be
+/// able to show it is what used to knock the running agent offline.
+function installCommand(site: string, token: string, seconds: number, proxy: string) {
+  const args = [`--server ${site}`, `--token ${token}`, `--interval ${seconds}`]
+  if (proxy) args.push(`--github-proxy ${shellArg(proxy.includes("://") ? proxy : `https://${proxy}`)}`)
+  return `curl -fsSL ${site}/install.sh | sh -s -- ${args.join(" ")}`
+}
 
-function InstallDialog({ node, onClose }: { node: Node; onClose: () => void }) {
-  const [details, setDetails] = useState<Install | null>(null)
+function InstallDialog({ node, site, onClose, onRotated }: {
+  node: Node
+  site: string
+  onClose: () => void
+  onRotated: () => void
+}) {
+  const [token, setToken] = useState(node.token ?? "")
   const [interval, setInterval] = useState("1")
   const [githubProxy, setGithubProxy] = useState("")
-
-  useEffect(() => {
-    let cancelled = false
-    api<Install>(`/nodes/${node.id}/token`, { method: "POST" })
-      .then((d) => {
-        if (!cancelled) setDetails(d)
-      })
-      .catch((e) => toast.error((e as Error).message))
-    return () => {
-      cancelled = true
-    }
-  }, [node.id])
+  const [rotating, setRotating] = useState(false)
+  const [confirmRotate, setConfirmRotate] = useState(false)
 
   const seconds = Math.min(3600, Math.max(1, Math.round(Number(interval) || 1)))
-  const args = ["--interval", String(seconds)]
-  const proxy = githubProxy.trim()
-  if (proxy) args.push("--github-proxy", shellArg(proxy.includes("://") ? proxy : `https://${proxy}`))
-  const command = details ? `${details.install} ${args.join(" ")}` : ""
+  const command = token ? installCommand(site, token, seconds, githubProxy.trim()) : ""
+
+  async function rotate() {
+    setRotating(true)
+    try {
+      const fresh = await api<{ token: string }>(`/nodes/${node.id}/token`, { method: "POST" })
+      setToken(fresh.token)
+      setConfirmRotate(false)
+      toast.success("凭证已换发，用新命令重装 agent")
+      onRotated()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setRotating(false)
+    }
+  }
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="sm:max-w-xl">
         <DialogHeader>
           <DialogTitle>{node.name}</DialogTitle>
-          {/* Opening this dialog already rotated the token and cut the node's
-              running agent loose. Saying so beats letting someone wonder why
-              a node they only looked at just went offline. */}
           <DialogDescription className="leading-relaxed">
-            已换发新凭证，这个节点上原来运行的 agent 随即掉线。用下面的命令重装即可恢复。
+            这条命令随时可以再来看，凭证不会因为你打开这个窗口而改变。
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-5">
@@ -398,22 +409,45 @@ function InstallDialog({ node, onClose }: { node: Node; onClose: () => void }) {
           <div className="space-y-2">
             <Label className="text-sm font-medium">安装命令</Label>
             <pre className="h-28 overflow-auto whitespace-pre-wrap break-all rounded-lg border bg-muted/40 p-3 text-xs leading-relaxed select-all">
-              {details ? command : "正在生成…"}
+              {/* A node added before the hub kept the token has nothing to show
+                  until its agent reconnects and hands it back. */}
+              {command || "这个节点的凭证是旧版本创建的，等它的 agent 连上一次就会显示；或者现在换发一个新的。"}
             </pre>
+          </div>
+          <div className="flex items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
+            <span>
+              <span className="block font-medium">换发凭证</span>
+              <span className="mt-0.5 block text-xs text-muted-foreground">
+                旧凭证立刻作废，这台机器上正在跑的 agent 会掉线，需要用新命令重装
+              </span>
+            </span>
+            <Button variant="outline" size="sm" disabled={rotating} onClick={() => setConfirmRotate(true)}>
+              换发
+            </Button>
           </div>
         </div>
         <DialogFooter>
-          <Button variant="ghost" onClick={onClose}>取消</Button>
-          <Button onClick={() => copy(command)} disabled={!details}>
+          <Button variant="ghost" onClick={onClose}>关闭</Button>
+          <Button onClick={() => copy(command)} disabled={!command}>
             <Copy className="size-4" /> 复制
           </Button>
         </DialogFooter>
       </DialogContent>
+      {confirmRotate && (
+        <ConfirmDialog
+          title={`给「${node.name}」换发凭证？`}
+          description="旧凭证立刻作废，这台机器上正在运行的 agent 会立即掉线，必须用新的安装命令重装才能恢复。只在凭证可能泄露时才需要这么做。"
+          confirmLabel="换发凭证"
+          busy={rotating}
+          onClose={() => setConfirmRotate(false)}
+          onConfirm={rotate}
+        />
+      )}
     </Dialog>
   )
 }
 
-function Nodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
+function Nodes({ nodes, refresh, site }: { nodes: Node[]; refresh: () => void; site: string }) {
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<Node | null>(null)
   const [billing, setBilling] = useState<Node | null>(null)
@@ -601,7 +635,14 @@ function Nodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
       {billing && (
         <BillingForm node={billing} onClose={() => setBilling(null)} onSaved={refresh} />
       )}
-      {installing && <InstallDialog node={installing} onClose={() => setInstalling(null)} />}
+      {installing && (
+        <InstallDialog
+          node={installing}
+          site={site}
+          onClose={() => setInstalling(null)}
+          onRotated={refresh}
+        />
+      )}
       {deleting && (
         <ConfirmDialog
           title={`删除节点「${deleting.name}」？`}
@@ -995,7 +1036,7 @@ export function Admin({
         ) : path === "/admin/settings" ? (
           <SettingsTab site={site} />
         ) : (
-          <Nodes nodes={nodes} refresh={refresh} />
+          <Nodes nodes={nodes} refresh={refresh} site={site} />
         )}
       </div>
     </div>

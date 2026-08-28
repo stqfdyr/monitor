@@ -80,10 +80,6 @@ impl App {
     pub fn secure_cookies(&self) -> bool {
         !self.site.starts_with("http://")
     }
-
-    pub fn install_command(&self, token: &str) -> String {
-        format!("curl -fsSL {}/install.sh | sh -s -- --server {} --token {}", self.site, self.site, token)
-    }
 }
 
 /// The one-liner pasted onto a new VPS.
@@ -389,15 +385,6 @@ mod tests {
         // Genuinely in the clear over the network.
         assert!(exposed_over_plain_http("http://203.0.113.10:8080"));
         assert!(exposed_over_plain_http("http://hub.example.com"));
-    }
-
-    #[test]
-    fn the_install_command_carries_the_public_url_and_token() {
-        let app = app("https://hub.example.com");
-        let command = app.install_command("tok123");
-        assert!(command.contains("https://hub.example.com/install.sh"));
-        assert!(command.contains("--server https://hub.example.com"));
-        assert!(command.contains("--token tok123"));
     }
 
     #[test]

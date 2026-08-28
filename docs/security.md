@@ -82,15 +82,20 @@ if allowed.is_empty() {
 
 ## 节点 token
 
-- 256 位随机值，**数据库里只存 sha256**
-- 添加节点时 token 不离开服务端；点击生成安装命令时才换发 token，明文只在该响应中返回
+- 256 位随机值，**数据库里存明文**（`node.token`），因为面板要能随时把安装命令显示出来。
+  这是用户拍板的取舍，理由和被推翻的旧设计都记在 [decisions.md](decisions.md)
+- **只在 `full=true` 的节点视图里输出**，和 ip / hostname / remark 同一个分支。公开页拿到的
+  JSON 里没有这个 key。有测试守着（`the_public_view_hides_private_nodes_and_sensitive_fields`
+  里断言整个公开 payload 的字符串不含任何节点的 token）
 - 可以重新生成（`POST /api/nodes/{id}/token`），旧的立刻失效——包括**已经连上的那条连接**：
-  token 只在 WebSocket 握手时校验，所以换发时 hub 会从 `App.agents` 里删掉发送端，agent 的
-  循环随即结束，它拿旧 token 重连会吃到 401。少了这一步，泄露的 token 打开的会话能一直报下去
+  token 只在 WebSocket 握手时校验，所以换发时 hub 会从 `App.agents` 和 `live` 里删掉这个节点，
+  agent 的循环随即结束，它拿旧 token 重连会吃到 401。少了这一步，泄露的 token 打开的会话能一直报下去
 - 走 `Authorization: Bearer` 头，不走 URL query——query 会进反代的 access log
 - 无效/缺失一律返回 401，不区分"格式不对"和"不存在"
 
-用 sha256 而不是 argon2 是有意的：这是高熵随机值，慢哈希只会让每次 agent 连接多花几十毫秒，挡不住任何实际攻击。
+**明文存储意味着数据库本身就是凭证。** 拿到 `monitor.db` 的人可以冒充任何节点上报假数据。但同一个
+文件里已经有 session、GitHub client secret 和管理员密码哈希，它本来就必须当作机密对待——备份要加密，
+文件权限要收紧。管理员密码和 session 不受影响，仍然分别是 argon2id 和 sha256。
 
 ### agent 侧
 

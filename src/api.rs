@@ -11,7 +11,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::auth::{authed, hash_password, issue_session, random_token, sha256, with_cookies};
+use crate::auth::{authed, hash_password, issue_session, random_token, with_cookies};
 use crate::db::{Node, PingTask};
 use crate::{agent_ws, App, Shared};
 
@@ -92,13 +92,16 @@ fn node_view(app: &App, node: &Node, full: bool) -> Value {
             m.remove("net_tx_total");
         }
     }
-    // Address and private notes never leave the panel.
+    // Address, private notes and the node's token never leave the panel. The
+    // token is here so the install command can be shown whenever it is asked
+    // for, rather than reissued to be read — see docs/decisions.md.
     if full {
         view["hostname"] = json!(node.hostname);
         view["ip"] = json!(node.ip);
         view["ipv4"] = json!(node.ipv4);
         view["ipv6"] = json!(node.ipv6);
         view["remark"] = json!(node.remark);
+        view["token"] = json!(node.token);
     }
     view
 }
@@ -204,6 +207,10 @@ pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
         "github": app.db.get("github_client_id").is_some_and(|v| !v.is_empty()),
         "site_name": app.db.get("site_name").unwrap_or_else(|| "Monitor".into()),
         "public_page": app.public_page(),
+        // The hub's own public URL, which is what belongs in an install command
+        // and in the OAuth callback — not whichever address this browser used
+        // to reach the panel, which may well be a loopback port behind a proxy.
+        "site": app.site,
     }))
 }
 
@@ -218,9 +225,10 @@ pub async fn create_node(
     }
     node.name = node.name.trim().to_owned();
     let token = random_token();
-    match app.db.create_node(&node, &sha256(&token)) {
-        // Installation is a separate action, so the bootstrap token never
-        // leaves the server and is replaced when the user generates a command.
+    match app.db.create_node(&node, &token) {
+        // The node is usable straight away: its install command is readable
+        // from the node list, so adding and deploying stay separate steps
+        // without a reissue standing between them.
         Ok(id) => Json(json!({"id": id})).into_response(),
         Err(e) => fail(e),
     }
@@ -273,6 +281,10 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
 }
 
 /// Issues a fresh token, which immediately invalidates the old one.
+///
+/// Only ever an explicit act now — rotate a token you think has leaked, and
+/// reinstall the agent afterwards. Reading the install command no longer goes
+/// through here, so nothing routine lands on it by accident.
 pub async fn reset_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
     let token = random_token();
     let updated = app.db.node(id).map(|n| n.is_some()).unwrap_or(false);
@@ -287,9 +299,10 @@ pub async fn reset_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     // teardown will leave it alone.
     app.agents.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
     app.live.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
-    match app.db.reset_token(id, &sha256(&token)) {
-        // The plaintext token exists only inside this one-time command.
-        Ok(()) => Json(json!({"token": token, "install": app.install_command(&token)})).into_response(),
+    match app.db.reset_token(id, &token) {
+        // Just the token: the panel builds the command, and one place that
+        // knows its shape is enough.
+        Ok(()) => Json(json!({"token": token})).into_response(),
         Err(e) => fail(e),
     }
 }
@@ -414,6 +427,8 @@ pub async fn save_settings(_: Admin, State(app): State<Shared>, Json(body): Json
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Sessions are still hashed; only node tokens stopped being.
+    use crate::auth::sha256;
     use crate::db::Db;
 
     fn app() -> App {
@@ -424,7 +439,7 @@ mod tests {
         app.db
             .create_node(
                 &Node { name: name.into(), public, remark: "secret note".into(), ..Default::default() },
-                &random_token(),
+                &format!("token-of-{name}"),
             )
             .unwrap()
     }
@@ -457,9 +472,15 @@ mod tests {
         let public = visible_nodes(&app, false).unwrap();
         assert_eq!(public.len(), 1, "a node marked private must not be listed");
         assert_eq!(public[0]["name"], "open");
-        for hidden in ["ip", "remark", "hostname"] {
+        // The token joined this list once the panel started reading it back;
+        // handing it out would let any visitor impersonate the node.
+        for hidden in ["ip", "remark", "hostname", "token"] {
             assert!(public[0].get(hidden).is_none(), "{hidden} must not be public");
         }
+        assert!(
+            !serde_json::to_string(&public).unwrap().contains("token-of-open"),
+            "no node's token may appear anywhere in a public payload"
+        );
         // Raw kernel counters would hand out the machine's lifetime traffic.
         for hidden in ["boot_id", "net_rx_total", "net_tx_total"] {
             assert!(public[0]["metrics"].get(hidden).is_none(), "{hidden} must not be public");

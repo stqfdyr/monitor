@@ -27,7 +27,9 @@ CREATE TABLE IF NOT EXISTS setting (
 CREATE TABLE IF NOT EXISTS node (
   id            INTEGER PRIMARY KEY,
   name          TEXT    NOT NULL,
-  token_hash    TEXT    NOT NULL UNIQUE,
+  -- The agent's credential, in the clear: the panel shows a node's install
+  -- command whenever it is asked, so it has to be able to read it back.
+  token         TEXT    NOT NULL UNIQUE,
   sort          INTEGER NOT NULL DEFAULT 0,
   public        INTEGER NOT NULL DEFAULT 1,
   price         REAL    NOT NULL DEFAULT 0,
@@ -157,6 +159,10 @@ pub struct Node {
     pub ipv4: String,
     #[serde(default)]
     pub ipv6: String,
+    /// What the agent authenticates with. Readable so the panel can show an
+    /// install command on demand; never leaves the admin view.
+    #[serde(default)]
+    pub token: String,
 }
 
 fn yes() -> bool {
@@ -214,6 +220,12 @@ impl Db {
         for column in ["ipv4 TEXT NOT NULL DEFAULT ''", "ipv6 TEXT NOT NULL DEFAULT ''"] {
             let _ = conn.execute(&format!("ALTER TABLE node ADD COLUMN {column}"), []);
         }
+        // The column used to hold a sha256 of the token. It holds the token
+        // itself now, so the panel can show an install command without minting
+        // a new one to do it. Databases from before the change keep their old
+        // digests, which no agent can present: those nodes need a new token
+        // issued from the panel and their agent reinstalled, once.
+        let _ = conn.execute("ALTER TABLE node RENAME COLUMN token_hash TO token", []);
         Ok(Self(Mutex::new(conn)))
     }
 
@@ -256,16 +268,16 @@ impl Db {
             .optional()?)
     }
 
-    /// Creates a node and returns its id. Only a token hash is stored.
-    pub fn create_node(&self, n: &Node, token_hash: &str) -> Result<i64> {
+    /// Creates a node and returns its id.
+    pub fn create_node(&self, n: &Node, token: &str) -> Result<i64> {
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO node (name, token_hash, sort, public, price, currency, billing_cycle,
+            "INSERT INTO node (name, token, sort, public, price, currency, billing_cycle,
                                expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day, created_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 n.name,
-                token_hash,
+                token,
                 n.sort,
                 n.public,
                 n.price,
@@ -339,16 +351,13 @@ impl Db {
     }
 
     /// Replaces a node's token, which immediately locks out the old one.
-    pub fn reset_token(&self, id: i64, token_hash: &str) -> Result<()> {
-        self.conn().execute("UPDATE node SET token_hash=?2 WHERE id=?1", params![id, token_hash])?;
+    pub fn reset_token(&self, id: i64, token: &str) -> Result<()> {
+        self.conn().execute("UPDATE node SET token=?2 WHERE id=?1", params![id, token])?;
         Ok(())
     }
 
-    pub fn node_by_token(&self, token_hash: &str) -> Result<Option<i64>> {
-        Ok(self
-            .conn()
-            .query_row("SELECT id FROM node WHERE token_hash = ?1", [token_hash], |r| r.get(0))
-            .optional()?)
+    pub fn node_by_token(&self, token: &str) -> Result<Option<i64>> {
+        Ok(self.conn().query_row("SELECT id FROM node WHERE token = ?1", [token], |r| r.get(0)).optional()?)
     }
 
     /// Stores the slow-changing facts an agent sends when it connects.
@@ -724,6 +733,7 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         ip: s("ip"),
         ipv4: s("ipv4"),
         ipv6: s("ipv6"),
+        token: s("token"),
     }
 }
 
@@ -759,8 +769,8 @@ mod tests {
     }
 
     fn node(db: &Db, reset_day: u32) -> i64 {
-        let hash = format!("hash-{}", rand::random::<u32>());
-        db.create_node(&Node { name: "n".into(), traffic_reset_day: reset_day, ..Default::default() }, &hash)
+        let token = format!("token-{}", rand::random::<u32>());
+        db.create_node(&Node { name: "n".into(), traffic_reset_day: reset_day, ..Default::default() }, &token)
             .unwrap()
     }
 
@@ -855,6 +865,22 @@ mod tests {
         assert!(db.node(id).unwrap().is_none());
         assert_eq!(db.metrics(id, 0).unwrap().len(), 0);
         assert_eq!(db.traffic(id).total_rx, 0);
+    }
+
+    #[test]
+    fn a_token_is_readable_and_rotation_retires_the_old_one() {
+        let db = db();
+        let id = db.create_node(&Node { name: "n".into(), ..Default::default() }, "first-token").unwrap();
+
+        // Readable, which is the whole point: the panel shows the install
+        // command without having to issue a new token to be able to.
+        assert_eq!(db.node(id).unwrap().unwrap().token, "first-token");
+        assert_eq!(db.node_by_token("first-token").unwrap(), Some(id));
+
+        db.reset_token(id, "second-token").unwrap();
+        assert_eq!(db.node(id).unwrap().unwrap().token, "second-token");
+        assert_eq!(db.node_by_token("second-token").unwrap(), Some(id));
+        assert_eq!(db.node_by_token("first-token").unwrap(), None, "the old token stops working");
     }
 
     #[test]
