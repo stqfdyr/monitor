@@ -193,7 +193,11 @@ fn live_snapshot(app: &App, full: bool) -> Utf8Bytes {
     let now = Utc::now().timestamp_millis();
     let slot = usize::from(full);
     let mut cache = app.snapshot.lock().unwrap_or_else(|e| e.into_inner());
-    if now.saturating_sub(cache[slot].0) < SNAPSHOT_TTL_MS {
+    // A cached frame's age has to be an age: non-negative. A wall clock can step
+    // backwards -- NTP correcting a fresh boot -- and against a bare upper bound
+    // the negative that produces reads as "young", pinning the panel to a stale
+    // frame until real time catches up to where the clock had been.
+    if (0..SNAPSHOT_TTL_MS).contains(&now.saturating_sub(cache[slot].0)) {
         return cache[slot].1.clone();
     }
     let nodes = visible_nodes(app, full).unwrap_or_default();
@@ -577,6 +581,20 @@ mod tests {
         assert!(admin.as_str().contains("198.51.100.9") && admin.as_str().contains("hidden"));
         // A second read inside the window is the same frame, not a rebuild.
         assert_eq!(live_snapshot(&app, false), public);
+    }
+
+    #[test]
+    fn a_clock_stepping_backwards_does_not_pin_a_stale_frame() {
+        let app = app();
+        node(&app, "first", true);
+        live_snapshot(&app, false);
+
+        // NTP correcting a fresh boot leaves the cached stamp in the future.
+        // That is not a young frame, and serving it would freeze the panel until
+        // real time caught up to where the clock had been.
+        app.snapshot.lock().unwrap()[0].0 = Utc::now().timestamp_millis() + 60_000;
+        node(&app, "added-after", true);
+        assert!(live_snapshot(&app, false).as_str().contains("added-after"));
     }
 
     #[tokio::test]
