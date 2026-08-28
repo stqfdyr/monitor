@@ -128,7 +128,7 @@ curl -s -b jar http://127.0.0.1:9911/api/nodes | python3 -c \
 kill $(ss -lptn "sport = :9911" | grep -oP 'pid=\K[0-9]+')
 ./target/debug/monitor-hub --listen 127.0.0.1:9911 --db e2e.db &
 
-# 等 agent 重连（退避最多 60 秒），再查一次——必须只增不减
+# 等 agent 重连（连接稳定过的话是 1 秒），再查一次——必须只增不减
 ```
 
 VPS 重启无法在本机模拟（`boot_id` 不会变）。单元测试用伪造的 `boot_id` 覆盖了这条路径。
