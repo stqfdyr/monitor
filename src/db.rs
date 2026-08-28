@@ -272,13 +272,15 @@ impl Db {
     pub fn create_node(&self, n: &Node, token: &str) -> Result<i64> {
         let conn = self.conn();
         conn.execute(
+            // A new node belongs at the end of the list. `sort` comes from the
+            // caller as 0, which would otherwise tie it with whatever the last
+            // manual reorder put first.
             "INSERT INTO node (name, token, sort, public, price, currency, billing_cycle,
                                expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             params![
                 n.name,
                 token,
-                n.sort,
                 n.public,
                 n.price,
                 n.currency,
@@ -906,6 +908,9 @@ mod tests {
         assert_eq!(db.nodes().unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), vec![c, a, b]);
         assert!(db.reorder_nodes(&[a, a, c]).is_err());
         assert_eq!(db.nodes().unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), vec![c, a, b]);
+        // A node added afterwards goes to the end, not to wherever sort 0 puts it.
+        let d = node(&db, 1);
+        assert_eq!(db.nodes().unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), vec![c, a, b, d]);
     }
 
     #[test]
