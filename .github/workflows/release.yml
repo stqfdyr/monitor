@@ -49,14 +49,15 @@ jobs:
 
   release:
     needs: build
-    # A manual dispatch builds but publishes nothing; only a tag makes a release.
-    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
-      # gh ships on the runner, so the release path carries no third-party action.
-      - run: gh release create "$GITHUB_REF_NAME" monitor-hub-* --generate-notes --repo "$GITHUB_REPOSITORY"
+      # A manual dispatch builds and collects the binaries; only a tag publishes,
+      # so the whole path can be exercised without cutting a release. gh ships on
+      # the runner, keeping a third-party action out of the contents:write step.
+      - if: startsWith(github.ref, 'refs/tags/')
+        run: gh release create "$GITHUB_REF_NAME" monitor-hub-* --generate-notes --repo "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ github.token }}
