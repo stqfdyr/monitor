@@ -348,12 +348,6 @@ mod tests {
         assert_eq!(renewed(d("2020-01-01"), "once", d("2026-08-28")), None);
     }
 
-    #[test]
-    fn secure_cookies_track_the_public_scheme() {
-        assert!(!app("http://127.0.0.1:8080").secure_cookies());
-        assert!(app("https://hub.example.com").secure_cookies());
-    }
-
     #[tokio::test]
     async fn an_unknown_api_path_is_a_404_not_the_single_page_app() {
         let app = Arc::new(app("http://localhost:8080"));
@@ -372,17 +366,26 @@ mod tests {
         assert_eq!(spa("/apiary").await.status(), StatusCode::OK);
     }
 
+    /// Both things `--site` decides: whether the session cookie may be marked
+    /// Secure, and whether the hub warns that it is answering in the clear.
+    /// Plain HTTP on loopback is where the two answers part ways.
     #[test]
-    fn plain_http_warning_fires_for_remote_hosts_only() {
-        // Local development: no warning.
-        assert!(!exposed_over_plain_http("http://127.0.0.1:8080"));
-        assert!(!exposed_over_plain_http("http://localhost:8080"));
-        assert!(!exposed_over_plain_http("http://[::1]:8080"));
+    fn the_site_scheme_decides_the_cookie_flag_and_the_plain_http_warning() {
+        // Local development: no Secure flag, because the browser would then
+        // refuse to keep the cookie at all -- and no warning either.
+        for local in ["http://127.0.0.1:8080", "http://localhost:8080", "http://[::1]:8080"] {
+            assert!(!app(local).secure_cookies(), "{local}");
+            assert!(!exposed_over_plain_http(local), "{local} is not exposed");
+        }
         // Behind TLS, including a tunnel that forwards to a loopback listener.
+        assert!(app("https://hub.example.com").secure_cookies());
         assert!(!exposed_over_plain_http("https://m.example.com"));
-        // Genuinely in the clear over the network.
-        assert!(exposed_over_plain_http("http://203.0.113.10:8080"));
-        assert!(exposed_over_plain_http("http://hub.example.com"));
+        // Genuinely in the clear over the network: warn, and still no Secure,
+        // which is exactly why the warning is worth printing.
+        for remote in ["http://203.0.113.10:8080", "http://hub.example.com"] {
+            assert!(!app(remote).secure_cookies(), "{remote}");
+            assert!(exposed_over_plain_http(remote), "{remote} is exposed");
+        }
     }
 
     #[test]

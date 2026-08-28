@@ -502,15 +502,6 @@ mod tests {
     }
 
     #[test]
-    fn creating_a_node_only_requires_its_name() {
-        let node: Node = serde_json::from_value(json!({"name": "Tokyo"})).unwrap();
-        assert_eq!(node.name, "Tokyo");
-        assert!(node.public);
-        assert_eq!(node.billing_cycle, "monthly");
-        assert_eq!(node.traffic_reset_day, 1);
-    }
-
-    #[test]
     fn the_public_view_hides_private_nodes_and_sensitive_fields() {
         let app = app();
         let open = node(&app, "open", true);
@@ -560,8 +551,14 @@ mod tests {
 
         let response = reset_token(Admin, axum::extract::State(app.clone()), Path(id)).await;
         assert_eq!(response.status(), StatusCode::OK);
-        // The agent loop selects on this receiver; None is how it learns to go.
-        assert!(rx.recv().await.is_none(), "the old agent's channel must be closed");
+        // The agent loop selects on this receiver; a closed channel is how it
+        // learns to go. Asked for with try_recv, because `recv().await` on a
+        // channel wrongly left open never returns: the regression this guards
+        // would hang the suite rather than fail it.
+        assert!(
+            matches!(rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)),
+            "the old agent's channel must be closed"
+        );
         assert!(app.agents.lock().unwrap().is_empty());
         assert!(app.live.read().unwrap().is_empty(), "the node must read as offline at once");
     }
@@ -579,8 +576,12 @@ mod tests {
         assert!(!public.as_str().contains("198.51.100.9"), "the public frame must carry no address");
         assert!(!public.as_str().contains("hidden"), "the public frame must carry no private node");
         assert!(admin.as_str().contains("198.51.100.9") && admin.as_str().contains("hidden"));
-        // A second read inside the window is the same frame, not a rebuild.
-        assert_eq!(live_snapshot(&app, false), public);
+
+        // A second read inside the window is the cached frame. Two reads over
+        // unchanged data prove nothing -- a rebuild returns the same bytes --
+        // so the data moves underneath first.
+        node(&app, "late", true);
+        assert_eq!(live_snapshot(&app, false), public, "the frame is reused, not rebuilt per viewer");
     }
 
     #[test]
@@ -597,17 +598,32 @@ mod tests {
         assert!(live_snapshot(&app, false).as_str().contains("added-after"));
     }
 
+    /// The panel sends nothing but a name, and expects the node it just added
+    /// to be in the frame it is already streaming.
     #[tokio::test]
-    async fn a_node_added_from_the_panel_is_in_the_very_next_frame() {
+    async fn a_node_added_from_the_panel_needs_only_a_name_and_shows_up_at_once() {
         let app = std::sync::Arc::new(app());
         node(&app, "existing", true);
         assert!(!live_snapshot(&app, true).as_str().contains("added"));
 
-        let body = Json(serde_json::from_value::<Node>(json!({"name": "added"})).unwrap());
-        assert_eq!(create_node(Admin, State(app.clone()), Ok(body)).await.status(), StatusCode::OK);
+        let added: Node = serde_json::from_value(json!({"name": "added"})).unwrap();
+        // The defaults the panel leans on by not sending them. `public` most of
+        // all: defaulting the other way would publish a node nobody published.
+        assert!(added.public);
+        assert_eq!(added.billing_cycle, "monthly");
+        assert_eq!(added.traffic_reset_day, 1);
+
+        let created = create_node(Admin, State(app.clone()), Ok(Json(added))).await;
+        assert_eq!(created.status(), StatusCode::OK);
         // Frames are cached for nearly two seconds. Without dropping that cache
         // the node the panel just added blinks straight back out of the list.
         assert!(live_snapshot(&app, true).as_str().contains("added"));
+
+        // A name of nothing but spaces is refused, and leaves no node behind.
+        let blank = Json(serde_json::from_value::<Node>(json!({"name": "   "})).unwrap());
+        let refused = create_node(Admin, State(app.clone()), Ok(blank)).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(app.db.nodes().unwrap().len(), 2);
     }
 
     #[test]

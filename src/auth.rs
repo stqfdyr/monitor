@@ -53,14 +53,24 @@ fn verify_password(password: &str, stored: &str) -> bool {
 }
 
 /// Per-address failure counter for the password endpoint.
-#[derive(Default)]
-pub struct Throttle(Mutex<HashMap<IpAddr, (u32, Instant)>>);
+pub struct Throttle {
+    seen: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+    /// How long a failure is remembered. A field rather than the constant so a
+    /// test can watch a lockout expire without sleeping for a quarter of an hour.
+    window: Duration,
+}
+
+impl Default for Throttle {
+    fn default() -> Self {
+        Self { seen: Mutex::default(), window: LOCKOUT }
+    }
+}
 
 impl Throttle {
     fn locked(&self, ip: IpAddr) -> bool {
-        let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         match map.get(&ip) {
-            Some((n, since)) if since.elapsed() < LOCKOUT => *n >= MAX_ATTEMPTS,
+            Some((n, since)) if since.elapsed() < self.window => *n >= MAX_ATTEMPTS,
             Some(_) => {
                 map.remove(&ip);
                 false
@@ -70,15 +80,15 @@ impl Throttle {
     }
 
     fn record_failure(&self, ip: IpAddr) {
-        let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         // Addresses past their window are dropped here rather than left to
         // accumulate, which also restarts the count for a returning one.
-        map.retain(|_, (_, since)| since.elapsed() < LOCKOUT);
+        map.retain(|_, (_, since)| since.elapsed() < self.window);
         map.entry(ip).or_insert((0, Instant::now())).0 += 1;
     }
 
     fn clear(&self, ip: IpAddr) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).remove(&ip);
+        self.seen.lock().unwrap_or_else(|e| e.into_inner()).remove(&ip);
     }
 }
 
@@ -352,7 +362,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn password_round_trips_and_rejects_wrong_input() {
+    fn a_password_round_trips_fails_closed_and_never_repeats_a_salt() {
         let hash = hash_password("correct horse battery staple").unwrap();
         assert!(verify_password("correct horse battery staple", &hash));
         assert!(!verify_password("Correct horse battery staple", &hash));
@@ -360,34 +370,57 @@ mod tests {
         // A corrupt or empty stored hash must fail closed, not open.
         assert!(!verify_password("anything", "not-a-hash"));
         assert!(!verify_password("anything", ""));
-    }
-
-    #[test]
-    fn each_hash_gets_its_own_salt() {
+        // Same password, different hash: the salt is per-hash, so one cracked
+        // row does not read off as every other row using that password.
         assert_ne!(hash_password("same").unwrap(), hash_password("same").unwrap());
     }
 
+    /// One address through the whole lockout lifecycle, in the order it
+    /// happens: attempts up to the limit are allowed, the next one shuts the
+    /// address out, the window runs out on its own, and a success clears it
+    /// early. The window is shortened so that expiry is reachable at all --
+    /// against the real quarter of an hour those branches can never be tested.
     #[test]
-    fn throttle_locks_an_address_then_forgets_it_on_success() {
-        let t = Throttle::default();
+    fn a_lockout_lands_expires_on_its_own_and_clears_on_success() {
+        let window = Duration::from_millis(60);
+        let t = Throttle { window, ..Default::default() };
         let ip: IpAddr = "203.0.113.7".parse().unwrap();
         let other: IpAddr = "203.0.113.8".parse().unwrap();
+        let stale: IpAddr = "203.0.113.9".parse().unwrap();
+        let held = || t.seen.lock().unwrap().len();
 
+        t.record_failure(stale);
         for _ in 0..MAX_ATTEMPTS {
-            assert!(!t.locked(ip));
+            assert!(!t.locked(ip), "attempts up to the limit are still allowed");
             t.record_failure(ip);
         }
-        assert!(t.locked(ip), "address must be locked out after repeated failures");
-        assert!(!t.locked(other), "lockout must not spread to other addresses");
+        assert!(t.locked(ip), "the attempt past the limit is shut out");
+        assert!(!t.locked(other), "the lockout must not spread to other addresses");
 
-        t.clear(ip);
-        assert!(!t.locked(ip));
+        // Nobody tries again while the window runs out. A lockout is a delay,
+        // not a ban: the address has to be let back in by itself.
+        std::thread::sleep(window * 2);
+        assert!(!t.locked(ip), "an expired lockout must lift on its own");
+
+        // `stale` is never asked about, so the only thing that can drop it is
+        // the sweep on the way in. Without it this map grows one entry per
+        // address a caller cares to present, for the life of the process.
+        assert_eq!(held(), 1, "the expired lockout is gone, stale is still held");
+        t.record_failure(other);
+        assert_eq!(held(), 1, "the stale address is swept, not carried");
+
+        // A correct password clears the count at once, so someone who mistyped
+        // a couple of times is not left one slip away from a lockout.
+        t.clear(other);
+        assert_eq!(held(), 0);
     }
 
-    /// A callback that cannot be parsed never reaches the handler, so it can
-    /// neither be logged nor explained. Every field must therefore be optional.
+    /// Both ends of the same redirect: every shape GitHub can send has to parse
+    /// -- one that does not never reaches the handler, so it can be neither
+    /// logged nor explained -- and the reason the hub sends back has to survive
+    /// the query string it is written into.
     #[test]
-    fn every_callback_shape_deserializes_instead_of_being_rejected() {
+    fn every_callback_shape_parses_and_a_failure_reason_survives_the_round_trip() {
         let parse = |q: &str| serde_urlencoded::from_str::<Callback>(q);
 
         let ok = parse("code=abc&state=xyz").expect("the happy path");
@@ -404,45 +437,42 @@ mod tests {
         // Truncated or empty callbacks must still land in the handler.
         assert!(parse("state=xyz").is_ok());
         assert!(parse("").is_ok());
+
+        // The hub's own failures ride back the same way. Anything that would
+        // break out of the query string has to be encoded on the way in, or the
+        // reason arrives truncated at the first stray separator.
+        assert_eq!(urlencode("a&b=c#d"), "a%26b%3Dc%23d");
+        assert_eq!(urlencode("用户"), "%E7%94%A8%E6%88%B7");
+        let reason = "no allowed GitHub users configured (a&b=c)";
+        let back = parse(&format!("error={}", urlencode(reason))).expect("a reason must parse");
+        assert_eq!(back.error.as_deref(), Some(reason), "the whole reason comes back");
     }
 
+    /// A session cookie's whole round trip: the flags it goes out with, riding
+    /// a response next to a second cookie, and being picked back out of the one
+    /// header the browser returns them all in.
     #[test]
-    fn several_cookies_all_survive_on_one_response() {
+    fn a_session_cookie_goes_out_locked_down_alongside_others_and_parses_back() {
+        let session = set_cookie(COOKIE, "abc123", 3_600, true);
+        assert!(session.contains("HttpOnly") && session.contains("SameSite=Lax"));
+        assert!(session.contains("Secure"));
+        assert!(!set_cookie(COOKIE, "abc123", 3_600, false).contains("Secure"));
+
         // axum applies an array of header tuples with insert(), which silently
         // drops all but the last Set-Cookie. This helper must append instead.
-        let response = with_cookies(StatusCode::OK, ["a=1".to_owned(), "b=2".to_owned()]);
+        let response = with_cookies(StatusCode::OK, [session, set_cookie(STATE_COOKIE, "s", 0, true)]);
         let set: Vec<_> = response.headers().get_all(header::SET_COOKIE).iter().collect();
         assert_eq!(set.len(), 2, "both cookies must reach the browser");
         // Empty entries are skipped rather than emitting a blank header.
         let response = with_cookies(StatusCode::OK, ["a=1".to_owned(), String::new()]);
         assert_eq!(response.headers().get_all(header::SET_COOKIE).iter().count(), 1);
-    }
 
-    #[test]
-    fn a_failure_reason_survives_the_trip_through_the_query_string() {
-        assert_eq!(
-            urlencode("no allowed GitHub users configured"),
-            "no%20allowed%20GitHub%20users%20configured"
-        );
-        // Characters that would otherwise break out of the query string.
-        assert_eq!(urlencode("a&b=c#d"), "a%26b%3Dc%23d");
-        assert_eq!(urlencode("用户"), "%E7%94%A8%E6%88%B7");
-    }
-
-    #[test]
-    fn cookies_are_parsed_out_of_a_shared_header() {
+        // And back. They come home crammed into one header, not one each.
         let mut h = HeaderMap::new();
         h.insert(header::COOKIE, "other=1; monitor_session=abc123; x=2".parse().unwrap());
         assert_eq!(cookie_value(&h, COOKIE).as_deref(), Some("abc123"));
         assert_eq!(cookie_value(&h, "missing"), None);
         assert_eq!(cookie_value(&HeaderMap::new(), COOKIE), None);
-    }
-
-    #[test]
-    fn session_cookie_is_locked_down() {
-        let c = set_cookie(COOKIE, "v", 3600, true);
-        assert!(c.contains("HttpOnly") && c.contains("SameSite=Lax") && c.contains("Secure"));
-        assert!(!set_cookie(COOKIE, "v", 3600, false).contains("Secure"));
     }
 
     #[test]
@@ -463,17 +493,5 @@ mod tests {
         assert_eq!(client_ip(&h, ip("2001:db8::5")), ip("2001:db8::5"));
         // No header at all: the peer, wherever it is.
         assert_eq!(client_ip(&HeaderMap::new(), ip("10.0.0.1")), ip("10.0.0.1"));
-    }
-
-    #[test]
-    fn the_throttle_map_does_not_grow_without_bound() {
-        // Every failure comes from a different address, as it would from a
-        // caller rotating a forged header or a botnet.
-        let t = Throttle::default();
-        for n in 0..500u32 {
-            t.record_failure(IpAddr::from([198, 51, 100, (n % 251) as u8]));
-        }
-        let held = t.0.lock().unwrap().len();
-        assert!(held <= 251, "one entry per distinct address, not per attempt: {held}");
     }
 }

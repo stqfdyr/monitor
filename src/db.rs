@@ -934,35 +934,33 @@ mod tests {
         assert_eq!((t.total_rx, t.total_tx), (2_700, 3_300));
     }
 
+    /// The two counters that restart on their own schedule, against a total
+    /// that never does. They hang off separate stored dates, so each rollover
+    /// has to leave the other one alone -- which only shows up if both happen
+    /// to the same node, one after the other.
     #[test]
-    fn month_counter_restarts_but_total_keeps_climbing() {
-        let db = db();
-        let id = node(&db, 1);
-        db.accumulate(id, "boot-a", 0, 0, 1).unwrap();
-        let t = db.accumulate(id, "boot-a", 8_000, 8_000, 1).unwrap();
-        assert_eq!(t.month_rx, 8_000);
-
-        // Force the stored period to look stale, as it would after a rollover.
-        db.conn().execute("UPDATE traffic SET month_start='1999-01-01' WHERE node_id=?1", [id]).unwrap();
-        let t = db.accumulate(id, "boot-a", 9_500, 9_500, 1).unwrap();
-        assert_eq!(t.month_rx, 1_500, "new period counts only this report's delta");
-        assert_eq!(t.total_rx, 9_500, "lifetime total is untouched by the rollover");
-    }
-
-    #[test]
-    fn day_counter_restarts_at_midnight_without_touching_the_others() {
+    fn day_and_month_restart_independently_while_the_total_keeps_climbing() {
         let db = db();
         let id = node(&db, 1);
         db.accumulate(id, "boot-a", 0, 0, 1).unwrap();
         let t = db.accumulate(id, "boot-a", 8_000, 4_000, 1).unwrap();
         assert_eq!((t.day_rx, t.day_tx), (8_000, 4_000));
+        assert_eq!((t.month_rx, t.month_tx), (8_000, 4_000));
 
-        // Force yesterday's date, as it would look after midnight passed.
+        // Midnight passes. Forced through the stored date, which is what the
+        // rollover actually reads.
         db.conn().execute("UPDATE traffic SET day_start='1999-01-01' WHERE node_id=?1", [id]).unwrap();
         let t = db.accumulate(id, "boot-a", 9_500, 4_600, 1).unwrap();
         assert_eq!((t.day_rx, t.day_tx), (1_500, 600), "a new day counts only this report's delta");
         assert_eq!(t.month_rx, 9_500, "the month is not a day");
-        assert_eq!(t.total_rx, 9_500, "lifetime total is untouched by the rollover");
+        assert_eq!(t.total_rx, 9_500, "and the total is neither");
+
+        // Then the billing period turns over, part-way through that same day.
+        db.conn().execute("UPDATE traffic SET month_start='1999-01-01' WHERE node_id=?1", [id]).unwrap();
+        let t = db.accumulate(id, "boot-a", 10_000, 4_700, 1).unwrap();
+        assert_eq!((t.month_rx, t.month_tx), (500, 100), "a new period counts only this report's delta");
+        assert_eq!((t.day_rx, t.day_tx), (2_000, 700), "the day carries on across a billing rollover");
+        assert_eq!(t.total_rx, 10_000, "lifetime total is untouched by either rollover");
     }
 
     #[test]
@@ -1013,10 +1011,17 @@ mod tests {
     fn nodes_can_be_reordered_atomically() {
         let db = db();
         let (a, b, c) = (node(&db, 1), node(&db, 1), node(&db, 1));
+        let order = || db.nodes().unwrap().iter().map(|n| n.id).collect::<Vec<_>>();
         db.reorder_nodes(&[c, a, b]).unwrap();
-        assert_eq!(db.nodes().unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), vec![c, a, b]);
-        assert!(db.reorder_nodes(&[a, a, c]).is_err());
-        assert_eq!(db.nodes().unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), vec![c, a, b]);
+        assert_eq!(order(), vec![c, a, b]);
+
+        // Every rejected shape leaves the order it found. The partial list is
+        // the one that matters: the panel sends the ids it has, and a stale tab
+        // that never saw a node would otherwise renumber the list around it.
+        assert!(db.reorder_nodes(&[a, a, c]).is_err(), "duplicates");
+        assert!(db.reorder_nodes(&[a, b]).is_err(), "a node left out");
+        assert!(db.reorder_nodes(&[a, b, 9999]).is_err(), "an id that is not a node");
+        assert_eq!(order(), vec![c, a, b]);
         // A node added afterwards goes to the end, not to wherever sort 0 puts it.
         let d = node(&db, 1);
         assert_eq!(db.nodes().unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), vec![c, a, b, d]);

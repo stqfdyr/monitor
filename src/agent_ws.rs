@@ -245,31 +245,36 @@ mod tests {
         .to_string()
     }
 
+    /// A burst of reports inside one minute: every one of them moves the live
+    /// view and the running totals, while history takes a single row stamped on
+    /// the minute boundary.
     #[test]
-    fn a_report_updates_live_state_and_accumulated_traffic() {
+    fn a_burst_of_reports_moves_the_live_view_but_writes_one_history_row() {
         let app = app();
         let id = node(&app);
+        let minute = Utc::now().timestamp() / 60 * 60;
 
         dispatch(&app, id, "1.2.3.4", &report_json("boot-a", 1_000, 500)).unwrap();
         dispatch(&app, id, "1.2.3.4", &report_json("boot-a", 3_000, 1_500)).unwrap();
 
         let live = app.live.read().unwrap();
-        let m = &live.get(&id).unwrap().metrics;
-        assert_eq!(m["cpu"], 12.5);
+        let entry = live.get(&id).unwrap();
+        assert_eq!(entry.metrics["cpu"], 12.5);
         // First report is the baseline, so only the second one counts.
-        assert_eq!(m["total_rx"], 2_000);
-        assert_eq!(m["total_tx"], 1_000);
-        assert_eq!(m["month_rx"], 2_000);
-    }
+        assert_eq!(entry.metrics["total_rx"], 2_000);
+        assert_eq!(entry.metrics["total_tx"], 1_000);
+        assert_eq!(entry.metrics["month_rx"], 2_000);
+        assert_eq!(entry.last_minute, minute / 60, "the minute already written is remembered");
+        drop(live);
 
-    #[test]
-    fn history_is_written_once_a_minute_not_once_a_report() {
-        let app = app();
-        let id = node(&app);
-        for _ in 0..5 {
-            dispatch(&app, id, "ip", &report_json("boot-a", 1_000, 1_000)).unwrap();
-        }
-        assert_eq!(app.db.metrics(id, 0).unwrap().len(), 1, "five reports in one minute is one row");
+        // History rows are keyed by (node, ts), so counting them proves nothing
+        // on its own: five reports a second apart collapse onto one row whether
+        // the minute gate is there or not. The stamp is what shows the gate.
+        let rows = app.db.metrics(id, 0).unwrap();
+        assert_eq!(rows.len(), 1, "a minute of reports is one row");
+        assert_eq!(rows[0]["ts"], minute, "stamped on the minute, not on the report");
+        // Written on the same branch, and the offline badge counts from it.
+        assert!(app.db.node(id).unwrap().unwrap().last_seen >= minute, "last_seen is written too");
     }
 
     #[test]
@@ -297,11 +302,25 @@ mod tests {
                    "params": {"task_id": task, "latency_ms": latency}})
             .to_string()
         };
-        dispatch(&app, id, "ip", &result(1, 42)).unwrap();
+        dispatch(&app, id, "ip", &result(7, 42)).unwrap();
+        // Records are keyed by (node, task, ts), so the rejected ones carry a
+        // task id of their own: a bare count would be satisfied by the key
+        // collapsing them onto the good row.
+        dispatch(&app, id, "ip", &result(8, 15)).unwrap();
         dispatch(&app, id, "ip", &result(0, 42)).unwrap(); // no such task
-        let records = app.db.ping_records(id, 0).unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0]["latency"], 42);
+        dispatch(&app, id, "ip", &result(-1, 42)).unwrap(); // nor this one
+
+        // Sorted rather than indexed: both rows land in the same second, and
+        // the query orders by timestamp.
+        let mut seen: Vec<(i64, i64)> = app
+            .db
+            .ping_records(id, 0)
+            .unwrap()
+            .iter()
+            .map(|r| (r["task_id"].as_i64().unwrap(), r["latency"].as_i64().unwrap()))
+            .collect();
+        seen.sort();
+        assert_eq!(seen, vec![(7, 42), (8, 15)], "each real task keeps its own result, and only those");
     }
 
     #[test]

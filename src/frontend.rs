@@ -186,4 +186,28 @@ mod tests {
 
         fs::remove_dir_all(base).unwrap();
     }
+
+    /// The two guards on a theme name, which the settings page runs together:
+    /// which strings may name a directory on disk at all, and which names the
+    /// panel is allowed to switch to.
+    #[test]
+    fn a_theme_name_is_checked_before_it_reaches_the_disk_or_the_settings_row() {
+        assert!(valid_short("aurora") && valid_short("my-theme_2"));
+        // Anything that could steer the join somewhere else.
+        for bad in ["", "..", "a/b", "a\\b", "./x", "~", "a b", "th\u{e9}me"] {
+            assert!(!valid_short(bad), "{bad:?} must not name a theme directory");
+        }
+        // The built-in theme is served out of the binary; a directory answering
+        // to its name would quietly take its place.
+        assert!(!valid_short("default"));
+
+        // It is still a theme the panel can switch to, though -- along with the
+        // empty string it stores as. Switching back to the built-in one is the
+        // way out of a broken external theme, so it can never be refused, and
+        // `selectable` names it twice over for that reason: once in its own
+        // right, once through the list, which always leads with it.
+        let app = App::for_test(crate::db::Db::open(":memory:").unwrap());
+        assert!(selectable(&app, "") && selectable(&app, "default"));
+        assert!(!selectable(&app, "aurora"), "a theme that is not installed is not selectable");
+    }
 }
