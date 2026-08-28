@@ -55,6 +55,18 @@ trap 'rm -f "$TMP"' EXIT
 
 echo "downloading monitor-agent ($ARCH)"
 curl -fsSL "$URL" -o "$TMP"
+
+# Stop an agent already running here before replacing its binary. The service
+# name is fixed, so a reinstall was never going to start a second copy, but
+# without this the new binary lands underneath a live process and only the
+# restart at the end picks it up. Stopping first also means the copy does not
+# depend on `install` choosing to unlink rather than fail with ETXTBSY.
+# After the download, so a node that cannot fetch the binary keeps running.
+if [ "$INIT" = openrc ]; then
+	rc-service monitor-agent stop 2>/dev/null || true
+else
+	systemctl stop monitor-agent 2>/dev/null || true
+fi
 install -m 0755 "$TMP" /usr/local/bin/monitor-agent
 
 # The token lives in a root-only environment file rather than the unit, so it

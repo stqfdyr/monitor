@@ -179,6 +179,20 @@ IPv6-only 的 Alpine 机器：github.com 没有 AAAA 记录，试过的三个加
 agent 本来就是 musl 静态二进制，Alpine 上跑得了，缺的只是 init 脚本。systemd 那套加固
 （`DynamicUser`、`ProtectSystem`）在 OpenRC 下没有对应物，用 `supervise-daemon` 拿到等价的自动重启。
 
+### 重复执行安装命令是幂等的 **[默认]**
+
+同一台机器上再跑一遍安装命令，**不会起第二个 agent**：服务名固定是 `monitor-agent`，二进制、
+env 文件、unit 文件全部整份覆盖，最后 `systemctl restart`（不是 `enable --now`，那个会放过
+已经在跑的服务，见 c6ce53a）。实测连装三次，始终是一个单元、一个进程，跑的是最后一次的参数。
+
+**下载成功之后、覆盖二进制之前先 stop 一次**。komari 的做法是完整卸载再装（停服务、删 unit、
+`rm` 旧二进制），我们只需要 stop：unit 每次都重写，`daemon-reload` + `restart` 就够了。stop
+这一步换来两件事——不必依赖 `install` 恰好会 unlink 而不是撞上 `ETXTBSY`（换成 `cp` 就会失败），
+以及消掉"新二进制已落盘、旧进程还在跑旧代码"的那段窗口。
+
+放在下载**之后**是有意的：拉不到二进制的节点（GitHub 不通、hub 挂了）保持原样继续跑，而不是
+先被停掉再发现装不上。
+
 ### 面板可以手改流量计数 **[用户]**
 
 `PUT /api/nodes/{id}/traffic` 一直都在，只是没有入口。节点换了机器，boot_id 变化会让 hub 把新机器的
