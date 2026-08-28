@@ -16,6 +16,9 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # A test that hangs rather than fails would otherwise sit here burning the
+    # six-hour default. A cold build plus the suite is a few minutes.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
