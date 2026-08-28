@@ -164,8 +164,8 @@ function NodeForm({ node, onClose, onSaved }: {
   const [traffic, setTraffic] = useState(() =>
     Object.fromEntries(TRAFFIC_FIELDS.map(([k]) => [k, gib(node[k])])) as Record<string, string>,
   )
-  // Compared as typed, not as bytes: rounding to GiB would otherwise look like
-  // an edit and zero out a node that has only moved a few MiB.
+  // Compared as typed, not as bytes: rounding to GB would otherwise look like
+  // an edit and zero out a node that has only moved a few MB.
   const pristine = useRef(traffic)
   const set = <K extends keyof Node>(k: K, v: Node[K]) => setForm((f) => ({ ...f, [k]: v }))
 
@@ -211,7 +211,7 @@ function NodeForm({ node, onClose, onSaved }: {
             <Input value={form.name} onChange={(e) => set("name", e.target.value)} />
           </Field>
           <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="每月流量额度 (GiB)" hint="留空或 0 不限">
+            <Field label="每月流量额度 (GB)" hint="留空或 0 不限">
               <Input type="number" value={limitGib} onChange={(e) => setLimitGib(e.target.value)} placeholder="1024" />
             </Field>
             <Field label="流量计算方式">
@@ -236,11 +236,11 @@ function NodeForm({ node, onClose, onSaved }: {
           <details className="rounded-lg border bg-muted/30 px-3 py-2.5">
             <summary className="cursor-pointer text-sm font-medium">流量校正</summary>
             <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-              换机或重装后，新机器的历史计数会被记成一次增量。按 GiB 填入正确值。
+              换机或重装后，新机器的历史计数会被记成一次增量。按 GB 填入正确值。
             </p>
             <div className="mt-3 grid gap-4 sm:grid-cols-2">
               {TRAFFIC_FIELDS.map(([key, label]) => (
-                <Field key={key} label={`${label} (GiB)`}>
+                <Field key={key} label={`${label} (GB)`}>
                   <Input
                     type="number"
                     step="0.001"

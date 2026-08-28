@@ -1,9 +1,20 @@
-/** 1024-based, because every VPS dashboard and `df` report bytes this way. */
-export function bytes(n: number, digits = 2): string {
+const UNITS = ["B", "KB", "MB", "GB", "TB", "PB"]
+
+const unitOf = (n: number) => Math.min(Math.floor(Math.log(n) / Math.log(1024)), UNITS.length - 1)
+
+/// 1024-based, because every VPS dashboard and `df` report bytes this way, but
+/// labelled MB/GB the way `df -h` and every hosting plan write it — nobody sells
+/// a "1000 GiB" plan, and the two extra letters were what pushed the memory and
+/// traffic lines past their column.
+///
+/// Three significant digits by default — "265 GB" of lifetime traffic, "1.8 KB/s"
+/// of live rate. Two decimals everywhere was what forced the public card's lines
+/// to end in an ellipsis; the panel's table has the room either way.
+export function bytes(n: number, digits?: number): string {
   if (!n || n < 0) return "0 B"
-  const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
-  const i = Math.min(Math.floor(Math.log(n) / Math.log(1024)), units.length - 1)
-  return `${(n / 1024 ** i).toFixed(i === 0 ? 0 : digits)} ${units[i]}`
+  const i = unitOf(n)
+  const v = n / 1024 ** i
+  return `${v.toFixed(i === 0 ? 0 : (digits ?? (v >= 100 ? 0 : v >= 10 ? 1 : 2)))} ${UNITS[i]}`
 }
 
 export function rate(n: number): string {
