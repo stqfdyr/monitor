@@ -82,9 +82,14 @@ impl App {
     }
 }
 
+/// Where the agent binaries are published. Deliberately not a setting: the only
+/// person who would ever point this elsewhere is someone forking the project,
+/// and they are already rebuilding this line.
+const AGENT_REPO: &str = "stqfdyr/agent";
+
 /// The one-liner pasted onto a new VPS.
-async fn install_script(State(app): State<Shared>) -> Response {
-    let script = include_str!("../install.sh").replace("@@REPO@@", &app.repo());
+async fn install_script() -> Response {
+    let script = include_str!("../install.sh").replace("@@REPO@@", AGENT_REPO);
     ([(header::CONTENT_TYPE, "text/x-shellscript")], script).into_response()
 }
 
@@ -96,8 +101,7 @@ async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Re
         return (StatusCode::NOT_FOUND, "unknown architecture").into_response();
     }
     let url = format!(
-        "https://github.com/{}/releases/latest/download/monitor-agent-{arch}-unknown-linux-musl",
-        app.repo()
+        "https://github.com/{AGENT_REPO}/releases/latest/download/monitor-agent-{arch}-unknown-linux-musl"
     );
     // The default client timeout is tuned for API calls, not a 1.6 MB download.
     let fetched = app.http.get(&url).timeout(std::time::Duration::from_secs(120)).send().await;
@@ -110,12 +114,6 @@ async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Re
             (StatusCode::BAD_GATEWAY, format!("release download failed: {}", res.status())).into_response()
         }
         Err(e) => (StatusCode::BAD_GATEWAY, format!("release download failed: {e}")).into_response(),
-    }
-}
-
-impl App {
-    fn repo(&self) -> String {
-        self.db.get("release_repo").unwrap_or_else(|| "stqfdyr/agent".into())
     }
 }
 

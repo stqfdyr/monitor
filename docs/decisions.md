@@ -80,6 +80,14 @@ agent 每 2 秒上报（实时视图用），但 `metric` 表每节点每分钟�
 
 **为什么能这么简单**：因为累计流量不是从 `metric` 算出来的，所以明细可以随便删。见 [traffic.md](traffic.md)。
 
+### agent 仓库写死在代码里，不做设置项 **[用户]**
+
+`src/main.rs` 的 `AGENT_REPO` 常量。曾经是 `setting` 表里的 `release_repo`，但没有任何界面能改它，
+唯一会想改的人是 fork 这个项目的人——而他们本来就要重新编译。一个从没被写入过的设置行、一次
+数据库读取、一段文档，换来的灵活性是零。
+
+顺带的好处：`/agent/{arch}` 转发的 URL 现在没有一段来自数据库。见 [security.md](security.md)。
+
 ---
 
 ## 流量
@@ -292,7 +300,3 @@ token 明文存库，随节点列表下发给面板，安装命令在前端本�
 | 远程 SSH | "我不需要远程 ssh 功能" |
 | 插件系统 | "不需要插件系统" |
 | ICMP / HTTP ping | "参考 komari 的配置方式，砍掉 icmp 和 http" |
-
-## 待办
-
-- `release_repo` 设置项目前只能改数据库，面板没有输入框。agent 不发在 `stqfdyr/agent` 的话需要手动 `UPDATE setting`

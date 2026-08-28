@@ -98,7 +98,6 @@ agent 收到后会**保留没变化的任务**（同 id + 同 target + 同 inter
 | `admin_password_hash` | 首次启动生成 | argon2id |
 | `github_client_id` / `github_client_secret` | 空 | OAuth App |
 | `github_allowed_users` | 空 | 逗号分隔的用户名白名单。**空 = 任何人都登不进来**（不是任何人都能进） |
-| `release_repo` | `stqfdyr/agent` | `install.sh` 从哪个仓库拉 agent 二进制。目前没有 UI，只能改 DB |
 | `theme` | `default` | 公开页主题短名；空、无效或已删除时使用内置默认主题 |
 
 ## 请求路径

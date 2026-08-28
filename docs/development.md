@@ -122,7 +122,8 @@ CHROME=$(find /root/.cache/puppeteer/chrome -name chrome -type f | head -1)
 
 推一个 `v*` tag 触发 `.github/workflows/release.yml`。CI 会构建内置后台、clone 并构建默认主题，再构建 hub 的 musl 静态二进制。agent 和主题由各自仓库独立发布。
 
-`install.sh` 从 `https://github.com/{release_repo}/releases/latest/download/monitor-agent-{arch}-unknown-linux-musl` 下载，`release_repo` 默认 `stqfdyr/agent`，存在 `setting` 表里。
+`install.sh` 默认走 hub 的 `/agent/{arch}` 拿二进制；只有 `--github-proxy` 会绕过 hub 直连 GitHub，
+拼的是 `src/main.rs` 里的 `AGENT_REPO` 常量。
 
 ## 几个容易踩的坑
 
