@@ -42,11 +42,26 @@ agent 不写任何文件、不记忆任何跨重启的状态。它只上报"此�
 
 **否决**：komari 的 `netstatic` 方案（agent 侧落盘记流量）——每台 VPS 一个状态文件，重装即丢。
 
-### 不做自动更新 **[用户]**
+### 自动更新用 systemd timer，不用 agent 自更新 **[用户]**
 
-komari-agent 能从 GitHub release 拉新二进制自替换。用户选了不做。
+先是不做（"升级就是重跑一遍安装命令"），后来用户要求加上，默认打开。
 
-**为什么**：自更新意味着 agent 能以 root 下载并执行任意二进制，是整个探针最大的攻击面。升级方式是重跑一遍安装命令，一行的事。
+komari-agent 的做法是 agent 进程自己每 6 小时问 GitHub API、用 go-github-selfupdate 替换自己的二进制、然后 `os.Exit(42)` 让服务管理器拉起来。**这条路我们走不了，也不该走**：agent 的 unit 里有 `DynamicUser=yes`、`ProtectSystem=strict`、`NoNewPrivileges=yes`，它连自己的二进制都写不了。要自更新就得把这三条全撤掉，等于让一个长期在线、解析外来 WebSocket 帧的进程拿到 root 写权限——这正是当初否决它的理由。
+
+**现在的做法**：`install.sh --auto-update`（默认开）额外装三样东西——`/usr/local/bin/monitor-agent-update`、一个 `Type=oneshot` 的 service、一个 `OnCalendar=daily` 的 timer。agent 本身一行更新代码都没有，仍然跑在 DynamicUser 下面；能替换二进制的东西一天只活两秒。
+
+**安全上做了什么**：
+
+- **只走 https**（回环除外）。明文下载等于把 root 二进制的写权限交给路径上任何人，这是自动更新唯一比不更新更糟的情形。URL 不是 https 就不装 timer，装完给出提示
+- **变了才动**。`cmp` 相同直接退出，不重启，不产生每日掉线
+- **先证明能跑**。下载的文件 `--help` 必须打出 `monitor-agent ` 开头的一行，截断的文件、代理返回的 HTML、错的架构都停在这一步，而不是停在重启之后
+- **起不来就回滚**。旧二进制留成 `.prev`，换完等 5 秒，服务没 active 就换回去重启
+- **临时文件放在二进制旁边**，不是 `/tmp`——加固过的机器 `/tmp` 是 noexec，冒烟测试会跑不起来
+- `RandomizedDelaySec=6h` + `Persistent=true`：一批机器不会在同一秒钟去拉同一个 1.6 MB，关机错过的也会补上
+
+**仍然成立的边界**：hub（以及它的 TLS）本来就是信任根——安装命令和二进制都从它来。自动更新把"装的那一刻信任一次"变成"每天信任一次"。这是这个功能的代价，不是 bug。
+
+**否决**：agent 侧自更新（komari 方案），理由见上。
 
 ---
 

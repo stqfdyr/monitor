@@ -68,6 +68,11 @@ curl -fsSL https://monitor.example.com/install.sh | sh -s -- \
 agent 二进制由 hub 转发，节点无需直连 GitHub。hub 自身无法访问 GitHub 时，可给安装命令加
 `--github-proxy https://ghfast.top`，由节点直连镜像下载。
 
+**自动更新默认开着**：安装时会额外装一个每天跑一次的 systemd timer（Alpine 上是
+`/etc/periodic/daily`），只有发布的二进制和本机的不一样才替换并重启，起不来会自动回滚到上一个。
+agent 进程本身不碰自己的二进制，仍然跑在 `DynamicUser` 下。安装命令加 `--no-auto-update` 可以关掉，
+面板的安装对话框里也有开关；关掉后重跑安装命令会把 timer 一并删掉。下载地址不是 https 时不会启用。
+
 ## 反向代理
 
 置于反向代理之后时，用 `--listen 127.0.0.1:8080` 限制监听，并注意：
