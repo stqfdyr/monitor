@@ -295,5 +295,4 @@ token 明文存库，随节点列表下发给面板，安装命令在前端本�
 
 ## 待办
 
-- `release_repo` 设置项目前只能改数据库，面板没有输入框。仓库名不是 `stqfdyr/monitor` 的话需要手动 `UPDATE setting`
-- `install.sh` 依赖 GitHub release 存在。需要先建仓库并推 `v0.1.0` tag，`.github/workflows/release.yml` 会构建 musl 静态二进制
+- `release_repo` 设置项目前只能改数据库，面板没有输入框。agent 不发在 `stqfdyr/agent` 的话需要手动 `UPDATE setting`
