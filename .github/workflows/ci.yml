@@ -27,7 +27,7 @@ jobs:
             web-admin/package-lock.json
             web-theme/package-lock.json
 
-      - run: npm ci && npm run build
+      - run: npm ci && npm run lint && npm run build
         working-directory: web-admin
       - run: npm ci && npm run build
         working-directory: web-theme
