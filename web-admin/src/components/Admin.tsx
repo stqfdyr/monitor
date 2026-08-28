@@ -13,7 +13,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { api, type Node, type PingTask } from "@/lib/api"
-import { bytes, CYCLES, money, monthUsage, uptime } from "@/lib/format"
+import { bytes, CYCLES, FOREVER, money, monthUsage, uptime } from "@/lib/format"
 
 const GIB = 1024 ** 3
 /// Counters the panel can correct by hand, e.g. after a node moved to new
@@ -274,6 +274,9 @@ function BillingForm({ node, onClose, onSaved }: {
   onSaved: () => void
 }) {
   const [form, setForm] = useState(node)
+  // Text, not a number: a numeric state cannot hold "empty", so clearing the
+  // box used to snap back to 0 while you were still typing. Empty means free.
+  const [price, setPrice] = useState(node.price > 0 ? String(node.price) : "")
   const [saving, setSaving] = useState(false)
   const set = <K extends keyof Node>(k: K, v: Node[K]) => setForm((f) => ({ ...f, [k]: v }))
 
@@ -284,7 +287,7 @@ function BillingForm({ node, onClose, onSaved }: {
         method: "PUT",
         body: JSON.stringify({
           ...form,
-          price: Number(form.price) || 0,
+          price: Math.max(0, Number(price) || 0),
           expires_at: form.expires_at || null,
         }),
       })
@@ -306,8 +309,15 @@ function BillingForm({ node, onClose, onSaved }: {
         </DialogHeader>
         <div className="space-y-5">
           <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="价格">
-              <Input type="number" min="0" step="0.01" value={form.price} onChange={(e) => set("price", Number(e.target.value))} />
+            <Field label="价格" hint="留空或 0 为免费">
+              <Input
+                type="number"
+                min="0"
+                step="0.01"
+                value={price}
+                onChange={(e) => setPrice(e.target.value)}
+                placeholder="免费"
+              />
             </Field>
             <Field label="货币">
               <Select value={form.currency} onValueChange={(v) => set("currency", v)}>
@@ -593,13 +603,13 @@ function Nodes({ nodes, refresh, site }: { nodes: Node[]; refresh: () => void; s
                 <TableCell className="tnum text-sm">
                   {bytes(monthUsage(n))}
                   <span className="text-muted-foreground">
-                    {" / "}{n.traffic_limit > 0 ? bytes(n.traffic_limit) : "不限"}
+                    {" / "}{n.traffic_limit > 0 ? bytes(n.traffic_limit) : FOREVER}
                   </span>
                 </TableCell>
                 <TableCell className="tnum text-sm">
-                  {n.price > 0 ? money(n.price, n.currency) : "—"}
+                  {n.price > 0 ? money(n.price, n.currency) : "免费"}
                 </TableCell>
-                <TableCell className="text-sm">{n.expires_at || "—"}</TableCell>
+                <TableCell className="text-sm">{n.expires_at || FOREVER}</TableCell>
                 <TableCell className="text-right whitespace-nowrap">
                   <Button variant="ghost" size="icon" onClick={() => setInstalling(n)} title="安装 Agent" aria-label="安装 Agent">
                     <Download />

@@ -30,6 +30,12 @@ export function daysUntil(date?: string | null): number | null {
   return Math.ceil((target - Date.now()) / 86400000)
 }
 
+/// No expiry, no traffic cap: the same "there is no ceiling here" either way.
+/// U+221E rather than the ♾️ emoji — the emoji arrives as a coloured tile from
+/// whatever font the visitor has, which on a greyscale page is the loudest
+/// thing on the card; this one inherits the text colour and size.
+export const FOREVER = "∞"
+
 const SYMBOLS: Record<string, string> = { USD: "$", CNY: "¥", EUR: "€", GBP: "£", JPY: "¥" }
 
 export function money(amount: number, currency: string): string {
