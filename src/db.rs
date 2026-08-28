@@ -527,11 +527,24 @@ impl Db {
                 ))
             })?;
 
-        let rebooted = prev_boot != boot_id || rx < last_rx || tx < last_tx;
-        let (d_rx, d_tx) = if rebooted { (rx, tx) } else { (rx - last_rx, tx - last_tx) };
-        // A brand new node has no baseline, so its first report would otherwise
-        // book the machine's entire lifetime traffic in one go.
-        let (d_rx, d_tx) = if prev_boot.is_empty() { (0, 0) } else { (d_rx, d_tx) };
+        // Three cases, and only the middle one may book a whole reading as new
+        // bytes. A new boot_id means the kernel counters really did restart at
+        // zero. A reading that merely shrank under the *same* boot means the
+        // baseline shrank instead: an interface the sum counted has gone (wg0
+        // down, a tunnel stopped), so the reading is the rest of the machine's
+        // history, and booking it would count that history twice -- tens of
+        // gigabytes on a box that has been up a month. Re-align to the smaller
+        // baseline and skip the one sample instead; the worst that costs is a
+        // report interval of traffic, against a total that stays honest.
+        let (d_rx, d_tx) = if prev_boot.is_empty() {
+            // A brand new node has no baseline, so its first report would
+            // otherwise book the machine's entire lifetime traffic in one go.
+            (0, 0)
+        } else if prev_boot != boot_id {
+            (rx, tx)
+        } else {
+            ((rx - last_rx).max(0), (tx - last_tx).max(0))
+        };
         total_rx += d_rx;
         total_tx += d_tx;
         month_rx += d_rx;
@@ -893,14 +906,32 @@ mod tests {
     }
 
     #[test]
-    fn counter_wrap_without_a_reboot_is_also_absorbed() {
+    fn a_shrinking_reading_re_aligns_instead_of_re_counting_history() {
         let db = db();
         let id = node(&db, 1);
         db.accumulate(id, "boot-a", 10_000, 10_000, 1).unwrap();
-        db.accumulate(id, "boot-a", 12_000, 12_000, 1).unwrap();
-        // Same boot, counter went backwards: treat the reading as fresh bytes.
+        let t = db.accumulate(id, "boot-a", 12_000, 12_000, 1).unwrap();
+        assert_eq!((t.total_rx, t.total_tx), (2_000, 2_000));
+
+        // Same boot, reading dropped: an interface the sum counted is gone, so
+        // this reading is the rest of the machine's history rather than fresh
+        // bytes. Booking it would land 2_500 here -- and tens of gigabytes on a
+        // box that has been up a month.
         let t = db.accumulate(id, "boot-a", 500, 500, 1).unwrap();
-        assert_eq!((t.total_rx, t.total_tx), (2_500, 2_500));
+        assert_eq!((t.total_rx, t.total_tx), (2_000, 2_000));
+
+        // Aligned to the smaller baseline, counting picks up from there.
+        let t = db.accumulate(id, "boot-a", 900, 900, 1).unwrap();
+        assert_eq!((t.total_rx, t.total_tx), (2_400, 2_400));
+
+        // A new boot still books the whole reading: those counters did start at
+        // zero, so the reading really is traffic since the machine came up.
+        let t = db.accumulate(id, "boot-b", 300, 300, 1).unwrap();
+        assert_eq!((t.total_rx, t.total_tx), (2_700, 2_700));
+
+        // One direction shrinking does not cost the other its increment.
+        let t = db.accumulate(id, "boot-b", 100, 900, 1).unwrap();
+        assert_eq!((t.total_rx, t.total_tx), (2_700, 3_300));
     }
 
     #[test]
