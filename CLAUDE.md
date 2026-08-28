@@ -16,9 +16,7 @@ agent 在 [独立仓库](https://github.com/stqfdyr/agent)。后台在 `web-admi
 
 ## 明确不做的
 
-不要"顺手"加回来，想加先问用户：通知、远程 SSH、插件系统、ICMP/HTTP ping、跨平台 agent。
-
-agent **自更新**同样不做——但 `install.sh` 会装一个 root 的 systemd timer 来更新它，默认开，`--no-auto-update` 关。理由见 [docs/decisions.md](docs/decisions.md)。
+不要"顺手"加回来，想加先问用户：通知、远程 SSH、插件系统、ICMP/HTTP ping、agent 自动更新、跨平台 agent。
 
 ## 工作方式
 

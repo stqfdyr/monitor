@@ -38,7 +38,7 @@
 - 远程 SSH / web terminal
 - 插件系统
 - ICMP ping 和 HTTP ping（只保留 TCP）
-- agent 自更新（agent 进程自己下载并替换自己的二进制；改由 install.sh 装的 root 定时器做）
+- agent 自动更新（升级方式是重跑一遍安装命令）
 - 跨平台 agent（Windows / macOS / BSD）
 
 理由见 [decisions.md](decisions.md)。想加任何一条之前先问用户。

@@ -352,10 +352,8 @@ function shellArg(value: string) {
 /// Built here rather than fetched: the node list already carries the token, so
 /// looking at an install command is a read, not an act. Reissuing one to be
 /// able to show it is what used to knock the running agent offline.
-function installCommand(site: string, token: string, seconds: number, proxy: string, autoUpdate: boolean) {
+function installCommand(site: string, token: string, seconds: number, proxy: string) {
   const args = [`--server ${site}`, `--token ${token}`, `--interval ${seconds}`]
-  // The installer defaults to updating itself, so only the off switch travels.
-  if (!autoUpdate) args.push("--no-auto-update")
   if (proxy) args.push(`--github-proxy ${shellArg(proxy.includes("://") ? proxy : `https://${proxy}`)}`)
   return `curl -fsSL ${site}/install.sh | sh -s -- ${args.join(" ")}`
 }
@@ -369,12 +367,11 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   const [token, setToken] = useState(node.token ?? "")
   const [interval, setInterval] = useState("1")
   const [githubProxy, setGithubProxy] = useState("")
-  const [autoUpdate, setAutoUpdate] = useState(true)
   const [rotating, setRotating] = useState(false)
   const [confirmRotate, setConfirmRotate] = useState(false)
 
   const seconds = Math.min(3600, Math.max(1, Math.round(Number(interval) || 1)))
-  const command = token ? installCommand(site, token, seconds, githubProxy.trim(), autoUpdate) : ""
+  const command = token ? installCommand(site, token, seconds, githubProxy.trim()) : ""
 
   async function rotate() {
     setRotating(true)
@@ -406,15 +403,6 @@ function InstallDialog({ node, site, onClose, onRotated }: {
               <Input value={githubProxy} onChange={(e) => setGithubProxy(e.target.value)} placeholder="https://ghfast.top" />
             </Field>
           </div>
-          <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
-            <span>
-              <span className="block font-medium">自动更新</span>
-              <span className="mt-0.5 block text-xs text-muted-foreground">
-                每天查一次新版本，只有二进制变了才替换并重启；启动不起来会自动回滚
-              </span>
-            </span>
-            <Switch checked={autoUpdate} onCheckedChange={setAutoUpdate} />
-          </label>
           <div className="space-y-2">
             <Label className="text-sm font-medium">安装命令</Label>
             <pre className="h-28 overflow-auto whitespace-pre-wrap break-all rounded-lg border bg-muted/40 p-3 text-xs leading-relaxed select-all">
