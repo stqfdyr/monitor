@@ -33,6 +33,10 @@ HUB=https://monitor.example.com
 case "$(uname -m)" in aarch64 | arm64) A=aarch64 ;; *) A=x86_64 ;; esac
 
 NEW=/usr/local/bin/.monitor-agent.new
+# 走哪条路径退出都清掉它，包括 curl 中途失败、ssh 断开这种半路退出。
+# 成功那条路径上它已经被 mv 走了，这里的 rm 是空操作。
+trap 'rm -f "$NEW"' EXIT
+
 curl -fsSL --max-time 120 "$HUB/agent/$A" -o "$NEW"
 chmod 0755 "$NEW"
 
@@ -40,12 +44,12 @@ chmod 0755 "$NEW"
 # 截断的文件、代理返回的 HTML 错误页、错的架构，都会停在这一步。
 # 不要省掉这三行。
 "$NEW" --help 2>&1 | head -1 | grep -q '^monitor-agent ' || {
-	rm -f "$NEW"; echo "$(hostname): 下载到的不是 agent，没动"; exit 1
+	echo "$(hostname): 下载到的不是 agent，没动"; exit 1
 }
 
 OLD=$(/usr/local/bin/monitor-agent --help 2>&1 | head -1)
 if cmp -s "$NEW" /usr/local/bin/monitor-agent; then
-	rm -f "$NEW"; echo "$(hostname): 已是最新 ($OLD)"; exit 0
+	echo "$(hostname): 已是最新 ($OLD)"; exit 0
 fi
 
 if command -v systemctl >/dev/null; then
@@ -62,6 +66,10 @@ REMOTE
 ```
 
 这段是幂等的：版本没变就什么都不做，不会白重启一次。
+
+**不留旧版本备份。** `mv` 直接把新的盖上去，旧二进制随之消失；节点上升级前后都只有
+`/usr/local/bin/monitor-agent` 一个文件。要退回旧版本，从 GitHub 下指定 tag，见下面
+[「升完之后节点在面板上一直不上线」](#升完之后节点在面板上一直不上线)。
 
 **临时文件放在 `/usr/local/bin/` 下而不是 `/tmp`**，因为上面那步冒烟测试要执行它，而加固过的机器 `/tmp` 是 `noexec`。
 
