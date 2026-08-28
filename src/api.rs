@@ -11,8 +11,8 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::auth::{authed, hash_password, issue_session, random_token, with_cookies};
 use crate::agent_ws::Live;
+use crate::auth::{authed, hash_password, issue_session, random_token, with_cookies};
 use crate::db::{Node, PingTask, Traffic};
 use crate::{agent_ws, App, Shared};
 
@@ -129,10 +129,7 @@ pub async fn nodes(State(app): State<Shared>, headers: HeaderMap) -> Response {
     // public status page that gets linked somewhere busy would otherwise
     // rebuild every node's row once per visitor, against the connection the
     // agents are writing through.
-    (
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        live_snapshot(&app, full).as_str().to_owned(),
-    )
+    ([(axum::http::header::CONTENT_TYPE, "application/json")], live_snapshot(&app, full).as_str().to_owned())
         .into_response()
 }
 
@@ -301,23 +298,18 @@ pub struct NodeOrder {
     ids: Vec<i64>,
 }
 
+/// The list must name every node exactly once. That is checked inside the
+/// transaction that does the renumbering rather than here: a duplicate, a
+/// missing node and an unknown id are the same three rejections either way, and
+/// re-reading the node list first only made the check race the write it guards.
 pub async fn reorder_nodes(_: Admin, State(app): State<Shared>, Json(order): Json<NodeOrder>) -> Response {
-    let mut existing = match app.db.nodes() {
-        Ok(nodes) => nodes.into_iter().map(|node| node.id).collect::<Vec<_>>(),
-        Err(e) => return fail(e),
-    };
-    let mut requested = order.ids.clone();
-    existing.sort_unstable();
-    requested.sort_unstable();
-    if requested != existing {
-        return bad("node order must include every node exactly once");
-    }
     match app.db.reorder_nodes(&order.ids) {
         Ok(()) => {
             invalidate_snapshot(&app);
             Json(json!({"ok": true})).into_response()
         }
-        Err(e) => fail(e),
+        // Every way this fails is a list the caller got wrong.
+        Err(e) => bad(&e.to_string()),
     }
 }
 
@@ -452,6 +444,12 @@ pub async fn save_settings(_: Admin, State(app): State<Shared>, Json(body): Json
         let Some(value) = value.as_str() else { continue };
         let stored = match key.as_str() {
             "theme" if !crate::frontend::selectable(&app, value) => return bad("theme is not installed"),
+            // Housekeeping clamps whatever it reads back, so anything it cannot
+            // parse would be stored, shown back in the panel, and quietly mean
+            // 30 days forever. Refuse it here instead.
+            "retention_days" if !value.parse::<i64>().is_ok_and(|d| (1..=3_650).contains(&d)) => {
+                return bad("retention days must be a number from 1 to 3650")
+            }
             k if READABLE_SETTINGS.contains(&k) || k == "github_client_secret" => value,
             // Changing the password logs every existing session out.
             "admin_password" => {
@@ -695,6 +693,22 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(app.db.get("admin_password_hash").is_none(), "the password must not have changed");
         assert!(app.db.session_valid(&sha256(&live)), "a rejected change must not log anyone out");
+    }
+
+    /// Housekeeping clamps whatever it finds, so a value it cannot parse is not
+    /// an error anywhere downstream -- it just silently means 30 days, in a box
+    /// that goes on displaying what was typed.
+    #[tokio::test]
+    async fn a_retention_window_that_would_never_apply_is_refused() {
+        let app = std::sync::Arc::new(app());
+        let put =
+            |v: &str| save_settings(Admin, State(app.clone()), Json(json!({"retention_days": v.to_owned()})));
+        for junk in ["", "abc", "0", "-1", "9999"] {
+            assert_eq!(put(junk).await.status(), StatusCode::BAD_REQUEST, "{junk:?}");
+        }
+        assert!(app.db.get("retention_days").is_none(), "a refused window must not be stored");
+        assert_eq!(put("7").await.status(), StatusCode::OK);
+        assert_eq!(app.db.get("retention_days").as_deref(), Some("7"));
     }
 
     #[tokio::test]
