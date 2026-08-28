@@ -13,7 +13,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { api, type Node, type PingTask } from "@/lib/api"
-import { bytes, CYCLES, money, monthUsage } from "@/lib/format"
+import { bytes, CYCLES, money, monthUsage, uptime } from "@/lib/format"
 
 const GIB = 1024 ** 3
 /// Counters the panel can correct by hand, e.g. after a node moved to new
@@ -579,6 +579,14 @@ function Nodes({ nodes, refresh, site }: { nodes: Node[]; refresh: () => void; s
                     {n.online ? "在线" : "离线"}
                   </Badge>
                   {!n.public && <Badge variant="outline" className="ml-1 font-normal">不公开</Badge>}
+                  {/* Under the badge rather than inside it: the column is a
+                      tenth of the table, and "离线" plus a duration plus the
+                      不公开 badge do not share one line. */}
+                  {!n.online && n.last_seen > 0 && Date.now() / 1000 - n.last_seen >= 60 && (
+                    <div className="tnum mt-1 text-xs text-muted-foreground">
+                      {uptime(Date.now() / 1000 - n.last_seen)}
+                    </div>
+                  )}
                 </TableCell>
                 {/* Counted by the node's own billing rule, the same way the
                     public page and the quota below it are. */}
