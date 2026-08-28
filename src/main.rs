@@ -22,6 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
 use chrono::{Months, NaiveDate, Utc};
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -216,11 +217,26 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     info!("listening on {} (public URL {})", args.listen, args.site);
     axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(shutdown())
         .await?;
     Ok(())
+}
+
+/// Waits for whichever stop signal arrives first.
+///
+/// SIGTERM is the one that matters: it is how systemd stops and restarts a
+/// service, and without it every deploy killed the hub outright rather than
+/// letting it finish the requests it was holding. Ctrl-C is the same event
+/// from a terminal.
+async fn shutdown() {
+    // SIGTERM is always registerable; a failure here is a broken runtime, and
+    // falling back to Ctrl-C alone would quietly reinstate the bug above.
+    let mut term = signal(SignalKind::terminate()).expect("listen for SIGTERM");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
+    info!("shutting down");
 }
 
 /// True when `--site` would send cookies and tokens over the wire in the clear.
