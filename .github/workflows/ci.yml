@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push supersedes the run still going for the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # rust-embed needs both dist/ trees to exist before cargo touches them.
+      - run: git clone --depth 1 https://github.com/stqfdyr/monitor-theme-default web-theme
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            web-admin/package-lock.json
+            web-theme/package-lock.json
+
+      - run: npm ci && npm run build
+        working-directory: web-admin
+      - run: npm ci && npm run build
+        working-directory: web-theme
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
