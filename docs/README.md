@@ -12,7 +12,7 @@
 | [data-accuracy.md](https://github.com/stqfdyr/agent/blob/main/docs/data-accuracy.md) | 碰 agent 采集代码之前。内存/硬盘/CPU 的口径和验证方法 |
 | [security.md](security.md) | 碰鉴权、API 边界、公开页之前 |
 | [development.md](development.md) | 要构建、测试、本地跑起来 |
-| [upgrade-agents.md](upgrade-agents.md) | 要把节点上的 agent 升到新版本。可以直接丢给一个有 ssh 权限的 AI 执行 |
+| [benchmark.md](benchmark.md) | 想知道比 komari 快多少、省多少。也是调优改动的记录 |
 
 ## 30 秒版本
 

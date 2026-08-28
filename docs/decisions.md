@@ -102,6 +102,38 @@ agent 每 2 秒上报（实时视图用），但 `metric` 表每节点每分钟�
 
 ---
 
+## 性能
+
+实测数字见 [benchmark.md](benchmark.md)。下面四条是那一轮定下来的取舍。
+
+### WebSocket 每连接读缓冲设成 4 KiB **[默认]**
+
+tungstenite 的默认值是 128 KiB，按大消息传输定的。一个上报包几百字节，200 个 agent 就是 25 MiB 纯浪费的常驻内存。
+
+改动位置：`src/api.rs` 的 `SOCKET_BUFFER`，agent 和浏览器两条 WebSocket 都用它。**要传大消息才需要调回去**，目前两边的帧都远小于 4 KiB。
+
+### 节点列表一次查完流量，不逐个查 **[默认]**
+
+`node_view()` 原来自己去查一次 `traffic` 表并拿一次 `live` 读锁，渲染 200 个节点就是 200 次查询、200 次加锁，全部排在 agent 的写入前面。现在 `visible_nodes()` 一次 `all_traffic()` + 一次锁，把结果传进去。
+
+**所以 `node_view()` 不再拿 `&App`。** 加新字段时它需要什么就从参数传进去，别在里面重新查库。
+
+### `/api/nodes` 复用 WebSocket 的快照缓存 **[默认]**
+
+`live_snapshot()` 的 2 秒缓存本来只有浏览器的 WebSocket 流在用，HTTP 那条路每次请求都重新渲染一遍全量 JSON。公开状态页被人转发一次就会把这条路打满。
+
+代价是缓存的帧里多了一个 `admin` 字段（两个消费端都只读 `nodes`，忽略多余字段），以及 HTTP 拿到的数据最多旧 2 秒——和 WebSocket 流本来就一样。**任何改节点的写路径都必须调 `invalidate_snapshot()`**，否则面板改完刷新看到的还是旧的。
+
+### SQLite 参数抄 komari **[默认]**
+
+komari 的 `internal/sqlitetune` 是认真调过的，能搬的都搬了：`cache_size = -8192`（8 MiB page cache）、`wal_autocheckpoint = 256`、`journal_size_limit = 1 MiB`。WAL、`synchronous = NORMAL`、`busy_timeout` 本来就一样。
+
+**没抄的两条**：`_txlock=immediate`（这里只有一个连接、外面一把 Mutex，不存在锁升级冲突）和上报批处理（这里 `metric` 表每节点每分钟才写一行，本来就没有可批的量）。
+
+PRAGMA 是**每连接**的，用 `sqlite3` 命令行去读只会读到它自己那条连接的默认值。`db.rs` 里有个测试守着这几个值真的落到了 hub 用的那条连接上。
+
+---
+
 ## 安全
 
 ### GitHub SSO + 本地应急密码 **[用户]**

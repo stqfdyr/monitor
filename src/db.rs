@@ -3,7 +3,7 @@
 // ponytail: single global connection; move to a read pool if the dashboard ever
 // blocks behind ingest.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use anyhow::Result;
@@ -18,6 +18,14 @@ PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
 PRAGMA busy_timeout = 5000;
+-- 8 MiB of page cache. The whole working set of a few hundred nodes fits, so
+-- the read paths stop going back to the filesystem. Same figure komari settled
+-- on, and the only one of its SQLite knobs that is not already the default here.
+PRAGMA cache_size = -8192;
+-- Without these the WAL grows to whatever the busiest minute needed and never
+-- gives the space back: a hub is a long-running process on a small VPS.
+PRAGMA wal_autocheckpoint = 256;
+PRAGMA journal_size_limit = 1048576;
 
 CREATE TABLE IF NOT EXISTS setting (
   key   TEXT PRIMARY KEY,
@@ -433,6 +441,44 @@ impl Db {
             .unwrap_or_default()
     }
 
+    /// Every node's counters in one query. The node list renders a row per node
+    /// and used to fetch each one separately: on a hub with a few hundred nodes
+    /// that was a few hundred round trips through the single connection, with
+    /// the agents' writes queued behind them.
+    pub fn all_traffic(&self) -> HashMap<i64, Traffic> {
+        let conn = self.conn();
+        let Ok(mut stmt) = conn.prepare_cached(
+            "SELECT node_id, total_rx, total_tx, month_rx, month_tx, month_start, day_rx, day_tx
+                 FROM traffic",
+        ) else {
+            return HashMap::new();
+        };
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                Traffic {
+                    total_rx: r.get(1)?,
+                    total_tx: r.get(2)?,
+                    month_rx: r.get(3)?,
+                    month_tx: r.get(4)?,
+                    month_start: r.get(5)?,
+                    day_rx: r.get(6)?,
+                    day_tx: r.get(7)?,
+                },
+            ))
+        });
+        rows.map(|r| r.flatten().collect()).unwrap_or_default()
+    }
+
+    /// The one field a report needs from the node row. Reading the whole row
+    /// here meant decoding thirty columns every couple of seconds per node.
+    pub fn traffic_reset_day(&self, id: i64) -> u32 {
+        self.conn()
+            .prepare_cached("SELECT traffic_reset_day FROM node WHERE id=?1")
+            .and_then(|mut s| s.query_row([id], |r| r.get(0)))
+            .unwrap_or(1)
+    }
+
     /// Folds one report's raw kernel counters into the node's running totals.
     ///
     /// A changed boot_id, or a counter that moved backwards, means the kernel
@@ -460,12 +506,12 @@ impl Db {
             mut day_rx,
             mut day_tx,
             day_start,
-        ) = conn.query_row(
+        ) = conn.prepare_cached(
             "SELECT boot_id, last_rx, last_tx, total_rx, total_tx, month_rx, month_tx, month_start,
                     day_rx, day_tx, day_start
                  FROM traffic WHERE node_id=?1",
-            [node_id],
-            |r| {
+        )?
+        .query_row([node_id], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, i64>(1)?,
@@ -479,8 +525,7 @@ impl Db {
                     r.get::<_, i64>(9)?,
                     r.get::<_, String>(10)?,
                 ))
-            },
-        )?;
+            })?;
 
         let rebooted = prev_boot != boot_id || rx < last_rx || tx < last_tx;
         let (d_rx, d_tx) = if rebooted { (rx, tx) } else { (rx - last_rx, tx - last_tx) };
@@ -508,15 +553,15 @@ impl Db {
             day_tx = d_tx;
         }
 
-        conn.execute(
+        conn.prepare_cached(
             "UPDATE traffic SET boot_id=?2, last_rx=?3, last_tx=?4, total_rx=?5, total_tx=?6,
                                 month_rx=?7, month_tx=?8, month_start=?9, day_rx=?10, day_tx=?11,
                                 day_start=?12 WHERE node_id=?1",
-            params![
-                node_id, boot_id, rx, tx, total_rx, total_tx, month_rx, month_tx, period, day_rx, day_tx,
-                today
-            ],
-        )?;
+        )?
+        .execute(params![
+            node_id, boot_id, rx, tx, total_rx, total_tx, month_rx, month_tx, period, day_rx, day_tx,
+            today
+        ])?;
         Ok(Traffic { total_rx, total_tx, month_rx, month_tx, month_start: period, day_rx, day_tx })
     }
 
@@ -542,11 +587,13 @@ impl Db {
         let f = |k: &str| m.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
         let n = |k: &str| m.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
         let load1 = m.get("load").and_then(|v| v.get(0)).and_then(|v| v.as_f64()).unwrap_or(0.0);
-        self.conn().execute(
-            "INSERT OR REPLACE INTO metric
+        self.conn()
+            .prepare_cached(
+                "INSERT OR REPLACE INTO metric
                (node_id, ts, cpu, load1, mem_used, swap_used, disk_used, net_rx, net_tx, tcp, udp, procs)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-            params![
+            )?
+            .execute(params![
                 node_id,
                 ts,
                 f("cpu"),
@@ -559,8 +606,7 @@ impl Db {
                 n("tcp"),
                 n("udp"),
                 n("procs")
-            ],
-        )?;
+            ])?;
         Ok(())
     }
 
@@ -802,6 +848,19 @@ mod tests {
 
     fn db() -> Db {
         Db::open(":memory:").unwrap()
+    }
+
+    /// PRAGMA settings are per connection, so a value read back through any
+    /// other handle proves nothing about the one the hub actually writes on.
+    #[test]
+    fn the_tuning_pragmas_reach_the_connection_the_hub_uses() {
+        let db = db();
+        let conn = db.conn();
+        let read = |p: &str| conn.query_row(&format!("PRAGMA {p}"), [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(read("cache_size"), -8192, "8 MiB of page cache");
+        assert_eq!(read("wal_autocheckpoint"), 256);
+        assert_eq!(read("journal_size_limit"), 1_048_576);
+        assert_eq!(read("busy_timeout"), 5_000);
     }
 
     fn node(db: &Db, reset_day: u32) -> i64 {

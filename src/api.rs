@@ -12,7 +12,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::auth::{authed, hash_password, issue_session, random_token, with_cookies};
-use crate::db::{Node, PingTask};
+use crate::agent_ws::Live;
+use crate::db::{Node, PingTask, Traffic};
 use crate::{agent_ws, App, Shared};
 
 /// Present only on requests carrying a valid session. Handlers that take it
@@ -43,10 +44,7 @@ fn bad(message: &str) -> Response {
 
 /// One node as the UI consumes it: stored config, live metrics and the hub's
 /// accumulated traffic in a single object.
-fn node_view(app: &App, node: &Node, full: bool) -> Value {
-    let live = app.live.read().unwrap_or_else(|e| e.into_inner());
-    let current = live.get(&node.id);
-    let traffic = app.db.traffic(node.id);
+fn node_view(node: &Node, current: Option<&Live>, traffic: &Traffic, full: bool) -> Value {
     let mut view = json!({
         "id": node.id,
         "name": node.name,
@@ -109,7 +107,17 @@ fn node_view(app: &App, node: &Node, full: bool) -> Value {
 }
 
 fn visible_nodes(app: &App, full: bool) -> Result<Vec<Value>, anyhow::Error> {
-    Ok(app.db.nodes()?.iter().filter(|n| full || n.public).map(|n| node_view(app, n, full)).collect())
+    // One traffic query and one lock for the whole list, not one of each per
+    // node: this list is what every visitor to the public page loads.
+    let nodes = app.db.nodes()?;
+    let traffic = app.db.all_traffic();
+    let live = app.live.read().unwrap_or_else(|e| e.into_inner());
+    let none = Traffic::default();
+    Ok(nodes
+        .iter()
+        .filter(|n| full || n.public)
+        .map(|n| node_view(n, live.get(&n.id), traffic.get(&n.id).unwrap_or(&none), full))
+        .collect())
 }
 
 pub async fn nodes(State(app): State<Shared>, headers: HeaderMap) -> Response {
@@ -117,10 +125,15 @@ pub async fn nodes(State(app): State<Shared>, headers: HeaderMap) -> Response {
     if !full && !app.public_page() {
         return (StatusCode::UNAUTHORIZED, "sign-in required").into_response();
     }
-    match visible_nodes(&app, full) {
-        Ok(list) => Json(json!({"nodes": list, "admin": full})).into_response(),
-        Err(e) => fail(e),
-    }
+    // The same rendered frame the browser streams get, for the same reason: a
+    // public status page that gets linked somewhere busy would otherwise
+    // rebuild every node's row once per visitor, against the connection the
+    // agents are writing through.
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        live_snapshot(&app, full).as_str().to_owned(),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -159,6 +172,11 @@ fn readable(app: &App, headers: &HeaderMap, id: i64) -> bool {
     authed(app, headers) || (app.public_page() && app.db.node(id).ok().flatten().is_some_and(|n| n.public))
 }
 
+/// Per-connection read buffer for both WebSocket surfaces. The default is
+/// 128 KiB, which at a few hundred agents is tens of megabytes of buffer for
+/// frames that are a few hundred bytes each.
+pub const SOCKET_BUFFER: usize = 4 * 1024;
+
 /// How long one rendered snapshot is reused. Just under the push interval, so
 /// every tick still rebuilds once and no viewer is served a stale frame twice.
 const SNAPSHOT_TTL_MS: i64 = 1_900;
@@ -179,7 +197,9 @@ fn live_snapshot(app: &App, full: bool) -> Utf8Bytes {
         return cache[slot].1.clone();
     }
     let nodes = visible_nodes(app, full).unwrap_or_default();
-    let payload = Utf8Bytes::from(json!({"nodes": nodes}).to_string());
+    // `admin` rides along so the panel's first fetch and its stream can share
+    // one cached frame; the stream's consumers only ever read `nodes`.
+    let payload = Utf8Bytes::from(json!({"nodes": nodes, "admin": full}).to_string());
     cache[slot] = (now, payload.clone());
     payload
 }
@@ -201,7 +221,7 @@ pub async fn live_ws(State(app): State<Shared>, headers: HeaderMap, upgrade: Web
     if !full && !app.public_page() {
         return (StatusCode::UNAUTHORIZED, "sign-in required").into_response();
     }
-    upgrade.on_upgrade(move |socket| stream_live(app, socket, full))
+    upgrade.read_buffer_size(SOCKET_BUFFER).on_upgrade(move |socket| stream_live(app, socket, full))
 }
 
 async fn stream_live(app: Shared, mut socket: WebSocket, full: bool) {
@@ -326,6 +346,9 @@ pub async fn reset_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     // teardown will leave it alone.
     app.agents.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
     app.live.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    // The token is part of the admin frame, so the panel would otherwise keep
+    // showing an install command for the credential just retired.
+    invalidate_snapshot(&app);
     match app.db.reset_token(id, &token) {
         // Just the token: the panel builds the command, and one place that
         // knows its shape is enough.

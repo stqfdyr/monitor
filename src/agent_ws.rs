@@ -62,7 +62,7 @@ pub async fn handler(
     };
     let ip = client_ip(&headers, peer.ip()).to_string();
 
-    upgrade.on_upgrade(move |socket| async move {
+    upgrade.read_buffer_size(crate::api::SOCKET_BUFFER).on_upgrade(move |socket| async move {
         if let Err(e) = serve(app, node_id, ip, socket).await {
             debug!("node {node_id} disconnected: {e:#}");
         }
@@ -165,7 +165,7 @@ fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<()> {
 
 fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()> {
     let now = Utc::now().timestamp();
-    let reset_day = app.db.node(node_id)?.map(|n| n.traffic_reset_day).unwrap_or(1);
+    let reset_day = app.db.traffic_reset_day(node_id);
 
     let boot_id = metrics.get("boot_id").and_then(|v| v.as_str()).unwrap_or("").to_owned();
     let rx = metrics.get("net_rx_total").and_then(|v| v.as_i64()).unwrap_or(0);
