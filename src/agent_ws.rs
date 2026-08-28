@@ -196,6 +196,7 @@ fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()>
 
     if store {
         app.db.insert_metric(node_id, minute * 60, &metrics)?;
+        app.db.touch_seen(node_id, now)?;
     }
     Ok(())
 }

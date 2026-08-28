@@ -53,7 +53,9 @@ fn node_view(app: &App, node: &Node, full: bool) -> Value {
         "sort": node.sort,
         "public": node.public,
         "online": current.is_some(),
-        "last_seen": current.map(|l| l.last_seen).unwrap_or(0),
+        // The live entry while it is connected, the stored one after it goes:
+        // "offline" is worth much more with a "since when" attached.
+        "last_seen": current.map(|l| l.last_seen).unwrap_or(node.last_seen),
         "metrics": current.map(|l| l.metrics.clone()).unwrap_or(Value::Null),
         "os": node.os,
         "kernel": node.kernel,
@@ -573,12 +575,16 @@ mod tests {
         let id = node(&app, "n", true);
         app.db.accumulate(id, "b", 100, 100, 1).unwrap();
         app.db.accumulate(id, "b", 900, 500, 1).unwrap();
+        app.db.touch_seen(id, 1_700_000_000).unwrap();
 
         let view = &visible_nodes(&app, true).unwrap()[0];
         assert_eq!(view["online"], false);
         assert_eq!(view["metrics"], Value::Null);
         assert_eq!(view["total_rx"], 800, "traffic is stored, not derived from the live state");
         assert_eq!(view["total_tx"], 400);
+        // The live entry is gone with the connection; "offline since when" has
+        // to come off the node row or the badge has nothing to count from.
+        assert_eq!(view["last_seen"], 1_700_000_000);
     }
 
     #[test]

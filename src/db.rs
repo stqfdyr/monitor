@@ -47,6 +47,9 @@ CREATE TABLE IF NOT EXISTS node (
   swap_total INTEGER NOT NULL DEFAULT 0, disk_total INTEGER NOT NULL DEFAULT 0,
   agent_version TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '',
   ipv4 TEXT NOT NULL DEFAULT '', ipv6 TEXT NOT NULL DEFAULT '',
+  -- Survives the disconnection it describes, unlike the in-memory live entry:
+  -- an offline node's page is exactly where "since when" is worth reading.
+  last_seen INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL
 );
 
@@ -159,6 +162,10 @@ pub struct Node {
     pub ipv4: String,
     #[serde(default)]
     pub ipv6: String,
+    /// Unix seconds of the node's last report, written once a minute alongside
+    /// the metric row. Zero for a node that has never reported.
+    #[serde(default)]
+    pub last_seen: i64,
     /// What the agent authenticates with. Readable so the panel can show an
     /// install command on demand; never leaves the admin view.
     #[serde(default)]
@@ -217,7 +224,11 @@ impl Db {
         ] {
             let _ = conn.execute(&format!("ALTER TABLE traffic ADD COLUMN {column}"), []);
         }
-        for column in ["ipv4 TEXT NOT NULL DEFAULT ''", "ipv6 TEXT NOT NULL DEFAULT ''"] {
+        for column in [
+            "ipv4 TEXT NOT NULL DEFAULT ''",
+            "ipv6 TEXT NOT NULL DEFAULT ''",
+            "last_seen INTEGER NOT NULL DEFAULT 0",
+        ] {
             let _ = conn.execute(&format!("ALTER TABLE node ADD COLUMN {column}"), []);
         }
         // The column used to hold a sha256 of the token. It holds the token
@@ -296,6 +307,13 @@ impl Db {
         let id = conn.last_insert_rowid();
         conn.execute("INSERT INTO traffic (node_id) VALUES (?1)", [id])?;
         Ok(id)
+    }
+
+    /// Records that the node reported. Called on the same beat as the metric
+    /// row, so it costs one row update a minute rather than one a report.
+    pub fn touch_seen(&self, id: i64, ts: i64) -> Result<()> {
+        self.conn().execute("UPDATE node SET last_seen=?2 WHERE id=?1", params![id, ts])?;
+        Ok(())
     }
 
     pub fn update_node(&self, id: i64, n: &Node) -> Result<()> {
@@ -750,6 +768,7 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         ip: s("ip"),
         ipv4: s("ipv4"),
         ipv6: s("ipv6"),
+        last_seen: n("last_seen"),
         token: s("token"),
     }
 }
