@@ -182,6 +182,15 @@ fn live_snapshot(app: &App, full: bool) -> Utf8Bytes {
     payload
 }
 
+/// Drops the cached frames so the next push rebuilds. A write the panel just
+/// made has to be in that push: without this the node it added blinks back out
+/// of the list, and the one it deleted reappears, until the frame ages out.
+fn invalidate_snapshot(app: &App) {
+    for slot in app.snapshot.lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
+        slot.0 = 0;
+    }
+}
+
 /// Live stream for the browser. Each connection runs its own timer, which is
 /// cheaper to reason about than a fan-out channel; the snapshot behind it is
 /// shared, so the timers cost nothing but a send.
@@ -233,7 +242,10 @@ pub async fn create_node(
         // The node is usable straight away: its install command is readable
         // from the node list, so adding and deploying stay separate steps
         // without a reissue standing between them.
-        Ok(id) => Json(json!({"id": id})).into_response(),
+        Ok(id) => {
+            invalidate_snapshot(&app);
+            Json(json!({"id": id})).into_response()
+        }
         Err(e) => fail(e),
     }
 }
@@ -250,7 +262,10 @@ pub async fn update_node(
     }
     node.name = node.name.trim().to_owned();
     match app.db.update_node(id, &node) {
-        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Ok(()) => {
+            invalidate_snapshot(&app);
+            Json(json!({"ok": true})).into_response()
+        }
         Err(e) => fail(e),
     }
 }
@@ -272,14 +287,20 @@ pub async fn reorder_nodes(_: Admin, State(app): State<Shared>, Json(order): Jso
         return bad("node order must include every node exactly once");
     }
     match app.db.reorder_nodes(&order.ids) {
-        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Ok(()) => {
+            invalidate_snapshot(&app);
+            Json(json!({"ok": true})).into_response()
+        }
         Err(e) => fail(e),
     }
 }
 
 pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
     match app.db.delete_node(id) {
-        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Ok(()) => {
+            invalidate_snapshot(&app);
+            Json(json!({"ok": true})).into_response()
+        }
         Err(e) => fail(e),
     }
 }
@@ -326,7 +347,10 @@ pub async fn patch_traffic(
     Json(p): Json<TrafficPatch>,
 ) -> Response {
     match app.db.set_traffic(id, p.total_rx, p.total_tx, p.month_rx, p.month_tx) {
-        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Ok(()) => {
+            invalidate_snapshot(&app);
+            Json(json!({"ok": true})).into_response()
+        }
         Err(e) => fail(e),
     }
 }
@@ -528,6 +552,19 @@ mod tests {
         assert!(admin.as_str().contains("198.51.100.9") && admin.as_str().contains("hidden"));
         // A second read inside the window is the same frame, not a rebuild.
         assert_eq!(live_snapshot(&app, false), public);
+    }
+
+    #[tokio::test]
+    async fn a_node_added_from_the_panel_is_in_the_very_next_frame() {
+        let app = std::sync::Arc::new(app());
+        node(&app, "existing", true);
+        assert!(!live_snapshot(&app, true).as_str().contains("added"));
+
+        let body = Json(serde_json::from_value::<Node>(json!({"name": "added"})).unwrap());
+        assert_eq!(create_node(Admin, State(app.clone()), Ok(body)).await.status(), StatusCode::OK);
+        // Frames are cached for nearly two seconds. Without dropping that cache
+        // the node the panel just added blinks straight back out of the list.
+        assert!(live_snapshot(&app, true).as_str().contains("added"));
     }
 
     #[test]
