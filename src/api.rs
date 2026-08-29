@@ -596,7 +596,8 @@ mod tests {
         app.db.save_facts(open, &json!({"hostname": "vps-1"}), "198.51.100.9").unwrap();
 
         // A live report, so the public view has metrics to strip.
-        let _held = connect(&app, open, json!({"boot_id": "abc", "net_rx_total": 134_000_000_000i64, "cpu": 1.0}));
+        let _held =
+            connect(&app, open, json!({"boot_id": "abc", "net_rx_total": 134_000_000_000i64, "cpu": 1.0}));
 
         let public = visible_nodes(&app, false).unwrap();
         assert_eq!(public.len(), 1, "a node marked private must not be listed");

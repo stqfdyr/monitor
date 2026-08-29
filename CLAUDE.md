@@ -29,6 +29,7 @@ agent 在 [独立仓库](https://github.com/stqfdyr/agent)。后台在 `web-admi
 
 ```bash
 cargo test
+cargo fmt --all              # CI 卡这个，改完必跑
 cargo clippy --all-targets
 cd web-admin && npm run build
 cd web-theme && npm run build      # 先按 web-theme.version 里的 tag clone monitor-theme-default 到这里

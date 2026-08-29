@@ -147,10 +147,18 @@ fn schema_mentions(conn: &Connection, table: &str, needle: &str) -> Result<bool>
 /// Everything that had accumulated before there was a version to record it
 /// under. Runs once, on a database that predates the stamp.
 fn migrate_to_1(conn: &Connection) -> Result<()> {
-    for column in ["day_rx INTEGER NOT NULL DEFAULT 0", "day_tx INTEGER NOT NULL DEFAULT 0", "day_start TEXT NOT NULL DEFAULT ''"] {
+    for column in [
+        "day_rx INTEGER NOT NULL DEFAULT 0",
+        "day_tx INTEGER NOT NULL DEFAULT 0",
+        "day_start TEXT NOT NULL DEFAULT ''",
+    ] {
         add_column(conn, "traffic", column)?;
     }
-    for column in ["ipv4 TEXT NOT NULL DEFAULT ''", "ipv6 TEXT NOT NULL DEFAULT ''", "last_seen INTEGER NOT NULL DEFAULT 0"] {
+    for column in [
+        "ipv4 TEXT NOT NULL DEFAULT ''",
+        "ipv6 TEXT NOT NULL DEFAULT ''",
+        "last_seen INTEGER NOT NULL DEFAULT 0",
+    ] {
         add_column(conn, "node", column)?;
     }
     // The column used to hold a sha256 of the token. It holds the token itself
@@ -316,11 +324,9 @@ impl Db {
         // Asked before CREATE TABLE runs: a file with no tables is a database
         // that has never existed, and it gets today's schema outright rather
         // than the history of how the schema arrived at it.
-        let fresh = conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )? == 0;
+        let fresh = conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table'", [], |r| r.get::<_, i64>(0))?
+            == 0;
         conn.execute_batch(SCHEMA)?;
         restrict(path);
 
