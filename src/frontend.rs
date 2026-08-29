@@ -55,10 +55,23 @@ fn is_api_path(path: &str) -> bool {
     path == "api" || path.starts_with("api/")
 }
 
+/// Everything a build writes under `assets/` carries a content hash, so a miss
+/// there is a client asking for a file that no longer exists -- never a route.
+/// Falling back to index.html answers a script tag with HTML, which the browser
+/// refuses on MIME type: the deploy that changed the hash looks like a broken
+/// page rather than a stale tab. Hashed names are also why `asset` may mark
+/// these immutable for a year, so both answers read the prefix from here.
+fn is_asset(path: &str) -> bool {
+    path.starts_with("assets/")
+}
+
 fn embedded<T: RustEmbed>(requested: &str, remedy: &str) -> Response {
     let path = if requested.is_empty() { "index.html" } else { requested };
     if let Some(file) = T::get(path) {
         return asset(path, file.data.into_owned());
+    }
+    if is_asset(path) {
+        return (StatusCode::NOT_FOUND, format!("no such asset: /{path}")).into_response();
     }
     match T::get("index.html") {
         Some(index) => asset("index.html", index.data.into_owned()),
@@ -68,14 +81,20 @@ fn embedded<T: RustEmbed>(requested: &str, remedy: &str) -> Response {
 
 fn disk(root: &Path, requested: &str) -> Option<Response> {
     let path = if requested.is_empty() { "index.html" } else { requested };
-    read_inside(root, path)
-        .map(|data| asset(path, data))
-        .or_else(|| read_inside(root, "index.html").map(|data| asset("index.html", data)))
+    if let Some(data) = read_inside(root, path) {
+        return Some(asset(path, data));
+    }
+    // None, not a 404: an external theme that does not carry the file leaves
+    // the answer to the built-in one, which refuses it there.
+    if is_asset(path) {
+        return None;
+    }
+    read_inside(root, "index.html").map(|data| asset("index.html", data))
 }
 
 fn asset(path: &str, data: Vec<u8>) -> Response {
     let mime = mime_guess::from_path(path).first_or_octet_stream();
-    let cache = if path.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
+    let cache = if is_asset(path) { "public, max-age=31536000, immutable" } else { "no-cache" };
     ([(header::CONTENT_TYPE, mime.as_ref()), (header::CACHE_CONTROL, cache)], data).into_response()
 }
 

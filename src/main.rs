@@ -384,6 +384,25 @@ mod tests {
         assert_eq!(spa("/apiary").await.status(), StatusCode::OK);
     }
 
+    /// A build writes hashed filenames under `assets/`, so a miss there is a
+    /// tab left open across a deploy -- and answering it with index.html hands
+    /// a script tag HTML, which fails on MIME type well after the request that
+    /// caused it. Both bundles are served through the same fallback, so both
+    /// have to refuse.
+    #[tokio::test]
+    async fn a_missing_hashed_asset_is_a_404_not_the_single_page_app() {
+        let app = Arc::new(app("http://localhost:8080"));
+        let spa = |p: &str| frontend::serve(State(app.clone()), p.parse::<Uri>().unwrap());
+
+        assert_eq!(spa("/assets/index-STALE.js").await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(spa("/admin/assets/index-STALE.js").await.status(), StatusCode::NOT_FOUND);
+
+        // A route that merely begins with those letters is still a route.
+        assert_eq!(spa("/assetsomething").await.status(), StatusCode::OK);
+        // And a deep client route still reloads into the app.
+        assert_eq!(spa("/node/7").await.status(), StatusCode::OK);
+    }
+
     /// Both things `--site` decides: whether the session cookie may be marked
     /// Secure, and whether the hub warns that it is answering in the clear.
     /// Plain HTTP on loopback is where the two answers part ways.
