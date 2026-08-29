@@ -639,13 +639,23 @@ impl Db {
         Ok(())
     }
 
-    pub fn metrics(&self, node_id: i64, since: i64) -> Result<Vec<serde_json::Value>> {
+    /// History for one node, thinned to one sample every `step` seconds.
+    ///
+    /// Without the thinning a month-wide window is tens of thousands of rows
+    /// built into as many `serde_json` maps before any of it is written -- on a
+    /// path anyone on the internet can ask for, against the connection the
+    /// agents report through.
+    ///
+    /// Bucketed rather than filtered on a multiple of `step`: rows normally
+    /// land on the minute, but nothing enforces it, and a filter would answer a
+    /// stamp that sits between the grid lines with silence.
+    pub fn metrics(&self, node_id: i64, since: i64, step: i64) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT ts, cpu, load1, mem_used, swap_used, disk_used, net_rx, net_tx
-             FROM metric WHERE node_id=?1 AND ts>=?2 ORDER BY ts",
+            "SELECT MAX(ts), cpu, load1, mem_used, swap_used, disk_used, net_rx, net_tx
+             FROM metric WHERE node_id=?1 AND ts>=?2 GROUP BY ts/?3 ORDER BY ts",
         )?;
-        let rows = stmt.query_map(params![node_id, since], |r| {
+        let rows = stmt.query_map(params![node_id, since, step], |r| {
             Ok(serde_json::json!({
                 "ts": r.get::<_, i64>(0)?, "cpu": r.get::<_, f64>(1)?, "load1": r.get::<_, f64>(2)?,
                 "mem_used": r.get::<_, i64>(3)?, "swap_used": r.get::<_, i64>(4)?,
@@ -764,12 +774,21 @@ impl Db {
         Ok(())
     }
 
-    pub fn ping_records(&self, node_id: i64, since: i64) -> Result<Vec<serde_json::Value>> {
+    /// Probe results for one node, one sample per probe per `step` seconds.
+    ///
+    /// These stamps are whenever the probe finished rather than on a minute, so
+    /// the thinning buckets them instead of matching a multiple: `MAX(ts)` with
+    /// bare columns beside it is SQLite's documented "row that held the
+    /// maximum", which makes the sample the newest result in its bucket. Same
+    /// reason as `metrics` above -- and this is the larger half of that
+    /// response, because a probe reports far more often than once a minute.
+    pub fn ping_records(&self, node_id: i64, since: i64, step: i64) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT task_id, ts, latency FROM ping_record WHERE node_id=?1 AND ts>=?2 ORDER BY ts",
+            "SELECT task_id, MAX(ts), latency FROM ping_record
+             WHERE node_id=?1 AND ts>=?2 GROUP BY task_id, ts/?3 ORDER BY ts",
         )?;
-        let rows = stmt.query_map(params![node_id, since], |r| {
+        let rows = stmt.query_map(params![node_id, since, step], |r| {
             Ok(serde_json::json!({
                 "task_id": r.get::<_, i64>(0)?, "ts": r.get::<_, i64>(1)?,
                 "latency": r.get::<_, i64>(2)?
@@ -1037,7 +1056,7 @@ mod tests {
         db.insert_metric(id, 1, &serde_json::json!({"cpu": 1.0})).unwrap();
         db.delete_node(id).unwrap();
         assert!(db.node(id).unwrap().is_none());
-        assert_eq!(db.metrics(id, 0).unwrap().len(), 0);
+        assert_eq!(db.metrics(id, 0, 60).unwrap().len(), 0);
         assert_eq!(db.traffic(id).total_rx, 0);
     }
 
@@ -1088,7 +1107,7 @@ mod tests {
         db.insert_metric(id, Utc::now().timestamp(), &serde_json::json!({"cpu": 2.0})).unwrap();
 
         db.prune(30).unwrap();
-        assert_eq!(db.metrics(id, 0).unwrap().len(), 1);
+        assert_eq!(db.metrics(id, 0, 60).unwrap().len(), 1);
         assert_eq!(db.traffic(id).total_rx, 800);
     }
 

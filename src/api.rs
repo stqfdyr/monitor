@@ -152,15 +152,32 @@ pub async fn metrics(
     if !readable(&app, &headers, id) {
         return (StatusCode::UNAUTHORIZED, "sign-in required").into_response();
     }
-    let since = Utc::now().timestamp() - w.hours.clamp(1, 24 * 90) * 3_600;
+    let hours = w.hours.clamp(1, 24 * 90);
+    let since = Utc::now().timestamp() - hours * 3_600;
     // Probe names ride along with the samples they label, so the chart reads
     // the same for a visitor as for the admin and the page needs no second
     // request. Only the names: targets and assignments stay behind `Admin`.
     let probes = app.db.ping_task_names().unwrap_or_else(|_| json!({}));
-    match (app.db.metrics(id, since), app.db.ping_records(id, since)) {
+    match (app.db.metrics(id, since, sample_step(hours)), app.db.ping_records(id, since, sample_step(hours)))
+    {
         (Ok(m), Ok(p)) => Json(json!({"metrics": m, "ping": p, "probes": probes})).into_response(),
         (Err(e), _) | (_, Err(e)) => fail(e),
     }
+}
+
+/// Seconds between the samples a window is drawn from, so that a chart costs
+/// the same whatever it spans: about `SAMPLES` points either way.
+///
+/// The unthinned month is 43 200 metric rows and several times that in probe
+/// results, which is megabytes of JSON built in memory for a request that needs
+/// no credentials at all — and a screen has around a thousand pixels to draw it
+/// across. Whole minutes, because that is the grid the metric rows sit on.
+// ponytail: the budget is per series, so a response is SAMPLES × (1 + probes) --
+// bounded by how many probes the admin created, not by the caller. Four probes
+// is ~250 KB; if that list ever grows long, scale SAMPLES by the probe count.
+fn sample_step(hours: i64) -> i64 {
+    const SAMPLES: i64 = 720;
+    60 * (hours * 60 / SAMPLES).max(1)
 }
 
 /// Guards a per-node read: the panel sees everything, the public page only
@@ -173,6 +190,15 @@ fn readable(app: &App, headers: &HeaderMap, id: i64) -> bool {
 /// 128 KiB, which at a few hundred agents is tens of megabytes of buffer for
 /// frames that are a few hundred bytes each.
 pub const SOCKET_BUFFER: usize = 4 * 1024;
+
+/// Largest frame either socket will accept, matching the 64 KiB cap the HTTP
+/// body already carries — a report is a few hundred bytes, and nothing on
+/// either socket is legitimately larger.
+///
+/// The body limit is a tower layer, so it never applied here: without this the
+/// default ceiling is 64 MiB. A node's own token buys the whole of it, and what
+/// arrives on it is stored and then handed to every viewer of the public page.
+pub const MAX_FRAME: usize = 64 * 1024;
 
 /// How long one rendered snapshot is reused. Just under the push interval, so
 /// every tick still rebuilds once and no viewer is served a stale frame twice.
@@ -222,7 +248,10 @@ pub async fn live_ws(State(app): State<Shared>, headers: HeaderMap, upgrade: Web
     if !full && !app.public_page() {
         return (StatusCode::UNAUTHORIZED, "sign-in required").into_response();
     }
-    upgrade.read_buffer_size(SOCKET_BUFFER).on_upgrade(move |socket| stream_live(app, socket, full))
+    upgrade
+        .read_buffer_size(SOCKET_BUFFER)
+        .max_message_size(MAX_FRAME)
+        .on_upgrade(move |socket| stream_live(app, socket, full))
 }
 
 async fn stream_live(app: Shared, mut socket: WebSocket, full: bool) {
@@ -497,6 +526,53 @@ mod tests {
                 &format!("token-of-{name}"),
             )
             .unwrap()
+    }
+
+    /// A chart request costs about the same whatever it spans. Nothing on this
+    /// path asks for a session, so an unbounded month-wide window is a few
+    /// megabytes of JSON that anyone at all can ask the hub to build, over and
+    /// over, on the connection the agents are reporting through.
+    #[test]
+    fn a_history_window_costs_the_same_however_wide_it_is() {
+        let app = app();
+        let id = node(&app, "n", true);
+        let now = Utc::now().timestamp();
+        // A month of history at the rate the hub actually writes it: a metric
+        // row a minute, and a probe result rather more often than that. Two
+        // probes, because each one is a line of its own on the chart and so
+        // gets its own samples -- the budget is per series, not per response,
+        // and a single-probe fixture would hide that.
+        const PROBES: i64 = 2;
+        for i in 0..30 * 1440 {
+            app.db.insert_metric(id, now - i * 60, &json!({"cpu": 1.0})).unwrap();
+            for task in 1..=PROBES {
+                app.db.insert_ping(id, task, now - i * 20, 42).unwrap();
+            }
+        }
+
+        for hours in [1, 6, 24, 168, 2_160] {
+            let step = sample_step(hours);
+            let since = now - hours * 3_600;
+            let metrics = app.db.metrics(id, since, step).unwrap();
+            let ping = app.db.ping_records(id, since, step).unwrap();
+            // One bucket of slack: the window rarely divides evenly.
+            let cap = (hours * 3_600 / step) + 1;
+            assert!(metrics.len() <= cap as usize, "{hours}h returned {} metric rows", metrics.len());
+            assert!(
+                ping.len() <= (cap * PROBES) as usize,
+                "{hours}h returned {} ping rows for {PROBES} probes",
+                ping.len()
+            );
+            // Thin, but not empty, and not reaching outside the window.
+            assert!(!metrics.is_empty() && !ping.is_empty(), "{hours}h returned nothing");
+            assert!(
+                metrics.iter().all(|m| m["ts"].as_i64().unwrap() >= since),
+                "{hours}h reached back too far"
+            );
+        }
+        // The whole point: the widest window is no dearer than a narrow one.
+        // Against a month of history, unthinned, this was 43 200 rows.
+        assert!(app.db.metrics(id, now - 2_160 * 3_600, sample_step(2_160)).unwrap().len() <= 721);
     }
 
     #[test]

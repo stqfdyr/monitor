@@ -107,10 +107,15 @@ async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Re
     // The default client timeout is tuned for API calls, not a 1.6 MB download.
     let fetched = app.http.get(&url).timeout(std::time::Duration::from_secs(120)).send().await;
     match fetched {
-        Ok(res) if res.status().is_success() => match res.bytes().await {
-            Ok(body) => ([(header::CONTENT_TYPE, "application/octet-stream")], body).into_response(),
-            Err(e) => (StatusCode::BAD_GATEWAY, format!("release download failed: {e}")).into_response(),
-        },
+        // Streamed rather than collected: this route needs no credentials, and
+        // holding each release whole meant a few hundred parallel requests --
+        // from anyone at all -- could reach the memory ceiling the unit sets.
+        // Passing the bytes through as they arrive costs a buffer per request.
+        Ok(res) if res.status().is_success() => (
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            axum::body::Body::from_stream(res.bytes_stream()),
+        )
+            .into_response(),
         Ok(res) => {
             (StatusCode::BAD_GATEWAY, format!("release download failed: {}", res.status())).into_response()
         }

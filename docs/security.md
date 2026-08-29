@@ -178,7 +178,10 @@ journalctl -u monitor-hub -f | grep sign-in
 - 请求体上限 64 KiB（`RequestBodyLimitLayer`）。一次上报几百字节，超过就不是正常上报
 - 所有 SQL 走 rusqlite 的参数绑定，没有字符串拼接
 - 探测目标必须是 `host:port` 格式，间隔 clamp 到 5–3600 秒
-- 历史查询窗口 clamp 到 1–2160 小时
+- 历史查询窗口 clamp 到 1–2160 小时，且**按窗口宽度降采样**（`api::sample_step`），每条曲线约 720 点。
+  这条路匿名可达：不降采样的话一个月窗口是四万多行 metric 加几倍于此的探测结果，几 MB 的 JSON 先在
+  内存里建出来再发走，几十个并发请求就能顶到 unit 的 `MemoryMax`。窄窗口本来就在预算内，不受影响
+- `/agent/{arch}` 边收边转，不把整个 release 收进内存再发（同样是匿名可达的路径）
 - agent 发来的垃圾消息只记日志，不断连接
 - 外部主题是本地静态文件。hub 对主题根和请求文件都执行 `canonicalize()`，并确认真实路径仍在主题目录内；`..` 和指向目录外的符号链接都会被拒绝
 - 主题列表和切换都必须经过 `Admin`；主题不能覆盖 `/admin/*`，所以登录与恢复入口始终使用内置前端
@@ -186,7 +189,13 @@ journalctl -u monitor-hub -f | grep sign-in
 ## 改动时的自查清单
 
 - [ ] 新增的面板接口签名里有 `_: Admin` 吗
+- **WebSocket 帧上限同样是 64 KiB**（`api::MAX_FRAME`，两个 socket 都加）。上面那个是 tower layer，
+  握手之后就不管事了，默认上限是 64 MiB：一个节点自己的 token 就能买下整个额度，而它发上来的东西
+  会落库、并原样推给公开页的每一个访客。这两个数字要一起改
 - [ ] 新增的节点字段是敏感信息吗？是就只放 `full` 分支
 - [ ] 新增的设置项是密钥吗？是就别加进 `READABLE_SETTINGS`
 - [ ] 有没有把用户可控的输入当成信任来源（尤其是 `X-Forwarded-For`）
 - [ ] 白名单/黑名单的空集合语义对吗（空 = 拒绝，不是放行）
+- [ ] 新增的匿名可达路径，单个请求最多让 hub 分配多少内存？由请求参数决定的就要有上界。
+      公开页的每一条路都是这样：`/api/nodes` 靠共享快照，`/api/nodes/{id}/metrics` 靠降采样，
+      `/agent/{arch}` 靠流式转发

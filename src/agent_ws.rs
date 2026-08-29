@@ -62,11 +62,13 @@ pub async fn handler(
     };
     let ip = client_ip(&headers, peer.ip()).to_string();
 
-    upgrade.read_buffer_size(crate::api::SOCKET_BUFFER).on_upgrade(move |socket| async move {
-        if let Err(e) = serve(app, node_id, ip, socket).await {
-            debug!("node {node_id} disconnected: {e:#}");
-        }
-    })
+    upgrade.read_buffer_size(crate::api::SOCKET_BUFFER).max_message_size(crate::api::MAX_FRAME).on_upgrade(
+        move |socket| async move {
+            if let Err(e) = serve(app, node_id, ip, socket).await {
+                debug!("node {node_id} disconnected: {e:#}");
+            }
+        },
+    )
 }
 
 /// Extracts the node token from `Authorization: Bearer <token>`.
@@ -270,7 +272,7 @@ mod tests {
         // History rows are keyed by (node, ts), so counting them proves nothing
         // on its own: five reports a second apart collapse onto one row whether
         // the minute gate is there or not. The stamp is what shows the gate.
-        let rows = app.db.metrics(id, 0).unwrap();
+        let rows = app.db.metrics(id, 0, 60).unwrap();
         assert_eq!(rows.len(), 1, "a minute of reports is one row");
         assert_eq!(rows[0]["ts"], minute, "stamped on the minute, not on the report");
         // Written on the same branch, and the offline badge counts from it.
@@ -314,7 +316,7 @@ mod tests {
         // the query orders by timestamp.
         let mut seen: Vec<(i64, i64)> = app
             .db
-            .ping_records(id, 0)
+            .ping_records(id, 0, 60)
             .unwrap()
             .iter()
             .map(|r| (r["task_id"].as_i64().unwrap(), r["latency"].as_i64().unwrap()))

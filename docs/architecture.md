@@ -125,6 +125,9 @@ root-only 的 `/etc/monitor/agent.env` 里。
 **面板**（全部要 `Admin` 提取器）：
 `POST /api/nodes`、`PUT /api/nodes/order`、`PUT|DELETE /api/nodes/{id}`、`POST /api/nodes/{id}/token`、`PUT /api/nodes/{id}/traffic`、`GET|POST /api/ping-tasks`、`DELETE /api/ping-tasks/{id}`、`GET|PUT /api/settings`、`GET /api/themes`
 
+`hours` clamp 到 1–2160，返回的点按窗口宽度降采样到每条曲线约 720 个（`api::sample_step`）——
+屏幕上画不下更多，而这条路匿名可达，代价必须和窗口宽度脱钩。见 [security.md](security.md)。
+
 其余路径按下面顺序处理：
 
 ```text
