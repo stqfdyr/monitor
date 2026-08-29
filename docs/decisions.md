@@ -314,7 +314,7 @@ runner 本来就装了 `gh`，`gh release create ... --generate-notes` 一行做
 
 真正的换主题能力来自 hub 运行时读取 `<themes>/<short>/dist`，不是拆仓库本身。选中主题缺失、损坏或被删除时自动回落内置默认主题，保证零配置启动和恢复入口可用。
 
-默认主题放在独立的 `monitor-theme-default` 仓库。hub release CI clone 并构建它，再作为内置 fallback 嵌入。这引入了一个明确接受的跨仓库构建依赖，换来独立的主题版本、契约和开发流程。
+默认主题放在独立的 `monitor-theme-default` 仓库，发布 `theme.tar.gz`，hub 按 `web-theme.pin` 下载校验后作为内置 fallback 嵌入（机制见「hub 消费主题的**构建产物**」）。这引入了一个明确接受的跨仓库构建依赖，换来独立的主题版本、契约和开发流程。
 
 **否决**：让主题接管后台——每个主题作者都会被迫实现节点 CRUD、OAuth、密码修改；zip 上传——需要额外依赖并扩大 zip-slip 攻击面，复制目录 + 面板选择已经够用。
 

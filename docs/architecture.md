@@ -17,7 +17,7 @@
 | **[agent](https://github.com/stqfdyr/agent)** | Linux agent。发布自己的 musl 二进制，`install.sh` 从那边的 release 拉 |
 | **[monitor-theme-default](https://github.com/stqfdyr/monitor-theme-default)** | 默认公开页主题。**发布构建产物**（`theme.tar.gz` = `dist/` + `theme.json`），hub 按 `web-theme.pin` 下载校验后嵌入 |
 
-agent 拆开是因为部署机器和发布节奏不同。默认主题拆开是为了让主题拥有独立契约、版本和开发流程；代价是 hub 的 release 构建多一个 clone 步骤。
+agent 拆开是因为部署机器和发布节奏不同。默认主题拆开是为了让主题拥有独立契约、版本和开发流程；代价是多一个跨仓库依赖——主题得先发布，`web-theme.pin` 才钉得上去。
 
 **hub 消费的是主题的构建产物，不编译主题源码。** 发布的 `theme.tar.gz` 里就是一个可安装的主题目录——
 hub 嵌进去的那个文件，和用户解到 `<themes>/<short>/` 的那个是同一个，所以默认主题和第三方主题走
