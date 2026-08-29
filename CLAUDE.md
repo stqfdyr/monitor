@@ -11,7 +11,7 @@ agent 在 [独立仓库](https://github.com/stqfdyr/agent)。后台在 `web-admi
 ## 三条铁律
 
 1. **总流量永不回退。** VPS 重启、hub 重启、agent 掉线，累计值都要继续加。见 [docs/traffic.md](docs/traffic.md)
-2. **内存和硬盘必须和 `free` / `df` 对得上。** 见 [agent 仓库的 data-accuracy.md](https://github.com/stqfdyr/agent/blob/main/docs/data-accuracy.md)
+2. **内存和硬盘必须和 `free` / `df` 对得上。** 数据由 agent 决定，那边叫「口径铁律」。见 [agent 仓库的 data-accuracy.md](https://github.com/stqfdyr/agent/blob/main/docs/data-accuracy.md)
 3. **公开状态页永远不输出 IP、主机名、备注。** 见 [docs/security.md](docs/security.md)
 
 ## 明确不做的

@@ -68,7 +68,7 @@ cargo fmt --all
 想确认一批测试到底护住了什么，就把逻辑挨个改坏，看有没有测试变红：
 
 ```bash
-# 例：让同 boot 的读数缩水时不再钳零，铁律一应该立刻报警
+# 例：让同 boot 的读数缩水时不再钳零，「总流量永不回退」应该立刻报警
 sed -i 's/(rx - last_rx).max(0), (tx - last_tx).max(0)/rx - last_rx, tx - last_tx/' src/db.rs
 cargo test        # 期望 db::tests::a_shrinking_reading... 变红
 git checkout -- src/db.rs

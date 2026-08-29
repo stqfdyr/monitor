@@ -25,10 +25,10 @@
 
 ## 三条铁律
 
-改代码之前先确认没有违反这三条，它们是这个项目存在的理由：
+改代码之前先确认没有违反这三条，它们是这个项目存在的理由。agent 仓库另有两条自己的、**编号对不上**的铁律，跨仓库引用时用名字别用编号：
 
 1. **总流量永不回退。** VPS 重启、hub 重启、agent 掉线重连，累计值都必须继续往上加。见 [traffic.md](traffic.md)
-2. **内存和硬盘的数字必须和 `free` / `df` 对得上。** 现成的写法在这两个数上口径都不对，错得又看不出来。见 [data-accuracy.md](https://github.com/stqfdyr/agent/blob/main/docs/data-accuracy.md)
+2. **内存和硬盘的数字必须和 `free` / `df` 对得上。** 现成的写法在这两个数上口径都不对，错得又看不出来。这一条唯一能被违反的地方在 agent，那边叫「口径铁律」——hub 只是转发。见 [data-accuracy.md](https://github.com/stqfdyr/agent/blob/main/docs/data-accuracy.md)
 3. **公开状态页永远不输出 IP、主机名和备注。** 见 [security.md](security.md)
 
 ## 明确不做的
