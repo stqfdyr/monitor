@@ -142,6 +142,11 @@ pub struct Window {
     /// How many points the caller can actually draw. Optional: an old theme,
     /// or curl, gets the full budget.
     points: Option<i64>,
+    /// Which half of the answer the caller will draw, `metrics` or `ping`.
+    /// Each tab draws one of them, and the one it does not draw was between a
+    /// third and two thirds of every response. Absent means both, which is
+    /// what curl and an older theme get.
+    series: Option<String>,
 }
 
 fn default_hours() -> i64 {
@@ -164,54 +169,37 @@ pub async fn metrics(
     // request. Only the names: targets and assignments stay behind `Admin`.
     let probes = app.db.ping_task_names().unwrap_or_else(|_| json!({}));
     let step = sample_step(hours, w.points);
-    match (app.db.metrics(id, since, step), app.db.ping_records(id, since, probe_step(hours, step))) {
+    let wants = |name: &str| w.series.as_deref().is_none_or(|s| s == name);
+    let metrics = if wants("metrics") { app.db.metrics(id, since, step) } else { Ok(vec![]) };
+    let ping = if wants("ping") { app.db.ping_records(id, since, step) } else { Ok(vec![]) };
+    match (metrics, ping) {
         (Ok(m), Ok(p)) => Json(json!({"metrics": m, "ping": p, "probes": probes})).into_response(),
         (Err(e), _) | (_, Err(e)) => fail(e),
     }
 }
 
-/// Seconds between the samples a window is drawn from, so that a chart costs
-/// the same whatever it spans: about `SAMPLES` points either way.
+/// Seconds between the samples a window is drawn from.
 ///
-/// The unthinned month is 43 200 metric rows and several times that in probe
-/// results, which is megabytes of JSON built in memory for a request that needs
-/// no credentials at all — and a screen has around a thousand pixels to draw it
-/// across. Whole minutes, because that is the grid the metric rows sit on.
+/// **Thinning is what the screen cannot draw, never a house style.** A day at
+/// the rate the hub writes is 1 440 metric rows and as many probe results per
+/// probe; a screen has a thousand-odd pixels of chart. Where the samples fit,
+/// every one of them is sent — a chart of a hundred points looks like a hundred
+/// samples were taken, whatever the sampler underneath it was really doing, and
+/// on a probe that is a claim about the network. Whole minutes, because that is
+/// the grid the metric rows sit on.
 ///
 /// `points` is what the caller says it can draw, the way Grafana's panels send
-/// their own width: a phone was being sent 720 samples a probe to lay across
-/// 280 pixels, which is two and a half samples a pixel of aliasing and a
-/// quarter of a megabyte over mobile data to draw it. It only ever lowers the
-/// budget — the ceiling is the hub's, not the caller's, because this path
-/// takes no credentials.
+/// their own width. It only ever lowers the budget: `SAMPLES` is the hub's
+/// ceiling, not the caller's, because this path takes no credentials, and the
+/// unthinned quarter-year behind it is 129 600 rows a series. The ceiling is
+/// set at a day of minutes, so the widest window a probe is charted over comes
+/// back whole.
 // ponytail: the budget is per series, so a response is SAMPLES × (1 + probes) --
 // bounded by how many probes the admin created, not by the caller. Four probes
-// is ~250 KB; if that list ever grows long, scale SAMPLES by the probe count.
-/// Five minutes to a probe bucket, the length of Smokeping's own ping cycle
-/// and of the buckets its graphs have been drawn from for thirty years.
-///
-/// Not a pixel count, which is what separates it from the budget above: a
-/// probe line is drawn as the bucket's median with the range its answers
-/// spanned behind it, and neither describes anything in a bucket holding two
-/// samples -- no middle, and a band two readings wide. How many answers that
-/// takes is a property of the statistic, so a phone and a wide screen get the
-/// same probe chart, and six hours and a day get the same bucket rather than
-/// the narrower window coming back as the messier one.
-///
-/// Except when the window is too short to spend them: an hour at five-minute
-/// buckets is twelve points, which is not a shape. Below that floor it keeps
-/// the metric step, which at an hour is every ping there is and wants no band.
-fn probe_step(hours: i64, step: i64) -> i64 {
-    let bucket = step.max(300);
-    if hours * 3_600 / bucket >= 60 {
-        bucket
-    } else {
-        step
-    }
-}
-
+// at a day is ~90 kB gzipped; if that list ever grows long, scale SAMPLES by
+// the probe count.
 fn sample_step(hours: i64, points: Option<i64>) -> i64 {
-    const SAMPLES: i64 = 720;
+    const SAMPLES: i64 = 1_440;
     let budget = points.unwrap_or(SAMPLES).clamp(60, SAMPLES);
     // Rounded up, or the budget is not one. Dividing down, a window that does
     // not divide evenly keeps the finer step and overruns: `hours=23` answered
@@ -219,10 +207,6 @@ fn sample_step(hours: i64, points: Option<i64>) -> i64 {
     // that ceiling is the whole reason the thinning is here -- it is the size
     // of a response anyone at all can ask the hub to build.
     //
-    // It was also why six hours of probes came back denser than a day of them,
-    // at 360 points against 288: 360/250 divides down to 1, so the probe budget
-    // did nothing at all in that window and the narrower chart drew as the
-    // messier one.
     // `i64::div_ceil` is still unstable, and both sides are positive here.
     60 * ((hours * 60 + budget - 1) / budget).max(1)
 }
@@ -619,7 +603,7 @@ mod tests {
             // out to -- derived from the step this says only that division
             // works, and stays green while the step lets the budget be blown.
             // One bucket of slack: the window rarely divides evenly.
-            let cap = 721;
+            let cap = 1_441;
             assert!(metrics.len() <= cap, "{hours}h returned {} metric rows", metrics.len());
             assert!(
                 ping.len() <= cap * PROBES as usize,
@@ -637,7 +621,14 @@ mod tests {
         }
         // The whole point: the widest window is no dearer than a narrow one.
         // Against a month of history, unthinned, this was 43 200 rows.
-        assert!(app.db.metrics(id, now - 2_160 * 3_600, sample_step(2_160, None)).unwrap().len() <= 721);
+        assert!(app.db.metrics(id, now - 2_160 * 3_600, sample_step(2_160, None)).unwrap().len() <= 1_441);
+
+        // A day comes back as every minute it holds. A chart of a hundred
+        // points reads as a hundred samples taken, however densely the sampler
+        // under it really ran -- and on a probe that is a claim about the
+        // network. Thinning is for what the screen cannot draw, nothing else.
+        assert_eq!(sample_step(24, Some(2_000)), 60, "a day of minutes fits under the ceiling");
+        assert_eq!(sample_step(6, Some(2_000)), 60, "and so does six hours");
 
         // A caller may ask for less than it can draw, and no caller may ask for
         // more: the ceiling on this path is the hub's, since it takes no
@@ -646,22 +637,12 @@ mod tests {
         assert_eq!(sample_step(24, Some(100_000)), sample_step(24, None));
         assert_eq!(sample_step(24, Some(0)), sample_step(24, Some(60)));
 
-        // The probe budget is a statistic, not a pixel count: a day's bucket
-        // has to hold several answers for a median and a spread to describe
-        // anything, and a wide screen does not change that. An hour still
-        // comes back one sample a bucket, which is every ping there is.
-        let probes = |hours, points| probe_step(hours, sample_step(hours, points));
-        assert_eq!(probes(24, Some(1_280)), 300, "a day of probes buckets by five minutes");
-        assert_eq!(
-            probes(6, Some(1_280)),
-            300,
-            "and so does six hours, or the narrower chart is the busier one"
-        );
-        assert_eq!(probes(24, Some(390)), probes(24, Some(1_280)), "a phone gets the same probe chart");
-        assert_eq!(probes(1, Some(1_280)), 60, "an hour is every ping there is, and wants no band");
-        for h in [1, 6, 13, 23, 24, 168, 2_160] {
-            assert!(probes(h, None) >= sample_step(h, None), "{h}h: probes are never finer than metrics");
-        }
+        // Asking for one half leaves the other empty rather than shipping it:
+        // on the day window the half a tab does not draw was two thirds of the
+        // response, and nothing on the page ever looked at it.
+        let series = |q: &str| serde_urlencoded::from_str::<Window>(q).unwrap().series;
+        assert_eq!(series("hours=24&series=ping").as_deref(), Some("ping"));
+        assert!(series("hours=24").is_none(), "no series means both, which is what curl gets");
     }
 
     /// What a thinned bucket is allowed to answer with. Keeping one row of it

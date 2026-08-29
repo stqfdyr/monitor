@@ -770,6 +770,11 @@ impl Db {
     /// the 27.52 GB the minutes actually hold. Averaged it is 28.02 GB, so the
     /// chart's integral matches the accumulator again.
     ///
+    /// `swap_used` is stored but not answered with: no chart has ever drawn
+    /// it, and an integer a row on every request is a cost with no reader.
+    /// The column stays -- it is a record of what the machine was doing, and
+    /// dropping it is a migration -- but the wire does not carry it.
+    ///
     /// The stamp is the bucket's own start rather than a row inside it, so
     /// every series lands on the same grid -- which is what lets the probe
     /// lines below share rows instead of each carrying its own timestamps.
@@ -777,16 +782,15 @@ impl Db {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT (MIN(ts)/?3)*?3, AVG(cpu), AVG(load1), CAST(AVG(mem_used) AS INTEGER),
-                    CAST(AVG(swap_used) AS INTEGER), CAST(AVG(disk_used) AS INTEGER),
+                    CAST(AVG(disk_used) AS INTEGER),
                     CAST(AVG(net_rx) AS INTEGER), CAST(AVG(net_tx) AS INTEGER)
              FROM metric WHERE node_id=?1 AND ts>=?2 GROUP BY ts/?3 ORDER BY ts",
         )?;
         let rows = stmt.query_map(params![node_id, since, step], |r| {
             Ok(serde_json::json!({
                 "ts": r.get::<_, i64>(0)?, "cpu": r.get::<_, f64>(1)?, "load1": r.get::<_, f64>(2)?,
-                "mem_used": r.get::<_, i64>(3)?, "swap_used": r.get::<_, i64>(4)?,
-                "disk_used": r.get::<_, i64>(5)?, "net_rx": r.get::<_, i64>(6)?,
-                "net_tx": r.get::<_, i64>(7)?,
+                "mem_used": r.get::<_, i64>(3)?, "disk_used": r.get::<_, i64>(4)?,
+                "net_rx": r.get::<_, i64>(5)?, "net_tx": r.get::<_, i64>(6)?,
             }))
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
