@@ -26,6 +26,11 @@ done
 case "$INTERVAL" in "" | *[!0-9]*) echo "interval must be an integer from 1 to 3600" >&2; exit 2 ;; esac
 [ "$INTERVAL" -ge 1 ] && [ "$INTERVAL" -le 3600 ] || { echo "interval must be from 1 to 3600" >&2; exit 2; }
 case "$GITHUB_PROXY" in "" | http://* | https://*) ;; *) echo "GitHub proxy must start with http:// or https://" >&2; exit 2 ;; esac
+# A bare host means TLS, which is the same upgrade the agent's ws_url() does
+# with one. Without this the two halves disagree: the agent would dial wss://,
+# while curl below defaults a scheme-less URL to http:// and fetches the binary
+# that is about to run as root over plaintext -- the worse half of the pair.
+case "$SERVER" in *://*) ;; *) SERVER="https://$SERVER" ;; esac
 # The agent already refuses plaintext ws:// to a remote hub, because the token
 # would travel in the clear. The same address fetches the binary that is about
 # to run as root here, so it gets the same rule: over plain HTTP anyone on the
