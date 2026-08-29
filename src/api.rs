@@ -616,33 +616,41 @@ mod tests {
     fn a_thinned_bucket_answers_with_its_mean_and_says_what_it_lost() {
         let app = app();
         let id = node(&app, "n", true);
-        let now = Utc::now().timestamp();
+        // Anchored on a bucket boundary, and a whole bucket into the past.
+        // Hung off `now` instead, the rows straddle the boundary or not
+        // depending on what second the suite is run at, and the assertions
+        // below are green on a developer's machine and red on CI.
+        let base = Utc::now().timestamp() / 120 * 120 - 120;
         // One bucket's worth: a quiet minute and a busy one, then a probe that
         // answered once and timed out three times.
-        app.db.insert_metric(id, now - 90, &json!({"cpu": 0.0, "net_rx": 0})).unwrap();
-        app.db.insert_metric(id, now - 30, &json!({"cpu": 40.0, "net_rx": 1_000})).unwrap();
+        app.db.insert_metric(id, base + 10, &json!({"cpu": 0.0, "net_rx": 0})).unwrap();
+        app.db.insert_metric(id, base + 70, &json!({"cpu": 40.0, "net_rx": 1_000})).unwrap();
         for (i, latency) in [30, -1, -1, -1].into_iter().enumerate() {
-            app.db.insert_ping(id, 1, now - 90 + i as i64 * 20, latency).unwrap();
+            app.db.insert_ping(id, 1, base + 10 + i as i64 * 20, latency).unwrap();
         }
-        // A second probe that never answered at all, which used to vanish.
-        app.db.insert_ping(id, 2, now - 90, -1).unwrap();
+        // A second probe that never answered at all, which used to vanish, and
+        // a third that answered cleanly.
+        app.db.insert_ping(id, 2, base + 10, -1).unwrap();
+        app.db.insert_ping(id, 3, base + 10, 12).unwrap();
 
-        let m = &app.db.metrics(id, now - 120, 120).unwrap()[0];
+        let m = &app.db.metrics(id, base, 120).unwrap()[0];
         assert_eq!(m["cpu"], 20.0, "the bucket is its mean, not one row of it");
         assert_eq!(m["net_rx"], 500);
-        assert_eq!(m["ts"].as_i64().unwrap() % 120, 0, "stamped with the bucket, so series share a grid");
+        assert_eq!(m["ts"], base, "stamped with the bucket, so every series shares a grid");
 
-        let p = app.db.ping_records(id, now - 120, 120).unwrap();
-        assert_eq!(p[0]["latency"], 30, "the mean of what answered, not of the timeouts");
-        assert_eq!(p[0]["loss"], 75);
-        assert_eq!(p[1]["latency"], json!(null), "a bucket that was all timeout has no latency");
-        assert_eq!(p[1]["loss"], 100);
-
+        // By task, not by index: the three rows share a timestamp, so the
+        // query's `ORDER BY ts` leaves their order to SQLite.
+        let rows = app.db.ping_records(id, base, 120).unwrap();
+        let probe = |task: i64| {
+            rows.iter().find(|r| r["task_id"] == task).unwrap_or_else(|| panic!("no probe {task}"))
+        };
+        assert_eq!(probe(1)["latency"], 30, "the mean of what answered, not of the timeouts");
+        assert_eq!(probe(1)["loss"], 75);
+        assert_eq!(probe(2)["latency"], json!(null), "a bucket that was all timeout has no latency");
+        assert_eq!(probe(2)["loss"], 100);
         // A clean bucket carries no loss key at all: it is per row, per probe,
         // on a response that is already a quarter of a megabyte.
-        app.db.insert_ping(id, 3, now - 90, 12).unwrap();
-        let clean = app.db.ping_records(id, now - 120, 120).unwrap();
-        assert!(clean[2].get("loss").is_none(), "{:?}", clean[2]);
+        assert!(probe(3).get("loss").is_none(), "{:?}", probe(3));
     }
 
     #[test]
