@@ -318,6 +318,14 @@ fn restrict(path: &str) {
     }
 }
 
+/// The chart's probe query. Named because the query plan is asserted on it in
+/// `rekeying_ping_record_keeps_the_rows_and_lets_the_window_query_seek`, and a
+/// second copy over there is a copy that stops matching what actually runs.
+const PING_WINDOW: &str = "SELECT task_id, (MIN(ts)/?3)*?3,
+            CAST(AVG(CASE WHEN latency>=0 THEN latency END) AS INTEGER),
+            (100*SUM(latency<0))/COUNT(*)
+     FROM ping_record WHERE node_id=?1 AND ts>=?2 GROUP BY task_id, ts/?3 ORDER BY ts";
+
 impl Db {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -734,10 +742,24 @@ impl Db {
     /// Bucketed rather than filtered on a multiple of `step`: rows normally
     /// land on the minute, but nothing enforces it, and a filter would answer a
     /// stamp that sits between the grid lines with silence.
+    ///
+    /// Averaged over the bucket, not sampled from it. `MAX(ts)` with bare
+    /// columns beside it answers with one arbitrary row, which is the 1/60
+    /// sampling decisions.md already threw out at the write side -- put back one
+    /// layer up, and worse: the seven-day window kept one minute in fourteen.
+    /// Measured on cc, that window integrated to 53.69 GB of traffic against
+    /// the 27.52 GB the minutes actually hold. Averaged it is 28.02 GB, so the
+    /// chart's integral matches the accumulator again.
+    ///
+    /// The stamp is the bucket's own start rather than a row inside it, so
+    /// every series lands on the same grid -- which is what lets the probe
+    /// lines below share rows instead of each carrying its own timestamps.
     pub fn metrics(&self, node_id: i64, since: i64, step: i64) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT MAX(ts), cpu, load1, mem_used, swap_used, disk_used, net_rx, net_tx
+            "SELECT (MIN(ts)/?3)*?3, AVG(cpu), AVG(load1), CAST(AVG(mem_used) AS INTEGER),
+                    CAST(AVG(swap_used) AS INTEGER), CAST(AVG(disk_used) AS INTEGER),
+                    CAST(AVG(net_rx) AS INTEGER), CAST(AVG(net_tx) AS INTEGER)
              FROM metric WHERE node_id=?1 AND ts>=?2 GROUP BY ts/?3 ORDER BY ts",
         )?;
         let rows = stmt.query_map(params![node_id, since, step], |r| {
@@ -859,25 +881,35 @@ impl Db {
         Ok(())
     }
 
-    /// Probe results for one node, one sample per probe per `step` seconds.
+    /// Probe results for one node, one sample per probe per `step` seconds:
+    /// the bucket's mean round trip, and how much of it was lost.
     ///
     /// These stamps are whenever the probe finished rather than on a minute, so
-    /// the thinning buckets them instead of matching a multiple: `MAX(ts)` with
-    /// bare columns beside it is SQLite's documented "row that held the
-    /// maximum", which makes the sample the newest result in its bucket. Same
-    /// reason as `metrics` above -- and this is the larger half of that
-    /// response, because a probe reports far more often than once a minute.
+    /// the thinning buckets them instead of matching a multiple. Same reason as
+    /// `metrics` above -- and this is the larger half of that response, because
+    /// a probe reports far more often than once a minute.
+    ///
+    /// A timeout is stored as -1, so it has to be kept out of the mean and
+    /// counted instead. Keeping the newest row of the bucket was worse than
+    /// coarse: on cc's 移动v4 it dropped 389 of the 788 timeouts in a day and
+    /// then drew the survivors as an unbroken line, which is a probe losing
+    /// half its packets rendered as a healthy one. `latency` is null when the
+    /// whole bucket timed out; `loss` is the percentage that did, and rides
+    /// along only when there is any -- a healthy day is 2 880 rows, and
+    /// `"loss":0` on each of them is 29 kB of nothing on an uncompressed
+    /// response.
     pub fn ping_records(&self, node_id: i64, since: i64, step: i64) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT task_id, MAX(ts), latency FROM ping_record
-             WHERE node_id=?1 AND ts>=?2 GROUP BY task_id, ts/?3 ORDER BY ts",
-        )?;
+        let mut stmt = conn.prepare(PING_WINDOW)?;
         let rows = stmt.query_map(params![node_id, since, step], |r| {
-            Ok(serde_json::json!({
+            let mut row = serde_json::json!({
                 "task_id": r.get::<_, i64>(0)?, "ts": r.get::<_, i64>(1)?,
-                "latency": r.get::<_, i64>(2)?
-            }))
+                "latency": r.get::<_, Option<i64>>(2)?
+            });
+            if let loss @ 1.. = r.get::<_, i64>(3)? {
+                row["loss"] = loss.into();
+            }
+            Ok(row)
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -1234,10 +1266,7 @@ mod tests {
         // What the rebuild was for. Without the timestamp second in the key the
         // plan stops at `node_id=?` and scans everything under it.
         let plan: String = conn
-            .prepare(
-                "EXPLAIN QUERY PLAN SELECT task_id, MAX(ts), latency FROM ping_record
-                      WHERE node_id=?1 AND ts>=?2 GROUP BY task_id, ts/?3 ORDER BY ts",
-            )
+            .prepare(&format!("EXPLAIN QUERY PLAN {PING_WINDOW}"))
             .unwrap()
             .query_map(params![1, 0, 60], |r| r.get::<_, String>(3))
             .unwrap()

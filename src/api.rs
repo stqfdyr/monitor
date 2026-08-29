@@ -139,6 +139,9 @@ pub async fn nodes(State(app): State<Shared>, headers: HeaderMap) -> Response {
 pub struct Window {
     #[serde(default = "default_hours")]
     hours: i64,
+    /// How many points the caller can actually draw. Optional: an old theme,
+    /// or curl, gets the full budget.
+    points: Option<i64>,
 }
 
 fn default_hours() -> i64 {
@@ -160,7 +163,7 @@ pub async fn metrics(
     // the same for a visitor as for the admin and the page needs no second
     // request. Only the names: targets and assignments stay behind `Admin`.
     let probes = app.db.ping_task_names().unwrap_or_else(|_| json!({}));
-    let step = sample_step(hours);
+    let step = sample_step(hours, w.points);
     match (app.db.metrics(id, since, step), app.db.ping_records(id, since, step)) {
         (Ok(m), Ok(p)) => Json(json!({"metrics": m, "ping": p, "probes": probes})).into_response(),
         (Err(e), _) | (_, Err(e)) => fail(e),
@@ -174,12 +177,20 @@ pub async fn metrics(
 /// results, which is megabytes of JSON built in memory for a request that needs
 /// no credentials at all — and a screen has around a thousand pixels to draw it
 /// across. Whole minutes, because that is the grid the metric rows sit on.
+///
+/// `points` is what the caller says it can draw, the way Grafana's panels send
+/// their own width: a phone was being sent 720 samples a probe to lay across
+/// 280 pixels, which is two and a half samples a pixel of aliasing and a
+/// quarter of a megabyte over mobile data to draw it. It only ever lowers the
+/// budget — the ceiling is the hub's, not the caller's, because this path
+/// takes no credentials.
 // ponytail: the budget is per series, so a response is SAMPLES × (1 + probes) --
 // bounded by how many probes the admin created, not by the caller. Four probes
 // is ~250 KB; if that list ever grows long, scale SAMPLES by the probe count.
-fn sample_step(hours: i64) -> i64 {
+fn sample_step(hours: i64, points: Option<i64>) -> i64 {
     const SAMPLES: i64 = 720;
-    60 * (hours * 60 / SAMPLES).max(1)
+    let budget = points.unwrap_or(SAMPLES).clamp(60, SAMPLES);
+    60 * (hours * 60 / budget).max(1)
 }
 
 /// Guards a per-node read: the panel sees everything, the public page only
@@ -564,7 +575,7 @@ mod tests {
         }
 
         for hours in [1, 6, 24, 168, 2_160] {
-            let step = sample_step(hours);
+            let step = sample_step(hours, None);
             let since = now - hours * 3_600;
             let metrics = app.db.metrics(id, since, step).unwrap();
             let ping = app.db.ping_records(id, since, step).unwrap();
@@ -578,14 +589,60 @@ mod tests {
             );
             // Thin, but not empty, and not reaching outside the window.
             assert!(!metrics.is_empty() && !ping.is_empty(), "{hours}h returned nothing");
+            // A row is stamped with its bucket's start, and a bucket the
+            // window opens halfway through starts before the window does.
             assert!(
-                metrics.iter().all(|m| m["ts"].as_i64().unwrap() >= since),
+                metrics.iter().all(|m| m["ts"].as_i64().unwrap() >= since - step),
                 "{hours}h reached back too far"
             );
         }
         // The whole point: the widest window is no dearer than a narrow one.
         // Against a month of history, unthinned, this was 43 200 rows.
-        assert!(app.db.metrics(id, now - 2_160 * 3_600, sample_step(2_160)).unwrap().len() <= 721);
+        assert!(app.db.metrics(id, now - 2_160 * 3_600, sample_step(2_160, None)).unwrap().len() <= 721);
+
+        // A caller may ask for less than it can draw, and no caller may ask for
+        // more: the ceiling on this path is the hub's, since it takes no
+        // credentials. A phone asking for its 390 pixels gets a coarser step.
+        assert!(sample_step(24, Some(390)) > sample_step(24, None));
+        assert_eq!(sample_step(24, Some(100_000)), sample_step(24, None));
+        assert_eq!(sample_step(24, Some(0)), sample_step(24, Some(60)));
+    }
+
+    /// What a thinned bucket is allowed to answer with. Keeping one row of it
+    /// and dropping the rest is how the seven-day traffic chart came to
+    /// integrate to twice the traffic the minutes hold, and how a probe losing
+    /// half its packets came to draw as an unbroken line.
+    #[test]
+    fn a_thinned_bucket_answers_with_its_mean_and_says_what_it_lost() {
+        let app = app();
+        let id = node(&app, "n", true);
+        let now = Utc::now().timestamp();
+        // One bucket's worth: a quiet minute and a busy one, then a probe that
+        // answered once and timed out three times.
+        app.db.insert_metric(id, now - 90, &json!({"cpu": 0.0, "net_rx": 0})).unwrap();
+        app.db.insert_metric(id, now - 30, &json!({"cpu": 40.0, "net_rx": 1_000})).unwrap();
+        for (i, latency) in [30, -1, -1, -1].into_iter().enumerate() {
+            app.db.insert_ping(id, 1, now - 90 + i as i64 * 20, latency).unwrap();
+        }
+        // A second probe that never answered at all, which used to vanish.
+        app.db.insert_ping(id, 2, now - 90, -1).unwrap();
+
+        let m = &app.db.metrics(id, now - 120, 120).unwrap()[0];
+        assert_eq!(m["cpu"], 20.0, "the bucket is its mean, not one row of it");
+        assert_eq!(m["net_rx"], 500);
+        assert_eq!(m["ts"].as_i64().unwrap() % 120, 0, "stamped with the bucket, so series share a grid");
+
+        let p = app.db.ping_records(id, now - 120, 120).unwrap();
+        assert_eq!(p[0]["latency"], 30, "the mean of what answered, not of the timeouts");
+        assert_eq!(p[0]["loss"], 75);
+        assert_eq!(p[1]["latency"], json!(null), "a bucket that was all timeout has no latency");
+        assert_eq!(p[1]["loss"], 100);
+
+        // A clean bucket carries no loss key at all: it is per row, per probe,
+        // on a response that is already a quarter of a megabyte.
+        app.db.insert_ping(id, 3, now - 90, 12).unwrap();
+        let clean = app.db.ping_records(id, now - 120, 120).unwrap();
+        assert!(clean[2].get("loss").is_none(), "{:?}", clean[2]);
     }
 
     #[test]
