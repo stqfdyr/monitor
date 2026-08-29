@@ -606,14 +606,17 @@ impl Db {
         day_rx += d_rx;
         day_tx += d_tx;
 
-        let period = period_start(Utc::now().date_naive(), reset_day).to_string();
+        // Both boundaries are human dates — the day a provider resets an
+        // allowance, and the day a person means by "today" — so both follow the
+        // hub's own timezone. On UTC the billing month turned over eight hours
+        // into the reset day for a hub in CST, while "today" beside it turned
+        // at midnight: two counters on the same row disagreeing about the date.
+        let period = period_start(Local::now().date_naive(), reset_day).to_string();
         if month_start != period {
             // New billing period: the month counter restarts, the total does not.
             month_rx = d_rx;
             month_tx = d_tx;
         }
-        // "Today" is a human word, so it follows the hub's own timezone rather
-        // than UTC, which would roll over mid-morning for anyone east of it.
         let today = Local::now().date_naive().to_string();
         if day_start != today {
             day_rx = d_rx;

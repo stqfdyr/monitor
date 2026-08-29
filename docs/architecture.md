@@ -79,7 +79,7 @@ agent 收到后会**保留没变化的任务**（同 id + 同 target + 同 inter
 | `setting` | key/value 配置 | 替代配置文件。见下方设置键列表 |
 | `node` | 节点配置 + agent 上报的静态信息 | `token` 存明文，面板要能重新显示安装命令；只在 `full` 视图输出 |
 | `traffic` | **单调递增的流量累计** | 1:1 于 node，但生命周期完全不同（每次上报都写） |
-| `metric` | 历史明细，**每节点每分钟一行** | `WITHOUT ROWID`，按保留天数定期删 |
+| `metric` | 历史明细，**每节点每分钟一行** | `WITHOUT ROWID`，按保留天数定期删。`net_rx/net_tx` 是这一分钟的**平均**速率，从累计器的差值算出，不是某一秒的读数——见 [decisions.md](decisions.md) |
 | `ping_task` / `ping_node` | 探测任务及其节点分配 | 多对多 |
 | `ping_record` | 探测结果 | 同样按保留天数删。主键是 `(node_id, ts, task_id)`——顺序跟着查询走，见 [benchmark.md](benchmark.md#6-下一轮一条会随时间变慢的查询) |
 | `session` | 登录会话 | 存 sha256，14 天过期 |

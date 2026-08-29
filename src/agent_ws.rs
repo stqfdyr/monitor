@@ -39,6 +39,13 @@ pub struct Live {
     pub last_seen: i64,
     /// Wall-clock minute of the last row written to `metric`.
     pub last_minute: i64,
+    /// `(unix seconds, total_rx, total_tx)` as they stood at the last history
+    /// row, so the next one can carry the average rate over the gap between
+    /// them. Without it the row held one report's instantaneous reading, which
+    /// is a 1-in-60 sample of the minute it claims to describe — and the chart
+    /// is drawn from it, so a burst that started and ended between two samples
+    /// simply never happened. See `report`.
+    pub mark: Option<(i64, i64, i64)>,
 }
 
 #[derive(Deserialize)]
@@ -190,13 +197,27 @@ fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()>
     let store = entry.last_minute != minute;
     entry.metrics = metrics.clone();
     entry.last_seen = now;
-    if store {
+    // The stored row differs from the live one in exactly one way: its network
+    // rate is the average since the previous row, taken from the accumulated
+    // totals this hub watched the counters climb through, rather than the
+    // reading of whichever second the minute happened to turn over on. That
+    // makes the chart integrate to the same bytes the totals show; the live
+    // view keeps the instantaneous rate, which is what it is for.
+    let row = store.then(|| {
+        let mut row = metrics.clone();
+        if let (Some((since, rx0, tx0)), Some(obj)) = (entry.mark, row.as_object_mut()) {
+            let elapsed = (now - since).max(1);
+            obj.insert("net_rx".into(), json!((traffic.total_rx - rx0).max(0) / elapsed));
+            obj.insert("net_tx".into(), json!((traffic.total_tx - tx0).max(0) / elapsed));
+        }
         entry.last_minute = minute;
-    }
+        entry.mark = Some((now, traffic.total_rx, traffic.total_tx));
+        row
+    });
     drop(live);
 
-    if store {
-        app.db.insert_metric(node_id, minute * 60, &metrics)?;
+    if let Some(row) = row {
+        app.db.insert_metric(node_id, minute * 60, &row)?;
         app.db.touch_seen(node_id, now)?;
     }
     Ok(())
@@ -276,6 +297,43 @@ mod tests {
         assert_eq!(rows[0]["ts"], minute, "stamped on the minute, not on the report");
         // Written on the same branch, and the offline badge counts from it.
         assert!(app.db.node(id).unwrap().unwrap().last_seen >= minute, "last_seen is written too");
+    }
+
+    /// The stored rate is the minute's average, taken from the totals the hub
+    /// accumulated, not the one instant the agent happened to be sampled at.
+    /// A burst that begins and ends between two reports moved real bytes; a
+    /// point sample of the second the minute turned over says it never did.
+    #[test]
+    fn a_history_row_carries_the_average_rate_not_one_instants_reading() {
+        let app = app();
+        let id = node(&app);
+        let burst = |rx: i64, instant: i64| {
+            json!({"jsonrpc": "2.0", "method": "report",
+                   "params": {"boot_id": "boot-a", "net_rx_total": rx, "net_tx_total": 0,
+                              // What the agent measured over its own last second:
+                              // idle, because the burst was already over.
+                              "net_rx": instant, "net_tx": 0}})
+            .to_string()
+        };
+
+        // First report is the baseline: nothing to average against yet.
+        dispatch(&app, id, "ip", &burst(1_000, 0)).unwrap();
+        // Rewind the bookkeeping by a minute so the next report crosses the
+        // boundary and writes a row, with a minute of elapsed time behind it.
+        let now = Utc::now().timestamp();
+        {
+            let mut live = app.live.write().unwrap();
+            let entry = live.get_mut(&id).unwrap();
+            entry.last_minute -= 1;
+            entry.mark = Some((now - 60, 0, 0));
+        }
+        // 60 MB arrived during that minute, and the agent reports 0 B/s now.
+        dispatch(&app, id, "ip", &burst(1_000 + 60_000_000, 0)).unwrap();
+
+        let row = &app.db.metrics(id, 0, 60).unwrap()[0];
+        assert_eq!(row["net_rx"], 1_000_000, "60 MB over 60 s is 1 MB/s, not the agent's 0");
+        // And the live view still shows the instant, which is what it is for.
+        assert_eq!(app.live.read().unwrap()[&id].metrics["net_rx"], 0);
     }
 
     #[test]
