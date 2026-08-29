@@ -29,13 +29,13 @@ hub 嵌进去的那个文件，和用户解到 `<themes>/<short>/` 的那个是�
 
 | 文件 | 规模（不含测试） | 职责 |
 |---|---|---|
-| `src/db.rs` | ~935 | schema + 所有 SQL。**流量累加 `accumulate()` 在这里** |
-| `src/api.rs` | ~510 | 面板和公开页的 HTTP 接口、`Admin` 提取器 |
+| `src/db.rs` | ~1060 | schema + 所有 SQL。**流量累加 `accumulate()` 在这里** |
+| `src/api.rs` | ~540 | 面板和公开页的 HTTP 接口、`Admin` 提取器 |
 | `src/auth.rs` | ~360 | session、GitHub OAuth、argon2 密码、登录限流 |
-| `src/main.rs` | ~350 | 启动、路由表、首次运行、定时清理 |
-| `src/agent_ws.rs` | ~225 | agent 侧 WebSocket、RPC 分发、实时状态 |
-| `src/frontend.rs` | ~165 | 双 SPA、主题扫描、磁盘安全读取与 fallback |
-| `web-admin/src/` | ~1520 | 内置后台。`components/ui/` 下是 shadcn 生成的，不手改 |
+| `src/main.rs` | ~365 | 启动、路由表、首次运行、定时清理 |
+| `src/agent_ws.rs` | ~365 | agent 侧 WebSocket、RPC 分发、实时状态 |
+| `src/frontend.rs` | ~180 | 双 SPA、主题扫描、磁盘安全读取与 fallback |
+| `web-admin/src/` | ~2320 | 内置后台。`components/ui/` 下是 shadcn 生成的，不手改 |
 | `scripts/theme.sh` | ~35 | 按 `web-theme.pin` 下载、校验、解出默认主题到 `target/theme/`。build.rs 和 CI 都调它 |
 
 agent 的采集代码在 [另一个仓库](https://github.com/stqfdyr/agent)。改了它的上报字段就是改了协议，两边要同步。
@@ -130,8 +130,11 @@ OpenRC 没有对应开关，要降权得自己建用户再指过去。agent 并�
 **读取**（登录了看全部，没登录且公开页开着只看公开节点）：
 `GET /api/me`、`GET /api/nodes`、`GET /api/nodes/{id}/metrics?hours=N`、`GET /api/ws`（每 2 秒推一次快照）
 
-`hours` clamp 到 1–2160，返回的点按窗口宽度降采样到每条曲线约 720 个（`api::sample_step`）——
-屏幕上画不下更多，而这条路匿名可达，代价必须和窗口宽度脱钩。见 [security.md](security.md)。
+`hours` clamp 到 1–2160。**分辨率由屏幕决定**：调用方用 `points` 报上自己能画多少点（设备像素），
+`api::sample_step` 只往下调，绝不往上——上限 `SAMPLES = 1440`（一天的分钟数）是 hub 的，不是调用方的。
+样本装得下就一个不抽稀，装不下才聚合。`series=metrics|ping` 再决定只要哪一半。
+这条路匿名可达，所以代价必须有上界。见 [security.md](security.md) 和
+[decisions.md](decisions.md#分辨率由屏幕决定聚合是退让不是默认-用户)。
 
 **登录**：`POST /api/auth/login`、`POST /api/auth/logout`、`GET /api/auth/github`、`GET /api/auth/github/callback`
 

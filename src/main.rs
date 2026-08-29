@@ -21,7 +21,7 @@ use axum::http::{header, Extensions, HeaderMap, StatusCode, Version};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
-use chrono::{Months, NaiveDate, Utc};
+use chrono::{Local, Months, NaiveDate};
 use tokio::signal::unix::{signal, SignalKind};
 use tower_http::compression::Predicate;
 use tracing::{info, warn};
@@ -327,7 +327,12 @@ fn renewed(expires: NaiveDate, cycle: &str, today: NaiveDate) -> Option<NaiveDat
 }
 
 fn renew_online_nodes(app: &App) -> Result<()> {
-    let today = Utc::now().date_naive();
+    // The hub's own timezone, the same as the traffic boundaries: an expiry
+    // date is a date a person wrote down, and on a CST hub `Utc` answers
+    // "yesterday" until 08:00, so a node expiring today is not rolled until
+    // then -- while the panel beside it, which reads local dates, already says
+    // it has expired.
+    let today = Local::now().date_naive();
     let online: Vec<i64> = app.agents.read().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
     for node in app.db.nodes()? {
         if !online.contains(&node.id) {

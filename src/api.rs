@@ -164,12 +164,15 @@ pub async fn metrics(
     }
     let hours = w.hours.clamp(1, 24 * 90);
     let since = Utc::now().timestamp() - hours * 3_600;
+    let step = sample_step(hours, w.points);
+    let wants = |name: &str| w.series.as_deref().is_none_or(|s| s == name);
     // Probe names ride along with the samples they label, so the chart reads
     // the same for a visitor as for the admin and the page needs no second
     // request. Only the names: targets and assignments stay behind `Admin`.
-    let probes = app.db.ping_task_names().unwrap_or_else(|_| json!({}));
-    let step = sample_step(hours, w.points);
-    let wants = |name: &str| w.series.as_deref().is_none_or(|s| s == name);
+    // Only when the probes themselves were asked for: the resources tab has
+    // nothing to label, and this is a turn at the write connection either way.
+    let probes =
+        if wants("ping") { app.db.ping_task_names().unwrap_or_else(|_| json!({})) } else { json!({}) };
     let metrics = if wants("metrics") { app.db.metrics(id, since, step) } else { Ok(vec![]) };
     let ping = if wants("ping") { app.db.ping_records(id, since, step) } else { Ok(vec![]) };
     match (metrics, ping) {
