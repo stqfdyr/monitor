@@ -17,12 +17,13 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Result;
 use axum::extract::{Path, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, Extensions, HeaderMap, StatusCode, Version};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
 use chrono::{Months, NaiveDate, Utc};
 use tokio::signal::unix::{signal, SignalKind};
+use tower_http::compression::Predicate;
 use tracing::{info, warn};
 
 use agent_ws::Agent;
@@ -214,6 +215,22 @@ async fn main() -> Result<()> {
         .fallback(frontend::serve)
         // A report is a few hundred bytes; anything larger is not one.
         .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
+        // A day of one node's chart is 236 kB of JSON and 30 kB of gzip, and
+        // the theme's bundle is much the same shape. The public page is behind
+        // a CDN that already does this; the panel, and anyone reaching the hub
+        // directly, were paying it in full.
+        //
+        // Not on a 101: both sockets upgrade through one, and a body encoder
+        // has no business wrapping a connection that is about to stop being
+        // HTTP. The default predicate skips images, SSE and anything under
+        // 32 bytes.
+        .layer(tower_http::compression::CompressionLayer::new().compress_when(
+            tower_http::compression::predicate::DefaultPredicate::new().and(
+                |status: StatusCode, _: Version, _: &HeaderMap, _: &Extensions| {
+                    status != StatusCode::SWITCHING_PROTOCOLS
+                },
+            ),
+        ))
         .with_state(app);
 
     let listener = tokio::net::TcpListener::bind(args.listen).await?;

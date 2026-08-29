@@ -23,7 +23,7 @@ hex = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 rust-embed = "8"
 mime_guess = "2"
-tower-http = { version = "0.6", features = ["limit"] }
+tower-http = { version = "0.6", features = ["limit", "compression-gzip"] }
 
 [dev-dependencies]
 serde_urlencoded = "0.7"
