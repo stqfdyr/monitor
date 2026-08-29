@@ -23,15 +23,15 @@ agent 拆开是因为部署机器和发布节奏不同。默认主题拆开是�
 
 ## 源码地图
 
-| 文件 | 规模 | 职责 |
+| 文件 | 规模（不含测试） | 职责 |
 |---|---|---|
-| `src/db.rs` | ~810 | schema + 所有 SQL。**流量累加 `accumulate()` 在这里** |
-| `src/agent_ws.rs` | ~275 | agent 侧 WebSocket、RPC 分发、实时状态 |
-| `src/api.rs` | ~405 | 面板和公开页的 HTTP 接口、`Admin` 提取器 |
-| `src/auth.rs` | ~330 | session、GitHub OAuth、argon2 密码、登录限流 |
-| `src/main.rs` | ~290 | 启动、路由表、首次运行、定时清理 |
-| `src/frontend.rs` | ~200 | 双 SPA、主题扫描、磁盘安全读取与 fallback |
-| `web-admin/src/` | ~700 | 内置后台。`components/ui/` 下是 shadcn 生成的，不手改 |
+| `src/db.rs` | ~935 | schema + 所有 SQL。**流量累加 `accumulate()` 在这里** |
+| `src/api.rs` | ~510 | 面板和公开页的 HTTP 接口、`Admin` 提取器 |
+| `src/auth.rs` | ~360 | session、GitHub OAuth、argon2 密码、登录限流 |
+| `src/main.rs` | ~350 | 启动、路由表、首次运行、定时清理 |
+| `src/agent_ws.rs` | ~225 | agent 侧 WebSocket、RPC 分发、实时状态 |
+| `src/frontend.rs` | ~165 | 双 SPA、主题扫描、磁盘安全读取与 fallback |
+| `web-admin/src/` | ~1520 | 内置后台。`components/ui/` 下是 shadcn 生成的，不手改 |
 | `web-theme/` | 构建时检出 | 默认主题仓库的本地工作副本，不提交到 hub 仓库 |
 
 agent 的采集代码在 [另一个仓库](https://github.com/stqfdyr/agent)。改了它的上报字段就是改了协议，两边要同步。
@@ -81,7 +81,7 @@ agent 收到后会**保留没变化的任务**（同 id + 同 target + 同 inter
 | `traffic` | **单调递增的流量累计** | 1:1 于 node，但生命周期完全不同（每次上报都写） |
 | `metric` | 历史明细，**每节点每分钟一行** | `WITHOUT ROWID`，按保留天数定期删 |
 | `ping_task` / `ping_node` | 探测任务及其节点分配 | 多对多 |
-| `ping_record` | 探测结果 | 同样按保留天数删 |
+| `ping_record` | 探测结果 | 同样按保留天数删。主键是 `(node_id, ts, task_id)`——顺序跟着查询走，见 [benchmark.md](benchmark.md#6-下一轮一条会随时间变慢的查询) |
 | `session` | 登录会话 | 存 sha256，14 天过期 |
 
 ### 为什么 traffic 单独一张表

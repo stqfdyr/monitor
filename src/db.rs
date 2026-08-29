@@ -101,10 +101,13 @@ CREATE TABLE IF NOT EXISTS ping_node (
   PRIMARY KEY (task_id, node_id)
 );
 
+-- Key order follows the only query there is: one node, one time window,
+-- every probe. With task_id ahead of ts SQLite can seek to the node and no
+-- further, then scans every record it ever kept -- see the migration in open().
 CREATE TABLE IF NOT EXISTS ping_record (
   node_id INTEGER NOT NULL, task_id INTEGER NOT NULL,
   ts INTEGER NOT NULL, latency INTEGER NOT NULL,
-  PRIMARY KEY (node_id, task_id, ts)
+  PRIMARY KEY (node_id, ts, task_id)
 ) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS session (
@@ -264,6 +267,33 @@ impl Db {
         // digests, which no agent can present: those nodes need a new token
         // issued from the panel and their agent reinstalled, once.
         let _ = conn.execute("ALTER TABLE node RENAME COLUMN token_hash TO token", []);
+        // A key can only be reordered by rebuilding the table, and CREATE TABLE
+        // IF NOT EXISTS leaves an existing one exactly as it was. The old order
+        // put task_id between the node and the timestamp, so a chart request --
+        // which needs no credentials, and holds the connection the agents report
+        // through -- read every probe result the node had ever kept to answer
+        // for one hour of it: 0.8 ms against 42 ms at a month of retention.
+        let stale: bool = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE name='ping_record' AND sql LIKE '%(node_id, task_id, ts)%'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? > 0;
+        if stale {
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE ping_record_rekeyed (
+                   node_id INTEGER NOT NULL, task_id INTEGER NOT NULL,
+                   ts INTEGER NOT NULL, latency INTEGER NOT NULL,
+                   PRIMARY KEY (node_id, ts, task_id)
+                 ) WITHOUT ROWID;
+                 INSERT INTO ping_record_rekeyed SELECT * FROM ping_record;
+                 DROP TABLE ping_record;
+                 ALTER TABLE ping_record_rekeyed RENAME TO ping_record;
+                 COMMIT;",
+            )?;
+            info!("rebuilt ping_record on a key the latency chart can seek");
+        }
         Ok(Self(Mutex::new(conn)))
     }
 
@@ -495,29 +525,17 @@ impl Db {
         rows.map(|r| r.flatten().collect()).unwrap_or_default()
     }
 
-    /// The one field a report needs from the node row. Reading the whole row
-    /// here meant decoding thirty columns every couple of seconds per node.
-    pub fn traffic_reset_day(&self, id: i64) -> u32 {
-        self.conn()
-            .prepare_cached("SELECT traffic_reset_day FROM node WHERE id=?1")
-            .and_then(|mut s| s.query_row([id], |r| r.get(0)))
-            .unwrap_or(1)
-    }
-
     /// Folds one report's raw kernel counters into the node's running totals.
     ///
     /// A changed boot_id, or a counter that moved backwards, means the kernel
     /// started counting from zero again: the whole current reading is new
     /// traffic. This is what keeps the total from collapsing on every reboot,
     /// which is the behaviour komari has.
-    pub fn accumulate(
-        &self,
-        node_id: i64,
-        boot_id: &str,
-        rx: i64,
-        tx: i64,
-        reset_day: u32,
-    ) -> Result<Traffic> {
+    ///
+    /// The billing reset day is read here rather than passed in: it lives one
+    /// join away from the row this already reads, and fetching it separately
+    /// cost every report a second turn at the single write connection.
+    pub fn accumulate(&self, node_id: i64, boot_id: &str, rx: i64, tx: i64) -> Result<Traffic> {
         let conn = self.conn();
         let (
             prev_boot,
@@ -531,11 +549,12 @@ impl Db {
             mut day_rx,
             mut day_tx,
             day_start,
+            reset_day,
         ) = conn
             .prepare_cached(
-                "SELECT boot_id, last_rx, last_tx, total_rx, total_tx, month_rx, month_tx, month_start,
-                    day_rx, day_tx, day_start
-                 FROM traffic WHERE node_id=?1",
+                "SELECT t.boot_id, t.last_rx, t.last_tx, t.total_rx, t.total_tx, t.month_rx, t.month_tx,
+                    t.month_start, t.day_rx, t.day_tx, t.day_start, n.traffic_reset_day
+                 FROM traffic t JOIN node n ON n.id = t.node_id WHERE t.node_id=?1",
             )?
             .query_row([node_id], |r| {
                 Ok((
@@ -550,6 +569,7 @@ impl Db {
                     r.get::<_, i64>(8)?,
                     r.get::<_, i64>(9)?,
                     r.get::<_, String>(10)?,
+                    r.get::<_, u32>(11)?,
                 ))
             })?;
 
@@ -947,10 +967,10 @@ mod tests {
 
         // First report only establishes the baseline: the box's lifetime
         // counters are not booked as traffic seen by this hub.
-        let t = db.accumulate(id, "boot-a", 5_000, 3_000, 1).unwrap();
+        let t = db.accumulate(id, "boot-a", 5_000, 3_000).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (0, 0));
 
-        let t = db.accumulate(id, "boot-a", 9_000, 6_000, 1).unwrap();
+        let t = db.accumulate(id, "boot-a", 9_000, 6_000).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (4_000, 3_000));
 
         // Reboot: new boot_id, counters restart near zero. What this guards is
@@ -958,11 +978,11 @@ mod tests {
         // is the komari behaviour the project exists to fix. The 700 bytes the
         // box moved before its first report are not booked -- there is no
         // baseline to have measured them against.
-        let t = db.accumulate(id, "boot-b", 700, 400, 1).unwrap();
+        let t = db.accumulate(id, "boot-b", 700, 400).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (4_000, 3_000), "a reboot must not reset the total");
 
         // And counting resumes from the new baseline.
-        let t = db.accumulate(id, "boot-b", 1_700, 900, 1).unwrap();
+        let t = db.accumulate(id, "boot-b", 1_700, 900).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (5_000, 3_500));
         assert_eq!((t.month_rx, t.month_tx), (5_000, 3_500));
     }
@@ -978,15 +998,15 @@ mod tests {
         let id = node(&db, 1);
         let (a, b) = (100_000_000_000, 80_000_000_000); // two lifetime counters
 
-        db.accumulate(id, "boot-a", a, a, 1).unwrap();
-        let t = db.accumulate(id, "boot-a", a + 1_000, a + 1_000, 1).unwrap();
+        db.accumulate(id, "boot-a", a, a).unwrap();
+        let t = db.accumulate(id, "boot-a", a + 1_000, a + 1_000).unwrap();
         assert_eq!(t.total_rx, 1_000, "the real machine's own traffic still counts");
 
         // Now they take turns. Every swap is a boot_id the hub has no baseline
         // for, so every swap books nothing.
         for round in 0..3 {
-            db.accumulate(id, "boot-b", b + round, b + round, 1).unwrap();
-            db.accumulate(id, "boot-a", a + 1_000 + round, a + 1_000 + round, 1).unwrap();
+            db.accumulate(id, "boot-b", b + round, b + round).unwrap();
+            db.accumulate(id, "boot-a", a + 1_000 + round, a + 1_000 + round).unwrap();
         }
         let t = db.traffic(id);
         assert!(t.total_rx < 10_000, "six swaps booked {} bytes, not a lifetime counter", t.total_rx);
@@ -996,28 +1016,28 @@ mod tests {
     fn a_shrinking_reading_re_aligns_instead_of_re_counting_history() {
         let db = db();
         let id = node(&db, 1);
-        db.accumulate(id, "boot-a", 10_000, 10_000, 1).unwrap();
-        let t = db.accumulate(id, "boot-a", 12_000, 12_000, 1).unwrap();
+        db.accumulate(id, "boot-a", 10_000, 10_000).unwrap();
+        let t = db.accumulate(id, "boot-a", 12_000, 12_000).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (2_000, 2_000));
 
         // Same boot, reading dropped: an interface the sum counted is gone, so
         // this reading is the rest of the machine's history rather than fresh
         // bytes. Booking it would land 2_500 here -- and tens of gigabytes on a
         // box that has been up a month.
-        let t = db.accumulate(id, "boot-a", 500, 500, 1).unwrap();
+        let t = db.accumulate(id, "boot-a", 500, 500).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (2_000, 2_000));
 
         // Aligned to the smaller baseline, counting picks up from there.
-        let t = db.accumulate(id, "boot-a", 900, 900, 1).unwrap();
+        let t = db.accumulate(id, "boot-a", 900, 900).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (2_400, 2_400));
 
         // A new boot re-aligns the same way, for the same reason: there is no
         // baseline under it either.
-        let t = db.accumulate(id, "boot-b", 300, 300, 1).unwrap();
+        let t = db.accumulate(id, "boot-b", 300, 300).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (2_400, 2_400));
 
         // One direction shrinking does not cost the other its increment.
-        let t = db.accumulate(id, "boot-b", 100, 900, 1).unwrap();
+        let t = db.accumulate(id, "boot-b", 100, 900).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (2_400, 3_000));
     }
 
@@ -1029,22 +1049,22 @@ mod tests {
     fn day_and_month_restart_independently_while_the_total_keeps_climbing() {
         let db = db();
         let id = node(&db, 1);
-        db.accumulate(id, "boot-a", 0, 0, 1).unwrap();
-        let t = db.accumulate(id, "boot-a", 8_000, 4_000, 1).unwrap();
+        db.accumulate(id, "boot-a", 0, 0).unwrap();
+        let t = db.accumulate(id, "boot-a", 8_000, 4_000).unwrap();
         assert_eq!((t.day_rx, t.day_tx), (8_000, 4_000));
         assert_eq!((t.month_rx, t.month_tx), (8_000, 4_000));
 
         // Midnight passes. Forced through the stored date, which is what the
         // rollover actually reads.
         db.conn().execute("UPDATE traffic SET day_start='1999-01-01' WHERE node_id=?1", [id]).unwrap();
-        let t = db.accumulate(id, "boot-a", 9_500, 4_600, 1).unwrap();
+        let t = db.accumulate(id, "boot-a", 9_500, 4_600).unwrap();
         assert_eq!((t.day_rx, t.day_tx), (1_500, 600), "a new day counts only this report's delta");
         assert_eq!(t.month_rx, 9_500, "the month is not a day");
         assert_eq!(t.total_rx, 9_500, "and the total is neither");
 
         // Then the billing period turns over, part-way through that same day.
         db.conn().execute("UPDATE traffic SET month_start='1999-01-01' WHERE node_id=?1", [id]).unwrap();
-        let t = db.accumulate(id, "boot-a", 10_000, 4_700, 1).unwrap();
+        let t = db.accumulate(id, "boot-a", 10_000, 4_700).unwrap();
         assert_eq!((t.month_rx, t.month_tx), (500, 100), "a new period counts only this report's delta");
         assert_eq!((t.day_rx, t.day_tx), (2_000, 700), "the day carries on across a billing rollover");
         assert_eq!(t.total_rx, 10_000, "lifetime total is untouched by either rollover");
@@ -1070,7 +1090,7 @@ mod tests {
     fn deleting_a_node_takes_its_data_with_it() {
         let db = db();
         let id = node(&db, 1);
-        db.accumulate(id, "b", 10, 10, 1).unwrap();
+        db.accumulate(id, "b", 10, 10).unwrap();
         db.insert_metric(id, 1, &serde_json::json!({"cpu": 1.0})).unwrap();
         db.delete_node(id).unwrap();
         assert!(db.node(id).unwrap().is_none());
@@ -1118,8 +1138,8 @@ mod tests {
     fn prune_drops_history_but_never_traffic_totals() {
         let db = db();
         let id = node(&db, 1);
-        db.accumulate(id, "b", 100, 100, 1).unwrap();
-        db.accumulate(id, "b", 900, 900, 1).unwrap();
+        db.accumulate(id, "b", 100, 100).unwrap();
+        db.accumulate(id, "b", 900, 900).unwrap();
         let old = Utc::now().timestamp() - 40 * 86_400;
         db.insert_metric(id, old, &serde_json::json!({"cpu": 1.0})).unwrap();
         db.insert_metric(id, Utc::now().timestamp(), &serde_json::json!({"cpu": 2.0})).unwrap();
@@ -1127,6 +1147,63 @@ mod tests {
         db.prune(30).unwrap();
         assert_eq!(db.metrics(id, 0, 60).unwrap().len(), 1);
         assert_eq!(db.traffic(id).total_rx, 800);
+    }
+
+    /// The rekeying in `open()`: rows have to survive it, and the chart's query
+    /// has to come out able to seek. Both halves matter -- a migration that
+    /// keeps every row on the old key is silent, and stays silent while the
+    /// query it exists for goes on reading the node's whole history to answer
+    /// for an hour of it.
+    #[test]
+    fn rekeying_ping_record_keeps_the_rows_and_lets_the_window_query_seek() {
+        let file = std::env::temp_dir().join(format!("monitor-rekey-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let path = file.to_str().unwrap();
+
+        // A database as an older hub left it.
+        let old = Connection::open(path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE ping_record (
+               node_id INTEGER NOT NULL, task_id INTEGER NOT NULL,
+               ts INTEGER NOT NULL, latency INTEGER NOT NULL,
+               PRIMARY KEY (node_id, task_id, ts)
+             ) WITHOUT ROWID;
+             INSERT INTO ping_record VALUES (1,7,100,12),(1,8,100,34),(1,7,200,56),(2,7,100,78);",
+        )
+        .unwrap();
+        drop(old);
+
+        let db = Db::open(path).unwrap();
+        let conn = db.conn();
+        let rows: Vec<(i64, i64, i64, i64)> = conn
+            .prepare("SELECT node_id, task_id, ts, latency FROM ping_record ORDER BY node_id, ts, task_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![(1, 7, 100, 12), (1, 8, 100, 34), (1, 7, 200, 56), (2, 7, 100, 78)]);
+
+        // What the rebuild was for. Without the timestamp second in the key the
+        // plan stops at `node_id=?` and scans everything under it.
+        let plan: String = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT task_id, MAX(ts), latency FROM ping_record
+                      WHERE node_id=?1 AND ts>=?2 GROUP BY task_id, ts/?3 ORDER BY ts",
+            )
+            .unwrap()
+            .query_map(params![1, 0, 60], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join(" | ");
+        assert!(plan.contains("node_id=? AND ts>?"), "the window has to be a seek, not a scan: {plan}");
+
+        // Opening again must not rebuild a table that is already right.
+        drop(conn);
+        drop(db);
+        assert!(Db::open(path).is_ok());
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]

@@ -86,6 +86,46 @@
 3. **状态页的 HTTP 接口复用已有的 2 秒快照缓存。** 这个缓存本来就在，但只有 WebSocket 那条路走它，HTTP 每次都重新渲染一遍全量 JSON。
 4. **SQLite 参数对齐 komari 的调优**：8 MiB page cache、WAL 检查点阈值和大小上限。komari 在这块的取舍是对的，直接抄了。
 
+## 6. 下一轮：一条会随时间变慢的查询
+
+上面那轮调的是并发下的常数开销。这一轮找的是另一类东西——**今天量不出来、每天都更慢一点**的。
+
+`ping_record` 的主键是 `(node_id, task_id, ts)`，而它唯一的查询是「某个节点、某个时间窗、所有探测」：
+
+```sql
+SELECT task_id, MAX(ts), latency FROM ping_record
+WHERE node_id=?1 AND ts>=?2 GROUP BY task_id, ts/?3 ORDER BY ts
+```
+
+`task_id` 卡在节点和时间戳中间，SQLite 只能定位到 `node_id`，然后把这个节点**留存期内的全部记录**扫一遍。
+换成 `(node_id, ts, task_id)` 之后同一条 SQL 变成范围 seek：
+
+```text
+(node_id, task_id, ts)   SEARCH ping_record USING PRIMARY KEY (node_id=?)
+(node_id, ts, task_id)   SEARCH ping_record USING PRIMARY KEY (node_id=? AND ts>?)
+```
+
+按默认 30 天保留期造数据（7 节点 × 4 个探测 × 60 秒 = 120 万行），同一个「1 小时延迟图」请求：
+
+| 主键顺序 | 单次耗时 |
+|---|---:|
+| `(node_id, task_id, ts)` | 41.91 ms |
+| `(node_id, ts, task_id)` | **0.82 ms** |
+
+线上那天只有 4 万行，1.4 ms，肉眼看不出来任何问题——这正是它值得单独记一笔的原因。
+而且这条路**匿名可达**，代价又落在 agent 上报用的那条唯一的写连接上，和
+[security.md](security.md) 末尾那条自查（匿名路径的开销必须有上界）是同一件事，只是维度从内存换成了 CPU。
+
+`Db::open` 里带一次性重建，靠 `sqlite_master` 里存的建表语句判断要不要做，做完不再做。
+守着它的是 `rekeying_ping_record_keeps_the_rows_and_lets_the_window_query_seek`——
+它同时断言行没丢、以及查询计划里确实出现了 `ts>?`；只查前者的话，一次什么都没换键的"迁移"也能过。
+
+顺带两处：
+
+- **上报少一次取锁。** `accumulate` 现在顺手 JOIN 出 `traffic_reset_day`，不再单独查一次 `node` 表。
+  每个节点每次上报省一次 SQL 和一次互斥锁。
+- **外部主题不再为了确认 `index.html` 存在而把它整个读出来扔掉**，改成 `is_file()`。这段在主题的每个请求上都跑。
+
 ---
 
 ## 为什么会差这么多
