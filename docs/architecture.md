@@ -117,16 +117,21 @@ IPv6-only 或者出不去的机器不用再找加速站。`--github-proxy` 是 h
 后者写 `/etc/init.d/monitor-agent`，用 `supervise-daemon` 拿到等价的自动重启。两边 token 都只在
 root-only 的 `/etc/monitor/agent.env` 里。
 
+**等价的只有自动重启。** OpenRC 那边的 agent 以 root 跑：`DynamicUser` 是 systemd 白送的降权，
+OpenRC 没有对应开关，要降权得自己建用户再指过去。agent 并不需要 root（只读 `/proc` 和 `/sys`
+里的公开文件，加出站 TCP），所以这是笔可以还的债，不是必须这样。没有顺手加 `command_user=nobody`：
+那会把 token 从 root 独占挪进一个共享身份的 `environ`，拿凭证换降权不是明确的净收益。
+
 **读取**（登录了看全部，没登录且公开页开着只看公开节点）：
 `GET /api/me`、`GET /api/nodes`、`GET /api/nodes/{id}/metrics?hours=N`、`GET /api/ws`（每 2 秒推一次快照）
+
+`hours` clamp 到 1–2160，返回的点按窗口宽度降采样到每条曲线约 720 个（`api::sample_step`）——
+屏幕上画不下更多，而这条路匿名可达，代价必须和窗口宽度脱钩。见 [security.md](security.md)。
 
 **登录**：`POST /api/auth/login`、`POST /api/auth/logout`、`GET /api/auth/github`、`GET /api/auth/github/callback`
 
 **面板**（全部要 `Admin` 提取器）：
 `POST /api/nodes`、`PUT /api/nodes/order`、`PUT|DELETE /api/nodes/{id}`、`POST /api/nodes/{id}/token`、`PUT /api/nodes/{id}/traffic`、`GET|POST /api/ping-tasks`、`DELETE /api/ping-tasks/{id}`、`GET|PUT /api/settings`、`GET /api/themes`
-
-`hours` clamp 到 1–2160，返回的点按窗口宽度降采样到每条曲线约 720 个（`api::sample_step`）——
-屏幕上画不下更多，而这条路匿名可达，代价必须和窗口宽度脱钩。见 [security.md](security.md)。
 
 其余路径按下面顺序处理：
 

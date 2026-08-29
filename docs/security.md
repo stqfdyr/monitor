@@ -107,12 +107,18 @@ if allowed.is_empty() {
 
 systemd 单元加固：`DynamicUser`、`NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome`、`PrivateTmp`、`PrivateDevices`、`RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK`、`MemoryMax=64M`。
 
+这一整行只对 systemd 成立。**OpenRC 上 agent 以 root 跑**，理由和这笔债的还法见
+[architecture.md](architecture.md)。token 的存放两边一样（root-only 的 env 文件，不进 init 脚本，不进日志）。
+
 `AF_NETLINK` 是 `getifaddrs(3)` 问内核"这台机器有哪些地址"的通道，agent 靠它上报自己的
 IPv4/IPv6。去掉它不会报错，只会让上报的地址一直是空字符串——这个坑踩过一次。
 
 ### agent 拒绝明文传输
 
 `ws_url()` 在目标不是回环地址时拒绝 `ws://`，裸主机名默认升级到 `wss://`。token 不能明文过公网。
+
+`install.sh` 对 `--server` 执行同一条规则。它拿这个地址下载的是**接下来要以 root 运行的二进制**，
+明文 HTTP 上任何一跳都能换掉它——比 token 泄露更糟。两处规则必须一起改，只改一边就是留了条明文的路。
 
 ## 公开状态页
 
@@ -180,6 +186,9 @@ journalctl -u monitor-hub -f | grep sign-in
 ## 其它
 
 - 请求体上限 64 KiB（`RequestBodyLimitLayer`）。一次上报几百字节，超过就不是正常上报
+- **WebSocket 帧上限同样是 64 KiB**（`api::MAX_FRAME`，两个 socket 都加）。上面那个是 tower layer，
+  握手之后就不管事了，默认上限是 64 MiB：一个节点自己的 token 就能买下整个额度，而它发上来的东西
+  会落库、并原样推给公开页的每一个访客。这两个数字要一起改
 - 所有 SQL 走 rusqlite 的参数绑定，没有字符串拼接
 - 探测目标必须是 `host:port` 格式，间隔 clamp 到 5–3600 秒
 - 历史查询窗口 clamp 到 1–2160 小时，且**按窗口宽度降采样**（`api::sample_step`），每条曲线约 720 点。
@@ -193,9 +202,6 @@ journalctl -u monitor-hub -f | grep sign-in
 ## 改动时的自查清单
 
 - [ ] 新增的面板接口签名里有 `_: Admin` 吗
-- **WebSocket 帧上限同样是 64 KiB**（`api::MAX_FRAME`，两个 socket 都加）。上面那个是 tower layer，
-  握手之后就不管事了，默认上限是 64 MiB：一个节点自己的 token 就能买下整个额度，而它发上来的东西
-  会落库、并原样推给公开页的每一个访客。这两个数字要一起改
 - [ ] 新增的节点字段是敏感信息吗？是就只放 `full` 分支
 - [ ] 新增的设置项是密钥吗？是就别加进 `READABLE_SETTINGS`
 - [ ] 有没有把用户可控的输入当成信任来源（尤其是 `X-Forwarded-For`）
