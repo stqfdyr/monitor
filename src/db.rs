@@ -546,50 +546,53 @@ impl Db {
 
     // ---- traffic ----
 
-    pub fn traffic(&self, node_id: i64) -> Traffic {
-        self.conn()
-            .query_row(
-                "SELECT total_rx, total_tx, month_rx, month_tx, month_start, day_rx, day_tx
-                     FROM traffic WHERE node_id=?1",
-                [node_id],
-                |r| {
-                    Ok(Traffic {
-                        total_rx: r.get(0)?,
-                        total_tx: r.get(1)?,
-                        month_rx: r.get(2)?,
-                        month_tx: r.get(3)?,
-                        month_start: r.get(4)?,
-                        day_rx: r.get(5)?,
-                        day_tx: r.get(6)?,
-                    })
-                },
-            )
-            .unwrap_or_default()
-    }
-
     /// Every node's counters in one query. The node list renders a row per node
     /// and used to fetch each one separately: on a hub with a few hundred nodes
     /// that was a few hundred round trips through the single connection, with
     /// the agents' writes queued behind them.
+    ///
+    /// The period counters are gated on the period they were written for. They
+    /// restart lazily, in `accumulate`, on the node's next report — so a node
+    /// that has been offline since before a boundary still holds the previous
+    /// period's bytes, and answering with those makes yesterday's transfer
+    /// today's and last month's usage the bar drawn against this month's quota.
+    /// The write side already knows the rule; this is the read side keeping it,
+    /// which is also why it is the only reader: a second one is a second place
+    /// for the rule to go missing from.
     pub fn all_traffic(&self) -> HashMap<i64, Traffic> {
         let conn = self.conn();
         let Ok(mut stmt) = conn.prepare_cached(
-            "SELECT node_id, total_rx, total_tx, month_rx, month_tx, month_start, day_rx, day_tx
-                 FROM traffic",
+            "SELECT t.node_id, t.total_rx, t.total_tx, t.month_rx, t.month_tx, t.month_start,
+                    t.day_rx, t.day_tx, t.day_start, n.traffic_reset_day
+                 FROM traffic t JOIN node n ON n.id = t.node_id",
         ) else {
             return HashMap::new();
         };
+        let today = Local::now().date_naive();
+        let day = today.to_string();
         let rows = stmt.query_map([], |r| {
+            // Zero rather than absent: the counter for this period really is
+            // nothing yet, and a theme drawing a meter needs a number.
+            let current = |stored: String, now: &str, rx: i64, tx: i64| {
+                if stored == now {
+                    (rx, tx)
+                } else {
+                    (0, 0)
+                }
+            };
+            let period = period_start(today, r.get(9)?).to_string();
+            let (month_rx, month_tx) = current(r.get(5)?, &period, r.get(3)?, r.get(4)?);
+            let (day_rx, day_tx) = current(r.get(8)?, &day, r.get(6)?, r.get(7)?);
             Ok((
                 r.get::<_, i64>(0)?,
                 Traffic {
                     total_rx: r.get(1)?,
                     total_tx: r.get(2)?,
-                    month_rx: r.get(3)?,
-                    month_tx: r.get(4)?,
-                    month_start: r.get(5)?,
-                    day_rx: r.get(6)?,
-                    day_tx: r.get(7)?,
+                    month_rx,
+                    month_tx,
+                    month_start: period,
+                    day_rx,
+                    day_tx,
                 },
             ))
         });
@@ -1127,7 +1130,7 @@ mod tests {
             db.accumulate(id, "boot-b", b + round, b + round).unwrap();
             db.accumulate(id, "boot-a", a + 1_000 + round, a + 1_000 + round).unwrap();
         }
-        let t = db.traffic(id);
+        let t = db.all_traffic()[&id].clone();
         assert!(t.total_rx < 10_000, "six swaps booked {} bytes, not a lifetime counter", t.total_rx);
     }
 
@@ -1189,6 +1192,34 @@ mod tests {
         assert_eq!(t.total_rx, 10_000, "lifetime total is untouched by either rollover");
     }
 
+    /// The other half of the rollover: the counters restart on the node's next
+    /// report, so a node that has not reported since before a boundary still
+    /// holds the previous period's bytes on disk. Reading those back is how
+    /// yesterday's transfer became today's figure on the status page, and how
+    /// last month's usage drew the bar against this month's quota.
+    #[test]
+    fn a_node_that_went_quiet_before_a_boundary_reads_as_zero_this_period() {
+        let db = db();
+        let id = node(&db, 1);
+        db.accumulate(id, "boot-a", 0, 0).unwrap();
+        db.accumulate(id, "boot-a", 8_000, 4_000).unwrap();
+        assert_eq!(db.all_traffic()[&id].day_rx, 8_000, "still today, so it still counts");
+
+        // The node goes offline; the day and the billing period both turn over
+        // with no report to restart the counters.
+        db.conn()
+            .execute(
+                "UPDATE traffic SET day_start='1999-01-01', month_start='1999-01-01' WHERE node_id=?1",
+                [id],
+            )
+            .unwrap();
+        let t = db.all_traffic()[&id].clone();
+        assert_eq!((t.day_rx, t.day_tx), (0, 0), "yesterday's bytes are not today's");
+        assert_eq!((t.month_rx, t.month_tx), (0, 0), "last period's bytes are not this period's");
+        assert_eq!(t.month_start, period_start(Local::now().date_naive(), 1).to_string());
+        assert_eq!((t.total_rx, t.total_tx), (8_000, 4_000), "the lifetime total never resets");
+    }
+
     #[test]
     fn period_start_handles_short_months_and_wraparound() {
         let d = |y, m, day| NaiveDate::from_ymd_opt(y, m, day).unwrap();
@@ -1214,7 +1245,7 @@ mod tests {
         db.delete_node(id).unwrap();
         assert!(db.node(id).unwrap().is_none());
         assert_eq!(db.metrics(id, 0, 60).unwrap().len(), 0);
-        assert_eq!(db.traffic(id).total_rx, 0);
+        assert!(!db.all_traffic().contains_key(&id));
     }
 
     #[test]
@@ -1265,7 +1296,7 @@ mod tests {
 
         db.prune(30).unwrap();
         assert_eq!(db.metrics(id, 0, 60).unwrap().len(), 1);
-        assert_eq!(db.traffic(id).total_rx, 800);
+        assert_eq!(db.all_traffic()[&id].total_rx, 800);
     }
 
     /// The rekeying in `open()`: rows have to survive it, and the chart's query

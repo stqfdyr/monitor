@@ -65,7 +65,7 @@ rx 和 tx 各判各的，一个方向变小不影响另一个方向的增量。
 测试：`a_shrinking_reading_re_aligns_instead_of_re_counting_history`、
 `two_machines_sharing_one_token_cannot_inflate_the_total`。
 
-## 三个必须守住的不变量
+## 五个必须守住的不变量
 
 ### 1. 没有基线的读数只建立基线，不计流量
 
@@ -101,17 +101,34 @@ if month_start != period {
 // total_rx 不受影响
 ```
 
-测试：`month_counter_restarts_but_total_keeps_climbing`。
+测试：`day_and_month_restart_independently_while_the_total_keeps_climbing`。
 
 ### 4. 今日计数器同理，但按本地时区跨天
 
 `day_rx` / `day_tx` 和月度计数器结构一样，只是比较的是日期：`day_start != 今天` 就从这次上报的增量重新开始。
 
-跨天用的是 **hub 所在机器的本地时区**，不是 UTC——"今天"是给人看的词，UTC+8 的用户在早上八点看到计数归零会莫名其妙。月度周期仍然走 UTC，改它会让所有节点的 `month_start` 变一次，白白触发一轮月度重置。
+**两条边界都走 hub 所在机器的本地时区**，不是 UTC。重置日和"今天"都是人说的日期，得跟人在同一个时区。
+原来月边界读 `Utc::now()`、日边界读 `Local::now()`，同一行上的两个计数器对"今天几号"给出不同答案：
+CST 的 hub 上，商家月度重置实际发生在重置日当天 08:00，而"今日流量"在 00:00 就翻了。
 
 历史明细里没有累计量，所以这个计数器上线当天只能从上线那一刻开始算，补不出当天早些时候的量。
 
-测试：`day_counter_restarts_at_midnight_without_touching_the_others`。
+测试：同上——日和月是同一条结构，一个测试把两条边界连着跨一遍。
+
+### 5. 读取侧和写入侧守同一条口径
+
+周期计数器是**惰性重置**的——只有节点下一次上报时 `accumulate()` 才会发现跨了边界。所以一个在边界之前
+就掉线的节点，磁盘上留着的是**上一个周期**的字节数。原样读出来，就是拿昨天的流量当今天的、拿上个月的
+用量去画这个月配额的进度条。
+
+`db::all_traffic()` 因此在读的时候再判一次周期：`day_start` 不是今天、`month_start` 不是本节点当前的
+`period_start()`，这两个计数器就答 0，`total_rx/total_tx` 一如既往不受影响。**这是全项目唯一的读取入口**——
+`db::traffic()` 曾经是第二个，只有测试在用，删掉了：规则有两个落脚点就有两个漏掉它的地方。
+
+这条不能放到前端做。第三方主题得跟着重新实现一遍 `period_start()`（还要拿到节点的重置日），
+少实现一次就又是一个显示错数字的主题。
+
+测试：`a_node_that_went_quiet_before_a_boundary_reads_as_zero_this_period`。
 
 ## 月度周期
 
@@ -156,7 +173,7 @@ agent 掉线期间产生的流量，重连后会被补上。因为读的是内�
 
 ## 怎么验证
 
-单元测试覆盖了逻辑（`src/db.rs` 的 `tests` 模块，7 个）。要验真机行为：
+单元测试覆盖了逻辑（`src/db.rs` 的 `tests` 模块）。要验真机行为：
 
 ```bash
 # 记下当前累计值
