@@ -220,10 +220,28 @@ pub struct PingTask {
     pub nodes: Vec<i64>,
 }
 
+/// Takes the database away from everyone but its owner.
+///
+/// This file is the credential store: node tokens are in it in the clear, next
+/// to the GitHub client secret and the password hash. SQLite creates it with
+/// whatever the umask allows, which on a default 022 is world-readable, and the
+/// WAL and shared-memory files beside it hold the same rows.
+///
+/// Best effort on purpose: a database on a filesystem with no Unix modes still
+/// works, and refusing to start over it would be worse than the exposure.
+fn restrict(path: &str) {
+    #[cfg(unix)]
+    for file in [path.to_owned(), format!("{path}-wal"), format!("{path}-shm")] {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
 impl Db {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
+        restrict(path);
         // SQLite has no ADD COLUMN IF NOT EXISTS, and an existing column is
         // exactly the case where this migration has nothing left to do.
         for column in [

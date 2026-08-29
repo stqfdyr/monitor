@@ -94,8 +94,12 @@ if allowed.is_empty() {
 - 无效/缺失一律返回 401，不区分"格式不对"和"不存在"
 
 **明文存储意味着数据库本身就是凭证。** 拿到 `monitor.db` 的人可以冒充任何节点上报假数据。但同一个
-文件里已经有 session、GitHub client secret 和管理员密码哈希，它本来就必须当作机密对待——备份要加密，
-文件权限要收紧。管理员密码和 session 不受影响，仍然分别是 argon2id 和 sha256。
+文件里已经有 session、GitHub client secret 和管理员密码哈希，它本来就必须当作机密对待——备份要加密。
+管理员密码和 session 不受影响，仍然分别是 argon2id 和 sha256。
+
+文件权限由 `Db::open` 自己收到 `0600`，`-wal` 和 `-shm` 一起——那两个文件装着同样的行。SQLite 建库
+时只认 umask，默认的 022 给出的是**所有人可读**，光靠目录权限挡是把凭证押在一层上。改成 best effort：
+没有 Unix 权限位的文件系统上照常启动，因为在那里拒绝启动比暴露更糟。
 
 ### agent 侧
 
