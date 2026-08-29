@@ -107,7 +107,11 @@ fn external_theme(themes: &Path, short: &str) -> Option<PathBuf> {
         return None;
     }
     let dist = root.join("dist").canonicalize().ok()?;
-    if !dist.starts_with(&root) || !dist.is_dir() || read_inside(&dist, "index.html").is_none() {
+    // Only that the entry point exists, not what is in it: this runs on every
+    // request the theme serves, and reading a whole index.html to throw it away
+    // was the largest thing on that path. A symlinked one still gets read
+    // through `read_inside`, which is where escaping the directory is refused.
+    if !dist.starts_with(&root) || !dist.is_dir() || !dist.join("index.html").is_file() {
         return None;
     }
     Some(dist)
