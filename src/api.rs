@@ -164,7 +164,15 @@ pub async fn metrics(
     // request. Only the names: targets and assignments stay behind `Admin`.
     let probes = app.db.ping_task_names().unwrap_or_else(|_| json!({}));
     let step = sample_step(hours, w.points);
-    match (app.db.metrics(id, since, step), app.db.ping_records(id, since, step)) {
+    // The probe series gets a budget of its own, and a smaller one. It is drawn
+    // as a median with the range its answers spanned around it, and a bucket
+    // holding two samples has no middle and a band two readings wide -- at a
+    // day's width that came out as a scribble with no envelope you could see.
+    // Smokeping's daily graph is the shape this lands on: five-minute buckets,
+    // 288 of them. An hour and six hours still come back one sample a bucket,
+    // which is every ping there is and needs no band at all.
+    let probe_step = sample_step(hours, Some(w.points.map_or(PROBE_POINTS, |p| p.min(PROBE_POINTS))));
+    match (app.db.metrics(id, since, step), app.db.ping_records(id, since, probe_step)) {
         (Ok(m), Ok(p)) => Json(json!({"metrics": m, "ping": p, "probes": probes})).into_response(),
         (Err(e), _) | (_, Err(e)) => fail(e),
     }
@@ -187,6 +195,12 @@ pub async fn metrics(
 // ponytail: the budget is per series, so a response is SAMPLES × (1 + probes) --
 // bounded by how many probes the admin created, not by the caller. Four probes
 // is ~250 KB; if that list ever grows long, scale SAMPLES by the probe count.
+/// Points a probe line is drawn from, whatever the screen. Unlike the metric
+/// budget this is not a pixel count: it is how coarse a bucket has to be for
+/// its median and its spread to describe anything, and that does not change
+/// when the window is narrower.
+const PROBE_POINTS: i64 = 250;
+
 fn sample_step(hours: i64, points: Option<i64>) -> i64 {
     const SAMPLES: i64 = 720;
     let budget = points.unwrap_or(SAMPLES).clamp(60, SAMPLES);
@@ -606,6 +620,18 @@ mod tests {
         assert!(sample_step(24, Some(390)) > sample_step(24, None));
         assert_eq!(sample_step(24, Some(100_000)), sample_step(24, None));
         assert_eq!(sample_step(24, Some(0)), sample_step(24, Some(60)));
+
+        // The probe budget is a statistic, not a pixel count: a day's bucket
+        // has to hold several answers for a median and a spread to describe
+        // anything, and a wide screen does not change that. An hour still
+        // comes back one sample a bucket, which is every ping there is.
+        let probes = |hours, points: Option<i64>| {
+            sample_step(hours, Some(points.map_or(PROBE_POINTS, |p: i64| p.min(PROBE_POINTS))))
+        };
+        assert_eq!(probes(24, Some(1_280)), 300, "a day of probes buckets by five minutes");
+        assert_eq!(probes(24, Some(1_280)), probes(24, Some(390)), "the phone gets the same buckets");
+        assert_eq!(probes(1, Some(1_280)), 60, "an hour is every sample, and needs no band");
+        assert!(probes(24, None) >= sample_step(24, None), "probes are never finer than metrics");
     }
 
     /// What a thinned bucket is allowed to answer with. Keeping one row of it
@@ -644,10 +670,12 @@ mod tests {
         let probe = |task: i64| {
             rows.iter().find(|r| r["task_id"] == task).unwrap_or_else(|| panic!("no probe {task}"))
         };
-        assert_eq!(probe(1)["latency"], 30, "the mean of what answered, not of the timeouts");
+        assert_eq!(probe(1)["latency"], 30, "the median of what answered, not of the timeouts");
         assert_eq!(probe(1)["loss"], 75);
         assert_eq!(probe(2)["latency"], json!(null), "a bucket that was all timeout has no latency");
         assert_eq!(probe(2)["loss"], 100);
+        // One answer, so there is nothing for a band to span.
+        assert!(probe(1).get("band").is_none(), "{:?}", probe(1));
         // A clean bucket carries no loss key at all: it is per row, per probe,
         // on a response that is already a quarter of a megabyte. Which is
         // exactly why the percentage rounds up -- the absence of the key is
@@ -666,6 +694,17 @@ mod tests {
         assert_eq!(rows.len(), 1, "the fixture has to be one bucket for this to mean anything");
         let row = &rows[0];
         assert_eq!(row["loss"], 1, "a bucket that lost one of 180 has not lost none");
+
+        // What the band is for: the middle reading, and the two ends the bucket
+        // actually reached. Drawing 20 here and nothing else is a link that
+        // swung 40 ms inside two minutes rendered as a flat point.
+        let jitter = node(&app, "jitter", true);
+        for (i, latency) in [10, 20, 50, 20, 20].into_iter().enumerate() {
+            app.db.insert_ping(jitter, 1, wide_base + i as i64, latency).unwrap();
+        }
+        let row = &app.db.ping_records(jitter, wide_base, 180).unwrap()[0];
+        assert_eq!(row["latency"], 20, "the middle answer, not the mean of 24");
+        assert_eq!(row["band"], json!([10, 50]));
     }
 
     #[test]

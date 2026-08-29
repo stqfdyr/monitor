@@ -318,13 +318,32 @@ fn restrict(path: &str) {
     }
 }
 
-/// The chart's probe query. Named because the query plan is asserted on it in
+/// The chart's probe query: per bucket, the median round trip, the range it
+/// moved through, and how much of it was lost.
+///
+/// The median rather than the mean, the way Smokeping draws it -- one SYN
+/// retransmit is tens of milliseconds and drags a mean, and it is the reading
+/// that is wrong rather than the link. It comes out of a window function
+/// because SQLite has no `median()`: rank each bucket's answers by latency and
+/// average the middle one, or the middle two when there is an even number.
+/// Ranking successes and timeouts in separate partitions is what keeps -1 out
+/// of the ordering without a second pass over the table.
+///
+/// Named because the query plan is asserted on it in
 /// `rekeying_ping_record_keeps_the_rows_and_lets_the_window_query_seek`, and a
 /// second copy over there is a copy that stops matching what actually runs.
-const PING_WINDOW: &str = "SELECT task_id, (MIN(ts)/?3)*?3,
-            CAST(AVG(CASE WHEN latency>=0 THEN latency END) AS INTEGER),
+const PING_WINDOW: &str = "WITH s AS (
+       SELECT task_id, ts/?3 AS b, latency,
+              ROW_NUMBER() OVER (PARTITION BY task_id, ts/?3, latency>=0 ORDER BY latency) AS r,
+              COUNT(*)     OVER (PARTITION BY task_id, ts/?3, latency>=0)                  AS n
+       FROM ping_record WHERE node_id=?1 AND ts>=?2
+     )
+     SELECT task_id, b*?3,
+            CAST(AVG(CASE WHEN latency>=0 AND r IN ((n+1)/2, (n+2)/2) THEN latency END) AS INTEGER),
+            MIN(CASE WHEN latency>=0 THEN latency END),
+            MAX(CASE WHEN latency>=0 THEN latency END),
             (100*SUM(latency<0) + COUNT(*) - 1)/COUNT(*)
-     FROM ping_record WHERE node_id=?1 AND ts>=?2 GROUP BY task_id, ts/?3 ORDER BY ts";
+     FROM s GROUP BY task_id, b ORDER BY b";
 
 impl Db {
     pub fn open(path: &str) -> Result<Self> {
@@ -889,7 +908,7 @@ impl Db {
     /// `metrics` above -- and this is the larger half of that response, because
     /// a probe reports far more often than once a minute.
     ///
-    /// A timeout is stored as -1, so it has to be kept out of the mean and
+    /// A timeout is stored as -1, so it has to be kept out of the median and
     /// counted instead. Keeping the newest row of the bucket was worse than
     /// coarse: on cc's 移动v4 it dropped 389 of the 788 timeouts in a day and
     /// then drew the survivors as an unbroken line, which is a probe losing
@@ -913,7 +932,15 @@ impl Db {
                 "task_id": r.get::<_, i64>(0)?, "ts": r.get::<_, i64>(1)?,
                 "latency": r.get::<_, Option<i64>>(2)?
             });
-            if let loss @ 1.. = r.get::<_, i64>(3)? {
+            // Only when the bucket actually moved. Every bucket holds one
+            // sample at the hour and six-hour windows, where a band would be a
+            // zero-height ribbon under every line and pure payload.
+            if let (Some(lo), Some(hi)) = (r.get::<_, Option<i64>>(3)?, r.get::<_, Option<i64>>(4)?) {
+                if hi > lo {
+                    row["band"] = serde_json::json!([lo, hi]);
+                }
+            }
+            if let loss @ 1.. = r.get::<_, i64>(5)? {
                 row["loss"] = loss.into();
             }
             Ok(row)
