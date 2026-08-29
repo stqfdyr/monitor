@@ -30,16 +30,15 @@ agent (Linux)  ──WebSocket / JSON-RPC 2.0──▶  hub (axum + SQLite)  ─
 
 ## 构建
 
-需要 Rust stable 与 Node.js。
+需要 Rust stable 与 Node.js（Node 只用于构建后台）。
 
 ```bash
 cd web-admin && npm ci && npm run build && cd ..
-git clone https://github.com/stqfdyr/monitor-theme-default web-theme
-cd web-theme && npm ci && npm run build && cd ..
 cargo build --release
 ```
 
-后台与默认主题在编译期嵌入二进制。
+后台与默认主题在编译期嵌入二进制。默认主题不需要 clone：`cargo build` 按 `web-theme.pin`
+里的 `<tag> <sha256>` 下载主题仓库发布的 `theme.tar.gz`，校验后解到 `target/theme/`。
 
 ## 运行
 
