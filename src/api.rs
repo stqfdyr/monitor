@@ -11,7 +11,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::agent_ws::Live;
+use crate::agent_ws::Agent;
 use crate::auth::{authed, hash_password, issue_session, random_token, with_cookies};
 use crate::db::{Node, PingTask, Traffic};
 use crate::{agent_ws, App, Shared};
@@ -44,7 +44,7 @@ fn bad(message: &str) -> Response {
 
 /// One node as the UI consumes it: stored config, live metrics and the hub's
 /// accumulated traffic in a single object.
-fn node_view(node: &Node, current: Option<&Live>, traffic: &Traffic, full: bool) -> Value {
+fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool) -> Value {
     let mut view = json!({
         "id": node.id,
         "name": node.name,
@@ -53,8 +53,10 @@ fn node_view(node: &Node, current: Option<&Live>, traffic: &Traffic, full: bool)
         "online": current.is_some(),
         // The live entry while it is connected, the stored one after it goes:
         // "offline" is worth much more with a "since when" attached.
-        "last_seen": current.map(|l| l.last_seen).unwrap_or(node.last_seen),
-        "metrics": current.map(|l| l.metrics.clone()).unwrap_or(Value::Null),
+        // Zero means connected but not yet reporting, which is not a time:
+        // fall back to the stored one so "offline since" survives the gap.
+        "last_seen": current.map(|a| a.last_seen).filter(|t| *t > 0).unwrap_or(node.last_seen),
+        "metrics": current.map(|a| a.metrics.clone()).unwrap_or(Value::Null),
         "os": node.os,
         "kernel": node.kernel,
         "arch": node.arch,
@@ -111,12 +113,12 @@ fn visible_nodes(app: &App, full: bool) -> Result<Vec<Value>, anyhow::Error> {
     // node: this list is what every visitor to the public page loads.
     let nodes = app.db.nodes()?;
     let traffic = app.db.all_traffic();
-    let live = app.live.read().unwrap_or_else(|e| e.into_inner());
+    let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
     let none = Traffic::default();
     Ok(nodes
         .iter()
         .filter(|n| full || n.public)
-        .map(|n| node_view(n, live.get(&n.id), traffic.get(&n.id).unwrap_or(&none), full))
+        .map(|n| node_view(n, agents.get(&n.id), traffic.get(&n.id).unwrap_or(&none), full))
         .collect())
 }
 
@@ -369,8 +371,7 @@ pub async fn reset_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     // Dropping the sender ends the agent's loop; it reconnects and is refused.
     // The live entry goes with it: that loop no longer owns it, so its own
     // teardown will leave it alone.
-    app.agents.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-    app.live.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
     // The token is part of the admin frame, so the panel would otherwise keep
     // showing an install command for the credential just retired.
     invalidate_snapshot(&app);
@@ -519,6 +520,18 @@ mod tests {
         App::for_test(Db::open(":memory:").unwrap())
     }
 
+    /// A connected agent holding one report, as `App.agents` carries it. The
+    /// receiver comes back because dropping it closes the channel, which is
+    /// itself the signal `reset_token` is tested for.
+    fn connect(app: &App, id: i64, metrics: Value) -> tokio::sync::mpsc::Receiver<String> {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut agent = crate::agent_ws::Agent::new(7, tx);
+        agent.metrics = metrics;
+        agent.last_seen = Utc::now().timestamp();
+        app.agents.write().unwrap().insert(id, agent);
+        rx
+    }
+
     fn node(app: &App, name: &str, public: bool) -> i64 {
         app.db
             .create_node(
@@ -583,13 +596,7 @@ mod tests {
         app.db.save_facts(open, &json!({"hostname": "vps-1"}), "198.51.100.9").unwrap();
 
         // A live report, so the public view has metrics to strip.
-        app.live.write().unwrap().insert(
-            open,
-            crate::agent_ws::Live {
-                metrics: json!({"boot_id": "abc", "net_rx_total": 134_000_000_000i64, "cpu": 1.0}),
-                ..Default::default()
-            },
-        );
+        let _held = connect(&app, open, json!({"boot_id": "abc", "net_rx_total": 134_000_000_000i64, "cpu": 1.0}));
 
         let public = visible_nodes(&app, false).unwrap();
         assert_eq!(public.len(), 1, "a node marked private must not be listed");
@@ -619,9 +626,7 @@ mod tests {
     async fn rotating_a_token_closes_the_session_the_old_one_opened() {
         let app = std::sync::Arc::new(app());
         let id = node(&app, "n", true);
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        app.agents.lock().unwrap().insert(id, (7, tx));
-        app.live.write().unwrap().insert(id, crate::agent_ws::Live::default());
+        let mut rx = connect(&app, id, Value::Null);
 
         let response = reset_token(Admin, axum::extract::State(app.clone()), Path(id)).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -633,8 +638,7 @@ mod tests {
             matches!(rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)),
             "the old agent's channel must be closed"
         );
-        assert!(app.agents.lock().unwrap().is_empty());
-        assert!(app.live.read().unwrap().is_empty(), "the node must read as offline at once");
+        assert!(app.agents.read().unwrap().is_empty(), "the node must read as offline at once");
     }
 
     #[test]

@@ -23,21 +23,19 @@ use axum::routing::{delete, get, post, put};
 use axum::Router;
 use chrono::{Months, NaiveDate, Utc};
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use agent_ws::Live;
+use agent_ws::Agent;
 use db::Db;
 
 pub type Shared = Arc<App>;
 
 pub struct App {
     pub db: Db,
-    /// Current state per node, refreshed on every agent report.
-    pub live: RwLock<HashMap<i64, Live>>,
-    /// Outbound channel per connected agent, used to push probe assignments,
-    /// tagged with the session that opened it. See `agent_ws::serve`.
-    pub agents: Mutex<HashMap<i64, (u64, mpsc::Sender<String>)>>,
+    /// Every connected agent: its outbound channel, the session that opened it
+    /// and its latest report. One map, because being connected and having
+    /// current figures are one fact about a node, not two. See `agent_ws`.
+    pub agents: RwLock<HashMap<i64, Agent>>,
     /// Last rendered node list per audience, `[public, admin]`, with the
     /// millisecond it was built. Shared by every browser stream so viewers do
     /// not multiply the query load. See `api::live_snapshot`.
@@ -54,8 +52,7 @@ impl App {
     fn new(db: Db, site: String, themes: PathBuf) -> Self {
         Self {
             db,
-            live: RwLock::default(),
-            agents: Mutex::default(),
+            agents: RwLock::default(),
             snapshot: Mutex::new([(0, Default::default()), (0, Default::default())]),
             throttle: auth::Throttle::default(),
             http: reqwest::Client::builder()
@@ -314,7 +311,7 @@ fn renewed(expires: NaiveDate, cycle: &str, today: NaiveDate) -> Option<NaiveDat
 
 fn renew_online_nodes(app: &App) -> Result<()> {
     let today = Utc::now().date_naive();
-    let online: Vec<i64> = app.live.read().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
+    let online: Vec<i64> = app.agents.read().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
     for node in app.db.nodes()? {
         if !online.contains(&node.id) {
             continue;

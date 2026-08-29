@@ -15,9 +15,11 @@
 |---|---|
 | **monitor**（本仓库） | hub + 内置后台 + `install.sh` |
 | **[agent](https://github.com/stqfdyr/agent)** | Linux agent。发布自己的 musl 二进制，`install.sh` 从那边的 release 拉 |
-| **[monitor-theme-default](https://github.com/stqfdyr/monitor-theme-default)** | 默认公开页主题；hub release 构建时 clone、构建并嵌入 |
+| **[monitor-theme-default](https://github.com/stqfdyr/monitor-theme-default)** | 默认公开页主题；hub 构建时按 `web-theme.version` 里的 tag clone、构建并嵌入 |
 
 agent 拆开是因为部署机器和发布节奏不同。默认主题拆开是为了让主题拥有独立契约、版本和开发流程；代价是 hub 的 release 构建多一个 clone 步骤。
+
+**嵌哪一版由 `web-theme.version` 决定**，CI 和 release 读同一个文件。不钉版本的话「独立版本」只是句话——同一个 hub tag 重新构建会嵌进不同的前端。
 
 后台不属于主题。`/admin/*` 和登录页始终由 hub 内置的 `web-admin` 提供；主题只负责公开状态页。这样第三方主题不需要重做节点 CRUD、OAuth 和密码设置。
 
@@ -72,14 +74,15 @@ agent 收到后会**保留没变化的任务**（同 id + 同 target + 同 inter
 
 ## 数据模型
 
-八张表，`src/db.rs` 顶部的 `SCHEMA` 常量是权威定义。
+八张表，`src/db.rs` 顶部的 `SCHEMA` 常量是权威定义。库的版本记在 SQLite 自带的
+`PRAGMA user_version` 里，当前是 `SCHEMA_VERSION`；迁移只在版本落后时跑一次，见 `db::migrate_to_1`。
 
 | 表 | 作用 | 注意 |
 |---|---|---|
 | `setting` | key/value 配置 | 替代配置文件。见下方设置键列表 |
 | `node` | 节点配置 + agent 上报的静态信息 | `token` 存明文，面板要能重新显示安装命令；只在 `full` 视图输出 |
 | `traffic` | **单调递增的流量累计** | 1:1 于 node，但生命周期完全不同（每次上报都写） |
-| `metric` | 历史明细，**每节点每分钟一行** | `WITHOUT ROWID`，按保留天数定期删。`net_rx/net_tx` 是这一分钟的**平均**速率，从累计器的差值算出，不是某一秒的读数——见 [decisions.md](decisions.md) |
+| `metric` | 历史明细，**每节点每分钟一行** | `WITHOUT ROWID`，按保留天数定期删。**一行描述它前面那一分钟，不是它那一瞬**：`net_rx/net_tx` 从累计器差值算出，`cpu`/`mem_used`/`disk_used`/`swap_used`/`tcp`/`udp`/`procs` 是分钟内均值。见 [decisions.md](decisions.md) |
 | `ping_task` / `ping_node` | 探测任务及其节点分配 | 多对多 |
 | `ping_record` | 探测结果 | 同样按保留天数删。主键是 `(node_id, ts, task_id)`——顺序跟着查询走，见 [benchmark.md](benchmark.md#6-下一轮一条会随时间变慢的查询) |
 | `session` | 登录会话 | 存 sha256，14 天过期 |
@@ -145,9 +148,18 @@ OpenRC 没有对应开关，要降权得自己建用户再指过去。agent 并�
 
 ## 实时状态放在内存里
 
-`App.live: RwLock<HashMap<i64, Live>>` 存每个节点的当前指标。hub 重启后会在一个上报周期内重建，所以不落盘。
+`App.agents: RwLock<HashMap<i64, Agent>>` 存每条 agent 连接：出站通道、会话号、最新一次上报。
+hub 重启后会在一个上报周期内重建，所以不落盘。
 
-**在线判定就是 WebSocket 连着**（`App.agents` 里有没有这个 node_id）。断开时同时从 `live` 和 `agents` 里删掉。
+**在线判定就是 WebSocket 连着**——`App.agents` 里有没有这个 node_id。握手时写入，断开时删掉，
+一张表一个真相。
+
+原来是两张：连接进 `agents`、指标进 `live`，靠每个改动点手工同步。它们已经不一致过——连接在握手时
+入表，指标在**首次上报**时才入表，而在线判定读的是 `live`，所以刚连上的节点会离线整整一个
+`--interval`（最长 1 小时）。合成一张表以后这类不同步没有地方可以发生。
+
+刚连上还没上报的节点是 `online: true` + `metrics: null`，主题和面板本来就要处理这个组合
+（离线节点也是 `metrics: null`）。
 
 连着不等于活着：机器掉进网络黑洞、内核卡死、NAT 表项超时，TCP 连接会停在半开状态，`recv()`
 永远不返回，节点就一直是"在线"配一份冻在死亡瞬间的指标——直到内核几小时后放弃这条连接。
@@ -158,5 +170,8 @@ OpenRC 没有对应开关，要降权得自己建用户再指过去。agent 并�
 
 源码里用 `ponytail:` 注释标出来了：
 
-- `src/db.rs` — 单个 SQLite 写连接加互斥锁。几十个节点每 2 秒上报完全够用；真堵了再拆读连接池
+- `src/db.rs` — 单个 SQLite 写连接加互斥锁。几十个节点每 2 秒上报完全够用；真堵了再拆读连接池。
+  **触发条件是可测的**：匿名可达的 `/api/nodes/{id}/metrics` 实测 24 小时窗口占锁 64 ms，这段时间
+  agent 上报排队。面板真的开始堵上报时再拆——WAL 下加一条 `SQLITE_OPEN_READ_ONLY` 连接就够，
+  但那会给 `:memory:` 的测试留一条和生产不同的路，现在这个规模不值得
 - `src/api.rs` — 浏览器实时推送是每个连接自己跑 2 秒定时器，不是广播 fan-out。定时器背后的快照是共享的（`live_snapshot`，公开/后台各一份，缓存 1.9 秒），所以多开几个标签页只多几次 socket 写，不会把查询量乘上观众数

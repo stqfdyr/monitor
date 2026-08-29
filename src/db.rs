@@ -115,6 +115,77 @@ CREATE TABLE IF NOT EXISTS session (
 );
 "#;
 
+/// Schema revision this build expects, stamped into `PRAGMA user_version`.
+/// Bump it and add a `migrate_to_N` when the schema changes under a database
+/// that is already in service.
+const SCHEMA_VERSION: i64 = 1;
+
+/// Adds a column that older databases lack.
+///
+/// A column already present is the one failure this is allowed to shrug at —
+/// it is what "the migration has nothing left to do" looks like. Everything
+/// else is real, and the `let _ =` this replaces hid a full disk and a corrupt
+/// page just as quietly as it hid a second run.
+fn add_column(conn: &Connection, table: &str, column: &str) -> Result<()> {
+    match conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column}"), []) {
+        Ok(_) => Ok(()),
+        Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// True when `table`'s stored DDL contains `needle` — how a migration asks
+/// what shape the database it inherited is actually in.
+fn schema_mentions(conn: &Connection, table: &str, needle: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name=?1 AND sql LIKE ?2",
+        params![table, format!("%{needle}%")],
+        |r| r.get::<_, i64>(0),
+    )? > 0)
+}
+
+/// Everything that had accumulated before there was a version to record it
+/// under. Runs once, on a database that predates the stamp.
+fn migrate_to_1(conn: &Connection) -> Result<()> {
+    for column in ["day_rx INTEGER NOT NULL DEFAULT 0", "day_tx INTEGER NOT NULL DEFAULT 0", "day_start TEXT NOT NULL DEFAULT ''"] {
+        add_column(conn, "traffic", column)?;
+    }
+    for column in ["ipv4 TEXT NOT NULL DEFAULT ''", "ipv6 TEXT NOT NULL DEFAULT ''", "last_seen INTEGER NOT NULL DEFAULT 0"] {
+        add_column(conn, "node", column)?;
+    }
+    // The column used to hold a sha256 of the token. It holds the token itself
+    // now, so the panel can show an install command without minting a new one
+    // to do it. Databases from before the change keep their old digests, which
+    // no agent can present: those nodes need a new token issued from the panel
+    // and their agent reinstalled, once.
+    if schema_mentions(conn, "node", "token_hash")? {
+        conn.execute("ALTER TABLE node RENAME COLUMN token_hash TO token", [])?;
+        info!("renamed node.token_hash to node.token; existing nodes need a fresh token");
+    }
+    // A key can only be reordered by rebuilding the table, and CREATE TABLE IF
+    // NOT EXISTS leaves an existing one exactly as it was. The old order put
+    // task_id between the node and the timestamp, so a chart request -- which
+    // needs no credentials, and holds the connection the agents report through
+    // -- read every probe result the node had ever kept to answer for one hour
+    // of it: 0.8 ms against 42 ms at a month of retention.
+    if schema_mentions(conn, "ping_record", "(node_id, task_id, ts)")? {
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE ping_record_rekeyed (
+               node_id INTEGER NOT NULL, task_id INTEGER NOT NULL,
+               ts INTEGER NOT NULL, latency INTEGER NOT NULL,
+               PRIMARY KEY (node_id, ts, task_id)
+             ) WITHOUT ROWID;
+             INSERT INTO ping_record_rekeyed SELECT * FROM ping_record;
+             DROP TABLE ping_record;
+             ALTER TABLE ping_record_rekeyed RENAME TO ping_record;
+             COMMIT;",
+        )?;
+        info!("rebuilt ping_record on a key the latency chart can seek");
+    }
+    Ok(())
+}
+
 /// One node's stored configuration and last known facts.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct Node {
@@ -242,57 +313,25 @@ fn restrict(path: &str) {
 impl Db {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
-        conn.execute_batch(SCHEMA)?;
-        restrict(path);
-        // SQLite has no ADD COLUMN IF NOT EXISTS, and an existing column is
-        // exactly the case where this migration has nothing left to do.
-        for column in [
-            "day_rx INTEGER NOT NULL DEFAULT 0",
-            "day_tx INTEGER NOT NULL DEFAULT 0",
-            "day_start TEXT NOT NULL DEFAULT ''",
-        ] {
-            let _ = conn.execute(&format!("ALTER TABLE traffic ADD COLUMN {column}"), []);
-        }
-        for column in [
-            "ipv4 TEXT NOT NULL DEFAULT ''",
-            "ipv6 TEXT NOT NULL DEFAULT ''",
-            "last_seen INTEGER NOT NULL DEFAULT 0",
-        ] {
-            let _ = conn.execute(&format!("ALTER TABLE node ADD COLUMN {column}"), []);
-        }
-        // The column used to hold a sha256 of the token. It holds the token
-        // itself now, so the panel can show an install command without minting
-        // a new one to do it. Databases from before the change keep their old
-        // digests, which no agent can present: those nodes need a new token
-        // issued from the panel and their agent reinstalled, once.
-        let _ = conn.execute("ALTER TABLE node RENAME COLUMN token_hash TO token", []);
-        // A key can only be reordered by rebuilding the table, and CREATE TABLE
-        // IF NOT EXISTS leaves an existing one exactly as it was. The old order
-        // put task_id between the node and the timestamp, so a chart request --
-        // which needs no credentials, and holds the connection the agents report
-        // through -- read every probe result the node had ever kept to answer
-        // for one hour of it: 0.8 ms against 42 ms at a month of retention.
-        let stale: bool = conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master
-             WHERE name='ping_record' AND sql LIKE '%(node_id, task_id, ts)%'",
+        // Asked before CREATE TABLE runs: a file with no tables is a database
+        // that has never existed, and it gets today's schema outright rather
+        // than the history of how the schema arrived at it.
+        let fresh = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
             [],
             |r| r.get::<_, i64>(0),
-        )? > 0;
-        if stale {
-            conn.execute_batch(
-                "BEGIN;
-                 CREATE TABLE ping_record_rekeyed (
-                   node_id INTEGER NOT NULL, task_id INTEGER NOT NULL,
-                   ts INTEGER NOT NULL, latency INTEGER NOT NULL,
-                   PRIMARY KEY (node_id, ts, task_id)
-                 ) WITHOUT ROWID;
-                 INSERT INTO ping_record_rekeyed SELECT * FROM ping_record;
-                 DROP TABLE ping_record;
-                 ALTER TABLE ping_record_rekeyed RENAME TO ping_record;
-                 COMMIT;",
-            )?;
-            info!("rebuilt ping_record on a key the latency chart can seek");
+        )? == 0;
+        conn.execute_batch(SCHEMA)?;
+        restrict(path);
+
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if !fresh && version < 1 {
+            migrate_to_1(&conn)?;
         }
+        // Stamped once the database matches this build. Before there was a
+        // version every migration below re-ran on every start, and each one
+        // decided for itself whether it had already happened.
+        conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(Self(Mutex::new(conn)))
     }
 

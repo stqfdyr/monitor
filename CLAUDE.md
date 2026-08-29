@@ -31,7 +31,7 @@ agent 在 [独立仓库](https://github.com/stqfdyr/agent)。后台在 `web-admi
 cargo test
 cargo clippy --all-targets
 cd web-admin && npm run build
-cd web-theme && npm run build      # 先 clone monitor-theme-default 到这里
+cd web-theme && npm run build      # 先按 web-theme.version 里的 tag clone monitor-theme-default 到这里
 cargo run -- --listen 127.0.0.1:9911 --db /tmp/dev.db --themes /tmp/themes --site http://127.0.0.1:9911
 ```
 

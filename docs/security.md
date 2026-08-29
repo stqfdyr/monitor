@@ -88,7 +88,7 @@ if allowed.is_empty() {
   JSON 里没有这个 key。有测试守着（`the_public_view_hides_private_nodes_and_sensitive_fields`
   里断言整个公开 payload 的字符串不含任何节点的 token）
 - 可以重新生成（`POST /api/nodes/{id}/token`），旧的立刻失效——包括**已经连上的那条连接**：
-  token 只在 WebSocket 握手时校验，所以换发时 hub 会从 `App.agents` 和 `live` 里删掉这个节点，
+  token 只在 WebSocket 握手时校验，所以换发时 hub 会把这个节点从 `App.agents` 里删掉，
   agent 的循环随即结束，它拿旧 token 重连会吃到 401。少了这一步，泄露的 token 打开的会话能一直报下去
 - 走 `Authorization: Bearer` 头，不走 URL query——query 会进反代的 access log
 - 无效/缺失一律返回 401，不区分"格式不对"和"不存在"

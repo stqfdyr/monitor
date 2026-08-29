@@ -7,14 +7,19 @@ Rust stable（1.98 验证过）、Node 24（CI 用的也是 24）。
 ```bash
 rustup component add clippy rustfmt
 cd web-admin && npm ci && cd ..
-git clone https://github.com/stqfdyr/monitor-theme-default web-theme
+# CI 和 release 都 clone 这个 tag，本地也跟着它，免得本机构建出来的
+# hub 和发出去的那个不是同一个前端。
+git clone --branch "$(cat web-theme.version)" https://github.com/stqfdyr/monitor-theme-default web-theme
 cd web-theme && npm ci && cd ..
 ```
 
-**别的地方已经有一份主题工作副本的话，`web-theme` 还是得是真目录，动手前先 `git pull`。**
+**hub 嵌哪一版主题由仓库根目录的 `web-theme.version` 决定**，CI、release 和上面这条命令读的是同一个文件。
+主题发了新版就是两步：主题仓库打 tag，hub 这边改这一行。不钉的话同一个 hub tag 重新构建会嵌进不同的
+前端——版本号一样，页面不一样，而拆出独立主题仓库的理由本来就是让主题有自己的版本。
+
+**别的地方已经有一份主题工作副本的话，`web-theme` 还是得是真目录，动手前先 `git fetch --tags` 并检出上面那个 tag。**
 两份 clone 会各自往前走，而 hub 嵌进二进制的永远是 `web-theme/dist` 那一份——本机上就发生过：
 主题仓库领先两个 commit，构建出来的 hub 带着旧默认主题，不报错、不告警，只是页面是旧的。
-release CI 每次现 clone，所以这只咬本地构建。
 
 **符号链接不行**，虽然看起来正好能解决这件事：rust-embed 的 debug 模式和 `frontend.rs` 里的
 `read_inside` 一样，会 canonicalize 之后确认文件仍在声明的目录内，跟出去的根目录一律拒绝。
