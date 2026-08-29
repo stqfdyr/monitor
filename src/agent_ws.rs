@@ -167,12 +167,10 @@ fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<()> {
 
 fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()> {
     let now = Utc::now().timestamp();
-    let reset_day = app.db.traffic_reset_day(node_id);
-
     let boot_id = metrics.get("boot_id").and_then(|v| v.as_str()).unwrap_or("").to_owned();
     let rx = metrics.get("net_rx_total").and_then(|v| v.as_i64()).unwrap_or(0);
     let tx = metrics.get("net_tx_total").and_then(|v| v.as_i64()).unwrap_or(0);
-    let traffic = app.db.accumulate(node_id, &boot_id, rx, tx, reset_day)?;
+    let traffic = app.db.accumulate(node_id, &boot_id, rx, tx)?;
 
     // The hub's accumulated figures are what the UI shows, so fold them into
     // the live payload and let the raw kernel counters stay an implementation

@@ -158,8 +158,8 @@ pub async fn metrics(
     // the same for a visitor as for the admin and the page needs no second
     // request. Only the names: targets and assignments stay behind `Admin`.
     let probes = app.db.ping_task_names().unwrap_or_else(|_| json!({}));
-    match (app.db.metrics(id, since, sample_step(hours)), app.db.ping_records(id, since, sample_step(hours)))
-    {
+    let step = sample_step(hours);
+    match (app.db.metrics(id, since, step), app.db.ping_records(id, since, step)) {
         (Ok(m), Ok(p)) => Json(json!({"metrics": m, "ping": p, "probes": probes})).into_response(),
         (Err(e), _) | (_, Err(e)) => fail(e),
     }
@@ -704,8 +704,8 @@ mod tests {
     fn a_node_view_carries_traffic_even_while_offline() {
         let app = app();
         let id = node(&app, "n", true);
-        app.db.accumulate(id, "b", 100, 100, 1).unwrap();
-        app.db.accumulate(id, "b", 900, 500, 1).unwrap();
+        app.db.accumulate(id, "b", 100, 100).unwrap();
+        app.db.accumulate(id, "b", 900, 500).unwrap();
         app.db.touch_seen(id, 1_700_000_000).unwrap();
 
         let view = &visible_nodes(&app, true).unwrap()[0];
