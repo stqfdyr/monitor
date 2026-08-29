@@ -649,8 +649,23 @@ mod tests {
         assert_eq!(probe(2)["latency"], json!(null), "a bucket that was all timeout has no latency");
         assert_eq!(probe(2)["loss"], 100);
         // A clean bucket carries no loss key at all: it is per row, per probe,
-        // on a response that is already a quarter of a megabyte.
+        // on a response that is already a quarter of a megabyte. Which is
+        // exactly why the percentage rounds up -- the absence of the key is
+        // read as "nothing was lost", so nothing lost has to be the only way
+        // to produce it.
         assert!(probe(3).get("loss").is_none(), "{:?}", probe(3));
+
+        // One timeout in a bucket too full for it to be a whole percent.
+        // Truncating divides this into the same answer as a clean bucket.
+        let wide = node(&app, "wide", true);
+        let wide_base = base / 180 * 180;
+        for i in 0..180 {
+            app.db.insert_ping(wide, 1, wide_base + i, if i == 0 { -1 } else { 20 }).unwrap();
+        }
+        let rows = app.db.ping_records(wide, wide_base, 180).unwrap();
+        assert_eq!(rows.len(), 1, "the fixture has to be one bucket for this to mean anything");
+        let row = &rows[0];
+        assert_eq!(row["loss"], 1, "a bucket that lost one of 180 has not lost none");
     }
 
     #[test]

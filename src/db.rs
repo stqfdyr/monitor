@@ -323,7 +323,7 @@ fn restrict(path: &str) {
 /// second copy over there is a copy that stops matching what actually runs.
 const PING_WINDOW: &str = "SELECT task_id, (MIN(ts)/?3)*?3,
             CAST(AVG(CASE WHEN latency>=0 THEN latency END) AS INTEGER),
-            (100*SUM(latency<0))/COUNT(*)
+            (100*SUM(latency<0) + COUNT(*) - 1)/COUNT(*)
      FROM ping_record WHERE node_id=?1 AND ts>=?2 GROUP BY task_id, ts/?3 ORDER BY ts";
 
 impl Db {
@@ -896,8 +896,15 @@ impl Db {
     /// half its packets rendered as a healthy one. `latency` is null when the
     /// whole bucket timed out; `loss` is the percentage that did, and rides
     /// along only when there is any -- a healthy day is 2 880 rows, and
-    /// `"loss":0` on each of them is 29 kB of nothing on an uncompressed
-    /// response.
+    /// `"loss":0` on each of them is 29 kB of nothing.
+    ///
+    /// **Rounded up, so that no `loss` key means no timeout and nothing else.**
+    /// Truncating folded the reader's two cases into one answer: a bucket of
+    /// 180 samples that lost one of them is 100/180, which integer division
+    /// calls 0, which drops the key, which reads as a clean bucket. A window
+    /// wide enough to fill a bucket that far is `hours=2160`, and this endpoint
+    /// accepts it. Rounding up costs under a percentage point and errs towards
+    /// saying a probe lost something, which is the safe direction.
     pub fn ping_records(&self, node_id: i64, since: i64, step: i64) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(PING_WINDOW)?;
