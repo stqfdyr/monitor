@@ -1,5 +1,6 @@
 //! The agent side of the hub: one WebSocket per node carrying JSON-RPC 2.0
-//! notifications, the same transport komari and NodeGet settled on.
+//! notifications. One long-lived connection either end can speak first on, and
+//! a frame that names its own method, which `curl` and a browser console read.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};

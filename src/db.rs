@@ -20,8 +20,7 @@ PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
 PRAGMA busy_timeout = 5000;
 -- 8 MiB of page cache. The whole working set of a few hundred nodes fits, so
--- the read paths stop going back to the filesystem. Same figure komari settled
--- on, and the only one of its SQLite knobs that is not already the default here.
+-- the read paths stop going back to the filesystem.
 PRAGMA cache_size = -8192;
 -- Without these the WAL grows to whatever the busiest minute needed and never
 -- gives the space back: a hub is a long-running process on a small VPS.
@@ -528,9 +527,9 @@ impl Db {
     /// Folds one report's raw kernel counters into the node's running totals.
     ///
     /// A changed boot_id, or a counter that moved backwards, means the kernel
-    /// started counting from zero again: the whole current reading is new
-    /// traffic. This is what keeps the total from collapsing on every reboot,
-    /// which is the behaviour komari has.
+    /// started counting from zero again. This is what keeps the total from
+    /// collapsing every time a box reboots, which is what showing the kernel's
+    /// own counter would do.
     ///
     /// The billing reset day is read here rather than passed in: it lives one
     /// join away from the row this already reads, and fetching it separately
@@ -975,9 +974,9 @@ mod tests {
 
         // Reboot: new boot_id, counters restart near zero. What this guards is
         // that the total does not fall back to the fresh counter value, which
-        // is the komari behaviour the project exists to fix. The 700 bytes the
-        // box moved before its first report are not booked -- there is no
-        // baseline to have measured them against.
+        // is the collapse this hub exists to not have. The 700 bytes the box
+        // moved before its first report are not booked -- there is no baseline
+        // to have measured them against.
         let t = db.accumulate(id, "boot-b", 700, 400).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (4_000, 3_000), "a reboot must not reset the total");
 

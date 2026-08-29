@@ -12,11 +12,11 @@
 | [data-accuracy.md](https://github.com/stqfdyr/agent/blob/main/docs/data-accuracy.md) | 碰 agent 采集代码之前。内存/硬盘/CPU 的口径和验证方法 |
 | [security.md](security.md) | 碰鉴权、API 边界、公开页之前 |
 | [development.md](development.md) | 要构建、测试、本地跑起来 |
-| [benchmark.md](benchmark.md) | 想知道比 komari 快多少、省多少。也是调优改动的记录 |
+| [benchmark.md](benchmark.md) | 想知道跑得有多省。横向对比的实测数字，也是调优改动的记录 |
 
 ## 30 秒版本
 
-服务器探针的 hub。agent 在 [另一个仓库](https://github.com/stqfdyr/agent)。用来替代 komari——功能砍到只剩四件事：看状态、看流量、看延迟、算成本。
+服务器探针的 hub。agent 在 [另一个仓库](https://github.com/stqfdyr/agent)。功能只有四件事：看状态、看流量、看延迟、算成本。
 
 - **agent** 只跑 Linux，直接读 `/proc` 和 `statvfs`，无状态、不落盘
 - **hub** 是 axum + SQLite，前端构建产物嵌进二进制，零配置文件启动
@@ -28,7 +28,7 @@
 改代码之前先确认没有违反这三条，它们是这个项目存在的理由：
 
 1. **总流量永不回退。** VPS 重启、hub 重启、agent 掉线重连，累计值都必须继续往上加。见 [traffic.md](traffic.md)
-2. **内存和硬盘的数字必须和 `free` / `df` 对得上。** 这是从 Scout 迁过来要修的原始 bug。见 [data-accuracy.md](https://github.com/stqfdyr/agent/blob/main/docs/data-accuracy.md)
+2. **内存和硬盘的数字必须和 `free` / `df` 对得上。** 现成的写法在这两个数上口径都不对，错得又看不出来。见 [data-accuracy.md](https://github.com/stqfdyr/agent/blob/main/docs/data-accuracy.md)
 3. **公开状态页永远不输出 IP、主机名和备注。** 见 [security.md](security.md)
 
 ## 明确不做的

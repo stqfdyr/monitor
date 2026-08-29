@@ -38,7 +38,7 @@ agent 的采集代码在 [另一个仓库](https://github.com/stqfdyr/agent)。�
 
 ## 线上协议
 
-WebSocket 承载 **JSON-RPC 2.0 通知**（只有 `method` + `params`，没有 `id`，不需要响应）。komari 和 NodeGet 都是这个方案。
+WebSocket 承载 **JSON-RPC 2.0 通知**（只有 `method` + `params`，没有 `id`，不需要响应）：一条长连接双向都能主动发，报文自带方法名，用 `curl` 和浏览器控制台就能读。
 
 ### agent → hub
 

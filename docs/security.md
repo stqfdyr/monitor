@@ -159,7 +159,7 @@ agent 上报里的 `boot_id`、`net_rx_total`、`net_tx_total` 同样只留给�
 
 回调路径是 **`/api/auth/github/callback`**。OAuth App 里必须精确填这个。
 
-komari 用的是 `/api/oauth_callback`——从 komari 迁过来的人很容易照抄那个路径。抄错的表现极具迷惑性：GitHub 授权成功，浏览器回到站点看起来一切正常，但没登上，**且服务端没有任何日志**，因为那个路径压根没进任何 handler。
+别的探针用的是别的路径（`/api/oauth_callback` 之类），照抄过来就会错。抄错的表现极具迷惑性：GitHub 授权成功，浏览器回到站点看起来一切正常，但没登上，**且服务端没有任何日志**，因为那个路径压根没进任何 handler。
 
 （现在未匹配的 `/api/` 会返回 404 而不是 SPA，所以这个错误会立刻现形。见 `src/main.rs` 的 `is_api_path()`。）
 

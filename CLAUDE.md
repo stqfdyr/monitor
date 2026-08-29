@@ -1,6 +1,6 @@
 # monitor
 
-Rust 服务器探针的 **hub**，替代 komari，功能砍到只剩：看状态、看流量、看延迟、算成本。
+Rust 服务器探针的 **hub**，功能只有四件事：看状态、看流量、看延迟、算成本。
 
 agent 在 [独立仓库](https://github.com/stqfdyr/agent)。后台在 `web-admin/`；默认公开页主题在
 [monitor-theme-default](https://github.com/stqfdyr/monitor-theme-default)，开发时检出到被忽略的

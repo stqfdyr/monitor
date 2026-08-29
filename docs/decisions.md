@@ -10,15 +10,17 @@
 
 ### WebSocket + JSON-RPC 2.0 **[用户]**
 
-用户要求"用 komari 最推荐的方式"。komari 的 v2 协议（`/api/clients/v2/rpc`）和 NodeGet 都是 WebSocket 上跑 JSON-RPC。
+用户要求用这类探针里最常见、最经得起考验的那套。一条长连接双向都能主动发，报文自带方法名，
+`curl` 和浏览器控制台就能读。
 
-**否决**：HTTP POST 轮询（Scout 的做法）——hub 无法主动下发探测任务；gRPC / protobuf（Scout 也用了）——多一个 codegen 步骤和 `protoc` 依赖，JSON 在这个数据量下够用且调试方便。
+**否决**：HTTP POST 轮询——hub 无法主动下发探测任务；gRPC / protobuf——多一个 codegen 步骤和
+`protoc` 依赖，JSON 在这个数据量下够用且调试方便。
 
 只用**通知**（无 `id`、无响应）而不是完整 RPC：没有任何一个调用需要返回值。
 
 ### token 走 `Authorization` 头，不走 URL query **[默认]**
 
-komari 是 `?token=xxx`。query string 会进 nginx/caddy 的 access log。agent 不是浏览器，能设请求头，所以没有理由把 token 放 URL 里。
+`?token=xxx` 是更省事的写法，但 query string 会进 nginx/caddy 的 access log。agent 不是浏览器，能设请求头，所以没有理由把 token 放 URL 里。
 
 改动位置：[agent 仓库](https://github.com/stqfdyr/agent) 的 `src/main.rs` 的 `session()`，`src/agent_ws.rs` 的 `bearer()`。
 
@@ -30,7 +32,7 @@ komari 是 `?token=xxx`。query string 会进 nginx/caddy 的 access log。agent
 
 用户在"只 Linux"和"Linux + Windows/macOS"之间选了前者。
 
-**这个决定的连锁效果很大**：直接读 `/proc` 和 `statvfs`，完全不引入 `sysinfo`。数据更准（sysinfo 的内存和硬盘口径就是要修的 bug）、二进制更小、零抽象层。
+**这个决定的连锁效果很大**：直接读 `/proc` 和 `statvfs`，完全不引入 `sysinfo`。数据更准（`sysinfo` 的内存和硬盘口径是错的，见 agent 仓库的 data-accuracy.md）、二进制更小、零抽象层。
 
 **要加跨平台就等于要推翻整个 `collect.rs`。** 先问用户。
 
@@ -40,11 +42,11 @@ agent 不写任何文件、不记忆任何跨重启的状态。它只上报"此�
 
 **为什么**：agent 跑在别人的 VPS 上，可能被重装、被迁移、被 kill -9。让它维护持久状态就等于给每台机器引入一个可能损坏的状态文件。hub 只有一个，备份和修复都容易。
 
-**否决**：komari 的 `netstatic` 方案（agent 侧落盘记流量）——每台 VPS 一个状态文件，重装即丢。
+**否决**：agent 侧落盘记流量——每台 VPS 一个状态文件，重装即丢。
 
 ### 不做自动更新 **[用户]**
 
-komari-agent 能从 GitHub release 拉新二进制自替换。用户选了不做。
+agent 可以做成自己从 GitHub release 拉新二进制替换掉自己。用户选了不做。
 
 **为什么**：自更新意味着 agent 能以 root 下载并执行任意二进制，是整个探针最大的攻击面。升级方式是重跑一遍安装命令，一行的事。
 
@@ -94,7 +96,7 @@ agent 每 2 秒上报（实时视图用），但 `metric` 表每节点每分钟�
 
 ### hub 侧累加 + boot_id 识别重启 **[用户提的需求，方案是默认]**
 
-用户的原话：komari 的 VPS 一重启总流量就清零，"我的探针要能续上，一直累加"。
+用户的原话：VPS 一重启总流量就清零，"我的探针要能续上，一直累加"。
 
 完整机制见 [traffic.md](traffic.md)。核心：agent 报内核 lifetime 计数器 + `boot_id`，hub 只计入
 **它亲眼看着计数器涨过去的那部分**；`boot_id` 变了就重新对基线，不计流量。
@@ -145,11 +147,11 @@ tungstenite 的默认值是 128 KiB，按大消息传输定的。一个上报包
 
 代价是缓存的帧里多了一个 `admin` 字段（两个消费端都只读 `nodes`，忽略多余字段），以及 HTTP 拿到的数据最多旧 2 秒——和 WebSocket 流本来就一样。**任何改节点的写路径都必须调 `invalidate_snapshot()`**，否则面板改完刷新看到的还是旧的。
 
-### SQLite 参数抄 komari **[默认]**
+### 调过的 SQLite 参数只有三个 **[默认]**
 
-komari 的 `internal/sqlitetune` 是认真调过的，能搬的都搬了：`cache_size = -8192`（8 MiB page cache）、`wal_autocheckpoint = 256`、`journal_size_limit = 1 MiB`。WAL、`synchronous = NORMAL`、`busy_timeout` 本来就一样。
+默认值里不合适的就这几条：`cache_size = -8192`（8 MiB page cache，几百个节点的工作集装得下，读路径不再回落到文件系统）、`wal_autocheckpoint = 256` 和 `journal_size_limit = 1 MiB`（否则 WAL 会涨到最忙那一分钟的大小再也不还回去，而 hub 是小机器上的长驻进程）。WAL、`synchronous = NORMAL`、`busy_timeout` 用的是默认或惯例值。
 
-**没抄的两条**：`_txlock=immediate`（这里只有一个连接、外面一把 Mutex，不存在锁升级冲突）和上报批处理（这里 `metric` 表每节点每分钟才写一行，本来就没有可批的量）。
+**考虑过没做的两条**：`_txlock=immediate`（这里只有一个连接、外面一把 Mutex，不存在锁升级冲突）和上报批处理（`metric` 表每节点每分钟才写一行，本来就没有可批的量）。
 
 PRAGMA 是**每连接**的，用 `sqlite3` 命令行去读只会读到它自己那条连接的默认值。`db.rs` 里有个测试守着这几个值真的落到了 hub 用的那条连接上。
 
@@ -161,7 +163,7 @@ PRAGMA 是**每连接**的，用 `sqlite3` 命令行去读只会读到它自己�
 
 用户在"纯 GitHub SSO"和"GitHub + 应急密码"之间选了后者。
 
-**为什么**：GitHub 挂了、OAuth App 配错了、被墙了，纯 SSO 会把用户彻底锁在自己的后台外面。komari 也是双通道。
+**为什么**：GitHub 挂了、OAuth App 配错了、被墙了，纯 SSO 会把用户彻底锁在自己的后台外面。
 
 细节见 [security.md](security.md)。
 
@@ -178,7 +180,7 @@ GitHub OAuth 就是两个 HTTP 请求。`oauth2` crate 带一堆用不上的 flo
 ### 节点 token 明文存库，管理员密码用 argon2 **[用户]**
 
 节点 token 存在 `node.token` 里，不做哈希。**这是为了面板能随时重新显示安装命令**——见下面的
-「安装命令随时可看」。komari 也是这么存的（`database/models/models.go` 的 `Token string`）。
+「安装命令随时可看」。
 
 代价是：能读到数据库的人就能拿到所有节点的 token，可以冒充节点上报假数据。接受这个代价的理由是
 数据库里还有 session、GitHub client secret、argon2 哈希，本来就是必须保护的东西；节点 token
@@ -206,7 +208,7 @@ runner 本来就装了 `gh`，`gh release create ... --generate-notes` 一行做
 
 ### 公开主题独立仓库，后台留在 hub **[用户]**
 
-用户在了解跨仓库构建代价后，明确要求像 komari 一样拆出主题，并能方便更换。主题只拥有公开状态页；登录页与 `/admin/*` 固定在 hub。
+用户在了解跨仓库构建代价后，明确要求把主题拆出去，并能方便更换。主题只拥有公开状态页；登录页与 `/admin/*` 固定在 hub。
 
 真正的换主题能力来自 hub 运行时读取 `<themes>/<short>/dist`，不是拆仓库本身。选中主题缺失、损坏或被删除时自动回落内置默认主题，保证零配置启动和恢复入口可用。
 
@@ -250,8 +252,8 @@ agent 本来就是 musl 静态二进制，Alpine 上跑得了，缺的只是 ini
 env 文件、unit 文件全部整份覆盖，最后 `systemctl restart`（不是 `enable --now`，那个会放过
 已经在跑的服务，见 c6ce53a）。实测连装三次，始终是一个单元、一个进程，跑的是最后一次的参数。
 
-**下载成功之后、覆盖二进制之前先 stop 一次**。komari 的做法是完整卸载再装（停服务、删 unit、
-`rm` 旧二进制），我们只需要 stop：unit 每次都重写，`daemon-reload` + `restart` 就够了。stop
+**下载成功之后、覆盖二进制之前先 stop 一次**。彻底一点的做法是完整卸载再装（停服务、删 unit、
+`rm` 旧二进制），这里只需要 stop：unit 每次都重写，`daemon-reload` + `restart` 就够了。stop
 这一步换来两件事——不必依赖 `install` 恰好会 unlink 而不是撞上 `ETXTBSY`（换成 `cp` 就会失败），
 以及消掉"新二进制已落盘、旧进程还在跑旧代码"的那段窗口。
 
@@ -273,7 +275,7 @@ env 文件、unit 文件全部整份覆盖，最后 `systemctl restart`（不是
 只动日期，不碰钱：仍然不做自动扣款，也不给离线节点顺延——节点掉线才是真到期的信号。
 **否决**：每个节点一个开关（还没人需要按节点关掉）、到期通知（用户明确砍掉了通知）。
 
-### 安装命令随时可看，和 komari 一致 **[用户]**
+### 安装命令随时可看 **[用户]**
 
 **这条推翻了之前的设计。** 原来的做法是只存 token 的哈希，所以面板没法把命令显示第二遍——
 每次打开安装弹窗都得换发一个新 token 才能拼出命令来。
@@ -283,8 +285,8 @@ env 文件、unit 文件全部整份覆盖，最后 `systemctl restart`（不是
 断开已连上的 agent，于是节点看起来一切正常，直到它下次重连——hub 重启、网络抖动、VPS 重启——
 才永久 401。生产环境的 zt 就是这么掉的，中间隔了多久都无从倒推。
 
-现在按 komari 的方式来（`komari-web` 的 `NodeFunction.tsx` 里 `const token = row.original.token`）：
-token 明文存库，随节点列表下发给面板，安装命令在前端本地拼出来，**打开弹窗一个请求都不发**。
+现在的做法是：token 明文存库，随节点列表下发给面板，安装命令在前端本地拼出来，
+**打开弹窗一个请求都不发**。
 
 `POST /nodes/{id}/token` 保留，但只作为显式的「换发凭证」按钮，带二次确认，用于怀疑凭证泄露时。
 换发会立刻断开那条连接（`api::reset_token` 从 `App.agents` 和 `live` 里删掉这个节点）：token 只在
@@ -312,4 +314,4 @@ token 明文存库，随节点列表下发给面板，安装命令在前端本�
 | 通知 | "我不需要通知功能" |
 | 远程 SSH | "我不需要远程 ssh 功能" |
 | 插件系统 | "不需要插件系统" |
-| ICMP / HTTP ping | "参考 komari 的配置方式，砍掉 icmp 和 http" |
+| ICMP / HTTP ping | "砍掉 icmp 和 http"，只留 TCP |
