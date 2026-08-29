@@ -16,7 +16,7 @@ use crate::{App, Shared};
 struct AdminAssets;
 
 #[derive(RustEmbed)]
-#[folder = "web-theme/dist"]
+#[folder = "target/theme/dist"]
 struct DefaultThemeAssets;
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -39,7 +39,7 @@ pub async fn serve(State(app): State<Shared>, uri: Uri) -> Response {
 
     if path == "admin" || path.starts_with("admin/") {
         let path = path.strip_prefix("admin").unwrap_or(path).trim_start_matches('/');
-        return embedded::<AdminAssets>(path, "web-admin");
+        return embedded::<AdminAssets>(path, "the panel is not built; run `npm run build` in web-admin/");
     }
 
     let theme = app.db.get("theme").unwrap_or_default();
@@ -48,22 +48,21 @@ pub async fn serve(State(app): State<Shared>, uri: Uri) -> Response {
             return response;
         }
     }
-    embedded::<DefaultThemeAssets>(path, "web-theme")
+    embedded::<DefaultThemeAssets>(path, "the default theme is missing; run scripts/theme.sh")
 }
 
 fn is_api_path(path: &str) -> bool {
     path == "api" || path.starts_with("api/")
 }
 
-fn embedded<T: RustEmbed>(requested: &str, source: &str) -> Response {
+fn embedded<T: RustEmbed>(requested: &str, remedy: &str) -> Response {
     let path = if requested.is_empty() { "index.html" } else { requested };
     if let Some(file) = T::get(path) {
         return asset(path, file.data.into_owned());
     }
     match T::get("index.html") {
         Some(index) => asset("index.html", index.data.into_owned()),
-        None => (StatusCode::NOT_FOUND, format!("frontend not built; run `npm run build` in {source}/"))
-            .into_response(),
+        None => (StatusCode::NOT_FOUND, remedy.to_owned()).into_response(),
     }
 }
 
@@ -127,7 +126,7 @@ fn manifest(root: &Path, short: &str) -> Option<Theme> {
 }
 
 pub fn themes(app: &App) -> std::io::Result<Vec<Theme>> {
-    let mut list = vec![serde_json::from_str(include_str!("../web-theme/theme.json"))
+    let mut list = vec![serde_json::from_str(include_str!("../target/theme/theme.json"))
         .expect("the built-in theme manifest must be valid")];
 
     if let Ok(base) = app.themes.canonicalize() {

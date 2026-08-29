@@ -66,7 +66,7 @@ agent 可以做成自己从 GitHub release 拉新二进制替换掉自己。用�
 
 ### 后台与默认主题嵌进二进制 **[默认]**
 
-`rust-embed` 把 `web-admin/dist` 和构建时检出的 `web-theme/dist` 打进 hub。没有安装第三方主题时，部署仍是一个二进制 + 一个 db 文件。
+`rust-embed` 把 `web-admin/dist` 和下载解出来的 `target/theme/dist` 打进 hub。没有安装第三方主题时，部署仍是一个二进制 + 一个 db 文件。
 
 注意：**debug 构建时 rust-embed 从磁盘读**，所以开发时要保留两个 `dist/`；release 才真正嵌入。
 
@@ -128,16 +128,57 @@ agent 每 2 秒上报（实时视图用），但 `metric` 表每节点每分钟�
 
 **否决**：自己建 `schema_version` 表（SQLite 已经有这个 pragma）、迁移框架（三条迁移）。
 
-### 主题版本钉在 `web-theme.version` **[默认]**
+### hub 消费主题的**构建产物**，不编译主题源码 **[用户]**
 
-CI 和 release 都 `git clone --branch "$(cat web-theme.version)"`。原来 clone 的是默认分支 HEAD，
-所以**同一个 hub tag 今天构建和下个月重建，嵌进去的前端不是同一份**——版本号一样，页面不一样。
-而拆出独立主题仓库的理由本来就是「让主题拥有独立的版本」，结果 hub 恰恰没消费那个版本。
+**这条推翻了之前的设计**，而且推翻的是根，不是枝。
 
-发新主题是两步：主题仓库打 tag，hub 改这一行。
+原来：hub 的构建要 clone 主题仓库到 `web-theme/`，装 Node、`npm ci`、`npm run build`，再 embed。
+也就是说 hub 的构建有一个**未声明、可变、无人校验的外部输入**——一个别人告诉你要手工 clone 的目录。
+它既是「人干活的地方」又是「构建输入」，这两个角色天生冲突，于是它漂移，而且是静默漂移：
+本机那份曾经落后 6 个提交还带着未提交改动，每一次 `cargo build --release` 都成功、无警告地嵌了错的主题。
+`development.md` 里写过警告，写完之后又发生了一次——**文档挡不住它**。
 
-**否决**：钉 commit SHA（40 位哈希，人读不出来是哪一版）、git submodule（多一层仪式，
-而这里只需要一行 clone）。
+真正的错在于：**默认主题是唯一一个不遵守 hub 自己定义的主题契约的主题。**
+第三方主题进 hub 的形状是一个目录 `{ dist/ + theme.json }`，运行时读，不需要任何工具链；
+只有默认主题要 hub 把「编译主题源码」这件事拉进自己的构建里。
+
+现在两者形状一致：
+
+```
+主题仓库打 tag  →  CI 构建  →  release 资产 theme.tar.gz + .sha256
+                                         │
+        hub: web-theme.pin = "<tag> <sha256>"
+                                         ↓
+        scripts/theme.sh  下载 → 校验 sha256 → 解到 target/theme/
+                                         ↓
+                            rust-embed 从那里嵌入
+```
+
+`theme.tar.gz` 里就是 `dist/` + `theme.json`，**它本身是一个可安装的主题目录**——hub 嵌进去的那个文件，
+和用户解到 `<themes>/<short>/` 的那个文件是同一个。顺带补上了一件本来缺的东西：第三方主题作者
+现在有了「主题该长什么样」的范本。
+
+得到的：hub 构建不再需要主题的 Node 工具链、不再 clone、**不再有第二份可能漂移的检出**——
+不是被管好了，是不存在了。sha256 不符构建直接失败（第三方 action 那条里同样的理由：tag 可以被移动）。
+
+`scripts/theme.sh` 同时被 build.rs 和 CI 调用，一份实现。CI 在宿主机上先跑是因为 release 走 `cross`，
+容器里不保证有 `curl`；build.rs 跑是为了本地 `cargo build` 零手工步骤。
+stamp 对得上就跳过，所以想拿一个还没发布的主题构建，把它放进 `target/theme/` 再写一行 stamp 即可。
+
+**否决**：把构建好的默认主题 vendored 进 hub 仓库（每次升级约 684 KB 二进制永久留在 git 历史里）；
+git submodule（还是一份可编辑的检出，只是漂移变得可见）；只加一个 build.rs 守卫（症状响了，
+根源还在——构建输入仍然是人维护的）。
+
+### tailwind 只扫自己的源码 **[默认]**
+
+发这条 pin 的时候才发现：同一个 tag 构建两次字节不一样。Tailwind v4 默认扫整个仓库，
+所以新加一个 workflow 里的 `permissions: contents: write` 就往样式表里塞了一条
+`.contents{display:contents}`，连带每个资源的内容哈希都变了。`api.rs` 里的 `.filter(...)`
+同样给后台塞过一条 `.filter`。
+
+两边的 `src/index.css` 都改成 `@import "tailwindcss" source(none)` 加显式 `@source`。
+后台 CSS 少 1.7 KB，主题少 1.7 KB，更要紧的是**产物不再取决于仓库里有什么无关文件**——
+没有这一条，钉住 sha256 只是把一个不确定的东西钉住了。
 
 ### agent 仓库写死在代码里，不做设置项 **[用户]**
 
@@ -174,7 +215,7 @@ CI 和 release 都 `git clone --branch "$(cat web-theme.version)"`。原来 clon
 
 用户明确说"这个和总流量不是一回事，要区分开"。
 
-`traffic` 表里 `total_rx/total_tx`（永不重置）和 `month_rx/month_tx`（按商家重置日重置）是两组独立的列，同一次上报同时更新。月流量在默认主题里和 CPU、内存、硬盘共用同一个进度条组件（开发检出路径 `web-theme/src/components/Meter.tsx`），按节点的 `traffic_mode` 计量——面板的节点表用的是同一套口径。
+`traffic` 表里 `total_rx/total_tx`（永不重置）和 `month_rx/month_tx`（按商家重置日重置）是两组独立的列，同一次上报同时更新。月流量在默认主题里和 CPU、内存、硬盘共用同一个进度条组件（主题仓库的 `src/components/Meter.tsx`），按节点的 `traffic_mode` 计量——面板的节点表用的是同一套口径。
 
 ### 月度周期按商家重置日算 **[默认]**
 

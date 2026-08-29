@@ -3,8 +3,9 @@
 Rust 服务器探针的 **hub**，功能只有四件事：看状态、看流量、看延迟、算成本。
 
 agent 在 [独立仓库](https://github.com/stqfdyr/agent)。后台在 `web-admin/`；默认公开页主题在
-[monitor-theme-default](https://github.com/stqfdyr/monitor-theme-default)，开发时检出到被忽略的
-`web-theme/`，两份构建产物都由 `rust-embed` 编译进二进制。外部主题由 hub 在运行时从磁盘读取。
+[monitor-theme-default](https://github.com/stqfdyr/monitor-theme-default)，**以发布好的
+`theme.tar.gz` 形式消费**——`web-theme.pin` 钉住 `<tag> <sha256>`，构建时下载校验解到
+`target/theme/`。两份产物都由 `rust-embed` 编译进二进制。外部主题由 hub 在运行时从磁盘读取。
 
 **动手之前先读 [docs/](docs/)**，尤其是 [docs/decisions.md](docs/decisions.md)——里面记了每个选择的理由和被否决的方案。
 
@@ -32,7 +33,6 @@ cargo test
 cargo fmt --all              # CI 卡这个，改完必跑
 cargo clippy --all-targets
 cd web-admin && npm run build
-cd web-theme && npm run build      # 先按 web-theme.version 里的 tag clone monitor-theme-default 到这里
 cargo run -- --listen 127.0.0.1:9911 --db /tmp/dev.db --themes /tmp/themes --site http://127.0.0.1:9911
 ```
 

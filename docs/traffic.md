@@ -130,7 +130,7 @@ if month_start != period {
 
 ## 月度用量怎么算
 
-`traffic` 表存的是分开的 `month_rx` 和 `month_tx`。至于额度按哪个算，看节点的 `traffic_mode`，在默认主题 `web-theme/src/components/NodeCard.tsx` 的 `monthUsage()` 里：
+`traffic` 表存的是分开的 `month_rx` 和 `month_tx`。至于额度按哪个算，看节点的 `traffic_mode`，在默认主题仓库 `src/components/NodeCard.tsx` 的 `monthUsage()` 里：
 
 | mode | 计算 | 典型场景 |
 |---|---|---|
@@ -139,7 +139,7 @@ if month_start != period {
 | `up` | 仅 tx | 只限上行 |
 | `down` | 仅 rx | 只限下行 |
 
-画进度条的是 `web-theme/src/components/Meter.tsx`。`traffic_limit` 为 0 时百分比显示"—"，条留空，页脚写"不限"。
+画进度条的是主题仓库的 `src/components/Meter.tsx`。`traffic_limit` 为 0 时百分比显示"—"，条留空，页脚写"不限"。
 
 ## 一个副作用（是特性不是 bug）
 

@@ -15,11 +15,13 @@
 |---|---|
 | **monitor**（本仓库） | hub + 内置后台 + `install.sh` |
 | **[agent](https://github.com/stqfdyr/agent)** | Linux agent。发布自己的 musl 二进制，`install.sh` 从那边的 release 拉 |
-| **[monitor-theme-default](https://github.com/stqfdyr/monitor-theme-default)** | 默认公开页主题；hub 构建时按 `web-theme.version` 里的 tag clone、构建并嵌入 |
+| **[monitor-theme-default](https://github.com/stqfdyr/monitor-theme-default)** | 默认公开页主题。**发布构建产物**（`theme.tar.gz` = `dist/` + `theme.json`），hub 按 `web-theme.pin` 下载校验后嵌入 |
 
 agent 拆开是因为部署机器和发布节奏不同。默认主题拆开是为了让主题拥有独立契约、版本和开发流程；代价是 hub 的 release 构建多一个 clone 步骤。
 
-**嵌哪一版由 `web-theme.version` 决定**，CI 和 release 读同一个文件。不钉版本的话「独立版本」只是句话——同一个 hub tag 重新构建会嵌进不同的前端。
+**hub 消费的是主题的构建产物，不编译主题源码。** 发布的 `theme.tar.gz` 里就是一个可安装的主题目录——
+hub 嵌进去的那个文件，和用户解到 `<themes>/<short>/` 的那个是同一个，所以默认主题和第三方主题走
+同一套契约。`web-theme.pin` 钉 `<tag> <sha256>`，对不上就构建失败。见 [decisions.md](decisions.md)。
 
 后台不属于主题。`/admin/*` 和登录页始终由 hub 内置的 `web-admin` 提供；主题只负责公开状态页。这样第三方主题不需要重做节点 CRUD、OAuth 和密码设置。
 
@@ -34,7 +36,7 @@ agent 拆开是因为部署机器和发布节奏不同。默认主题拆开是�
 | `src/agent_ws.rs` | ~225 | agent 侧 WebSocket、RPC 分发、实时状态 |
 | `src/frontend.rs` | ~165 | 双 SPA、主题扫描、磁盘安全读取与 fallback |
 | `web-admin/src/` | ~1520 | 内置后台。`components/ui/` 下是 shadcn 生成的，不手改 |
-| `web-theme/` | 构建时检出 | 默认主题仓库的本地工作副本，不提交到 hub 仓库 |
+| `scripts/theme.sh` | ~35 | 按 `web-theme.pin` 下载、校验、解出默认主题到 `target/theme/`。build.rs 和 CI 都调它 |
 
 agent 的采集代码在 [另一个仓库](https://github.com/stqfdyr/agent)。改了它的上报字段就是改了协议，两边要同步。
 

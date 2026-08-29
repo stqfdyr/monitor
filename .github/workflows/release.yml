@@ -17,25 +17,21 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The default theme is a repository of its own, and a hub release embeds
-      # whatever it builds here. Pinned to a tag so the same hub tag always
-      # embeds the same frontend: on the default branch, rebuilding v0.1.6 next
-      # month would quietly ship a different page under the same version.
-      - run: git clone --depth 1 --branch "$(cat web-theme.version)" https://github.com/stqfdyr/monitor-theme-default web-theme
+      # The default theme arrives as a published archive, verified against the
+      # hash in web-theme.pin. Run on the runner rather than leaving it to
+      # build.rs, because the cross container below is not guaranteed to carry
+      # curl -- it finds the theme already unpacked and does nothing.
+      - run: ./scripts/theme.sh
 
       - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: |
-            web-admin/package-lock.json
-            web-theme/package-lock.json
+          cache-dependency-path: web-admin/package-lock.json
 
-      # The hub embeds both SPAs, so they have to exist before cargo runs.
+      # The hub embeds the panel, so its dist/ has to exist before cargo runs.
       - run: npm ci && npm run build
         working-directory: web-admin
-      - run: npm ci && npm run build
-        working-directory: web-theme
 
       - uses: dtolnay/rust-toolchain@stable
         with:

@@ -1,4 +1,13 @@
-@import "tailwindcss";
+/* Scan this app's own source and nothing else. Tailwind's automatic detection
+   walks the whole repository, so a word in a Rust file or a document became a
+   utility class in the shipped stylesheet: `.filter` and `.transform` were
+   here because api.rs calls `.filter(...)`. Worse than the wasted bytes, it
+   made the build depend on files that have nothing to do with it -- adding an
+   unrelated workflow changed the CSS, and with it the content hash of every
+   asset. */
+@import "tailwindcss" source(none);
+@source "../index.html";
+@source "../src";
 @import "tw-animate-css";
 
 @custom-variant dark (&:is(.dark *));

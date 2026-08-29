@@ -7,19 +7,21 @@ Rust stable（1.98 验证过）、Node 24（CI 用的也是 24）。
 ```bash
 rustup component add clippy rustfmt
 cd web-admin && npm ci && cd ..
-# CI 和 release 都 clone 这个 tag，本地也跟着它，免得本机构建出来的
-# hub 和发出去的那个不是同一个前端。
-git clone --branch "$(cat web-theme.version)" https://github.com/stqfdyr/monitor-theme-default web-theme
-cd web-theme && npm ci && cd ..
 ```
 
-**hub 嵌哪一版主题由仓库根目录的 `web-theme.version` 决定**，CI、release 和上面这条命令读的是同一个文件。
-主题发了新版就是两步：主题仓库打 tag，hub 这边改这一行。不钉的话同一个 hub tag 重新构建会嵌进不同的
-前端——版本号一样，页面不一样，而拆出独立主题仓库的理由本来就是让主题有自己的版本。
+**没有第三步。** 默认主题不需要 clone、不需要 Node —— `cargo build` 自己会按 `web-theme.pin`
+把发布好的主题包下载、校验 sha256、解到 `target/theme/`（`scripts/theme.sh` 干的，build.rs 调它）。
 
-**别的地方已经有一份主题工作副本的话，`web-theme` 还是得是真目录，动手前先 `git fetch --tags` 并检出上面那个 tag。**
-两份 clone 会各自往前走，而 hub 嵌进二进制的永远是 `web-theme/dist` 那一份——本机上就发生过：
-主题仓库领先两个 commit，构建出来的 hub 带着旧默认主题，不报错、不告警，只是页面是旧的。
+以前这里要求把主题仓库 clone 到 `web-theme/`，那个目录已经删掉了。它同时是「人干活的地方」和
+「构建输入」，于是会静默漂移——本机那份曾经落后 6 个提交还带着未提交改动，构建照样成功，
+嵌进去的是旧主题。理由见 [decisions.md](decisions.md#hub-消费主题的构建产物不编译主题源码-用户)。
+
+**改主题**：在主题仓库自己的检出里改（本机是 `/opt/monitor-theme-default`），`npm run dev` 起
+Vite，它会把 `/api` 和 WebSocket 代理到 9911 的 hub。改完发版是两步：主题仓库打 tag（CI 自动
+发布 `theme.tar.gz` + `.sha256`），hub 这边把 `web-theme.pin` 换成新的 `<tag> <sha256>`。
+
+想拿一个**还没发布**的主题构建 hub：把构建好的 `dist/` + `theme.json` 放进 `target/theme/`，
+再往 `target/theme/.pin` 写一行和 `web-theme.pin` 一样的内容，脚本就会跳过下载。
 
 **符号链接不行**，虽然看起来正好能解决这件事：rust-embed 的 debug 模式和 `frontend.rs` 里的
 `read_inside` 一样，会 canonicalize 之后确认文件仍在声明的目录内，跟出去的根目录一律拒绝。
@@ -29,13 +31,13 @@ cd web-theme && npm ci && cd ..
 ## 构建
 
 ```bash
-# 两个前端要先构建，hub 会把它们的 dist 嵌进二进制
+# 后台要先构建，hub 会把它的 dist 嵌进二进制
 cd web-admin && npm run build && cd ..
-cd web-theme && npm run build && cd ..
+# 默认主题不用管：build.rs 按 web-theme.pin 取回来放好
 cargo build --release
 ```
 
-**debug 构建时 rust-embed 从磁盘读两个 `dist/`**，所以开发期间改完前端不用重新 `cargo build`，重新运行对应目录的 `npm run build` 就行。release 才真正嵌入。
+**debug 构建时 rust-embed 从磁盘读两个 `dist/`**（`web-admin/dist` 和 `target/theme/dist`），所以开发期间改完后台不用重新 `cargo build`，重跑 `npm run build` 就行。release 才真正嵌入。
 
 ## 测试
 
@@ -92,7 +94,7 @@ cargo run -- --listen 127.0.0.1:9911 --db /tmp/dev.db --themes /tmp/themes --sit
 cd web-admin && npm run dev
 ```
 
-后台开发服务器使用 `/admin/`。默认主题在另一个终端运行 `cd web-theme && npm run dev`，其 Vite 也会把 `/api` 和 WebSocket 代理到 9911。
+后台开发服务器使用 `/admin/`。改默认主题在主题仓库自己的检出里做（本机 `/opt/monitor-theme-default`），那边 `npm run dev` 的 Vite 同样把 `/api` 和 WebSocket 代理到 9911。
 
 第三方主题不用加入 hub 仓库。构建后按下面的形状复制到 `--themes` 指向的目录，再到后台「主题」页切换：
 
