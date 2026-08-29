@@ -11,6 +11,16 @@ git clone https://github.com/stqfdyr/monitor-theme-default web-theme
 cd web-theme && npm ci && cd ..
 ```
 
+**别的地方已经有一份主题工作副本的话，`web-theme` 还是得是真目录，动手前先 `git pull`。**
+两份 clone 会各自往前走，而 hub 嵌进二进制的永远是 `web-theme/dist` 那一份——本机上就发生过：
+主题仓库领先两个 commit，构建出来的 hub 带着旧默认主题，不报错、不告警，只是页面是旧的。
+release CI 每次现 clone，所以这只咬本地构建。
+
+**符号链接不行**，虽然看起来正好能解决这件事：rust-embed 的 debug 模式和 `frontend.rs` 里的
+`read_inside` 一样，会 canonicalize 之后确认文件仍在声明的目录内，跟出去的根目录一律拒绝。
+症状是 `/` 返回 404 而 `/admin` 正常，`an_unknown_api_path_is_a_404_not_the_single_page_app`
+会挂在这一行上。
+
 ## 构建
 
 ```bash
