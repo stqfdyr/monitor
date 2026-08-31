@@ -18,6 +18,7 @@ use axum::Json;
 use chrono::Utc;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 use crate::App;
@@ -28,6 +29,33 @@ const SESSION_DAYS: i64 = 14;
 /// Failed password attempts allowed per address before it is shut out.
 const MAX_ATTEMPTS: u32 = 5;
 const LOCKOUT: Duration = Duration::from_secs(900);
+
+/// How many password checks may run at once.
+///
+/// argon2 is meant to be expensive: one attempt costs 19 MiB and about a tenth
+/// of a second of a core, on purpose. Unbounded, that cost is a lever rather
+/// than a defence -- this path takes no credentials, and the per-address
+/// lockout bounds attempts per address while nothing bounds the addresses,
+/// which on IPv6 is a /64 the caller already owns. The hub's own rule for an
+/// anonymous path applies here: what a request can spend needs a ceiling.
+/// See docs/security.md.
+///
+/// **One, because any number at or above what the machine can actually run at
+/// once is not a limit.** This was first written as four, which reads as
+/// generous and measured as nothing at all: argon2 saturates a core, so a
+/// three-core hub never had four in flight to refuse, and a flood went through
+/// a gate of four exactly as if there were no gate -- 570 MB either way,
+/// against a unit file that allows 256. At one the same flood is refused at
+/// the door: 633 of 640 attempts turned away, and the hub stays inside its
+/// budget. A number tied to the core count would only re-open the hole on
+/// smaller machines.
+///
+/// The cost is that two people signing in at the same instant means one retries.
+/// This panel has one administrator.
+///
+/// Refused rather than queued: a queue lets the flood in anyway, only later.
+const PASSWORD_CHECKS: usize = 1;
+static PASSWORD_GATE: Semaphore = Semaphore::const_new(PASSWORD_CHECKS);
 
 pub fn sha256(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
@@ -137,6 +165,10 @@ pub async fn login(
     if app.throttle.locked(ip) {
         return (StatusCode::TOO_MANY_REQUESTS, "too many attempts, try again later").into_response();
     }
+    // Held until the check below is done, which is the whole point of it.
+    let Ok(_permit) = PASSWORD_GATE.try_acquire() else {
+        return (StatusCode::TOO_MANY_REQUESTS, "too many attempts, try again later").into_response();
+    };
     let Some(stored) = app.db.get("admin_password_hash") else {
         return (StatusCode::FORBIDDEN, "password login is disabled").into_response();
     };
@@ -318,7 +350,12 @@ async fn github_login(app: &App, code: &str) -> Result<()> {
     })?;
 
     if !allowed.contains(&user.login.to_lowercase()) {
-        bail!("GitHub user {} is not on the allowed list {allowed:?}", user.login);
+        // The list stays in the log and out of the reason, which rides back to
+        // the sign-in page in a query string. Anyone with a GitHub account can
+        // reach that page and authorize this app, so a reason carrying the
+        // allow list hands every one of them the names worth phishing.
+        warn!("GitHub user {} is not on the allowed list {allowed:?}", user.login);
+        bail!("GitHub user {} is not on the allowed list", user.login);
     }
     info!("GitHub sign-in accepted for {}", user.login);
     Ok(())
@@ -413,6 +450,18 @@ mod tests {
         // a couple of times is not left one slip away from a lockout.
         t.clear(other);
         assert_eq!(held(), 0);
+    }
+
+    /// The gate has to refuse rather than queue: a queue lets a flood arrive
+    /// anyway, just later, and each attempt that lands costs 19 MiB that stays
+    /// in a thread's arena for the life of the process.
+    #[test]
+    fn the_password_gate_refuses_a_flood_rather_than_queueing_it() {
+        let held: Vec<_> =
+            (0..PASSWORD_CHECKS).map(|_| PASSWORD_GATE.try_acquire().expect("up to the limit")).collect();
+        assert!(PASSWORD_GATE.try_acquire().is_err(), "the attempt past the limit must be refused");
+        drop(held);
+        assert!(PASSWORD_GATE.try_acquire().is_ok(), "permits come back when the checks finish");
     }
 
     /// Both ends of the same redirect: every shape GitHub can send has to parse

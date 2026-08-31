@@ -72,6 +72,24 @@ if allowed.is_empty() {
 
 `auth::Throttle`：同一来源地址 15 分钟内 5 次失败就锁死。成功登录清零。
 
+**外加一道并发闸门**（`auth::PASSWORD_CHECKS`，值为 1）：同一时刻只允许一次密码校验，挤不进来的
+直接 429，不排队。锁定管的是「一个地址试几次」，管不住「几个地址一起试」——而 IPv6 下攻击者手里
+的地址是一个 /64。argon2 一次要 19 MiB 和大约十分之一秒的一个核，这个开销是故意的，没有上界它
+就从防御变成杠杆。
+
+**闸门的值必须小于机器真能同时跑的数量，否则等于没有。** 最早写的是 4，读起来宽松、量出来是零：
+argon2 吃满一个核，三核的 hub 根本凑不出 4 个在飞，洪水穿过 4 的闸门和没有闸门一模一样。实测
+（64 线程 × 10 轮）：
+
+| | 洪水后 RSS | 结果 |
+|---|---:|---|
+| 无闸门 | **570 MB** | 160 次全跑完 argon2 |
+| 闸门 = 4 | **570 MB** | 与无闸门相同 |
+| 闸门 = 1 | **104–143 MB** | 640 次里 633 次被 429 挡下 |
+
+unit 文件给的是 `MemoryMax=256M`：无闸门的 570 MB 是它的 2.2 倍，也就是被 OOM 掉再重启，再打
+再挂。取 1 而不是「跟着核数走」，是因为跟着核数走只会在更小的机器上把洞重新打开。
+
 来源地址取 `X-Forwarded-For` 的第一跳，没有就用 peer 地址。**这个值只用于限流和面板上显示的
 节点地址，绝不用于鉴权**——它是客户端可伪造的。
 
@@ -175,7 +193,9 @@ journalctl -u monitor-hub -f | grep sign-in
 ```
 
 - `no allowed GitHub users configured` —— 白名单为空。**空 = 拒绝所有人**，不是放行所有人
-- `GitHub user X is not on the allowed list` —— 用户名不在白名单里
+- `GitHub user X is not on the allowed list` —— 用户名不在白名单里。**完整白名单只进日志，
+  不进回给浏览器的原因**：这个原因会写进 `/admin?login_error=` 跳回登录页，而任何一个 GitHub
+  账号都能走完授权拿到它——带上白名单就等于把「值得钓鱼的那几个名字」发给所有人
 - `GitHub returned access_denied: ...` —— 在 GitHub 页面上点了拒绝
 - `state mismatch or missing` —— 不是从登录页发起的，或 state cookie 过期（10 分钟）
 - `incorrect_client_credentials` —— client secret 不对
@@ -191,6 +211,7 @@ journalctl -u monitor-hub -f | grep sign-in
 ## 其它
 
 - 请求体上限 64 KiB（`RequestBodyLimitLayer`）。一次上报几百字节，超过就不是正常上报
+- 密码校验同时最多一次（`auth::PASSWORD_CHECKS`），见上面「登录限流」
 - **WebSocket 帧上限同样是 64 KiB**（`api::MAX_FRAME`，两个 socket 都加）。上面那个是 tower layer，
   握手之后就不管事了，默认上限是 64 MiB：一个节点自己的 token 就能买下整个额度，而它发上来的东西
   会落库、并原样推给公开页的每一个访客。这两个数字要一起改
