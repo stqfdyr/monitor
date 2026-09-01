@@ -56,11 +56,10 @@ fn is_api_path(path: &str) -> bool {
 }
 
 /// Everything a build writes under `assets/` carries a content hash, so a miss
-/// there is a client asking for a file that no longer exists -- never a route.
-/// Falling back to index.html answers a script tag with HTML, which the browser
-/// refuses on MIME type: the deploy that changed the hash looks like a broken
-/// page rather than a stale tab. Hashed names are also why `asset` may mark
-/// these immutable for a year, so both answers read the prefix from here.
+/// there is a request for a file that no longer exists, never a route. Falling
+/// back to index.html answers a script tag with HTML, which the browser refuses
+/// on MIME type. Hashed names are also why `asset` marks these immutable for a
+/// year, so both answers read the prefix from here.
 fn is_asset(path: &str) -> bool {
     path.starts_with("assets/")
 }
@@ -84,8 +83,8 @@ fn disk(root: &Path, requested: &str) -> Option<Response> {
     if let Some(data) = read_inside(root, path) {
         return Some(asset(path, data));
     }
-    // None, not a 404: an external theme that does not carry the file leaves
-    // the answer to the built-in one, which refuses it there.
+    // None, not a 404: an external theme without the file leaves the answer to
+    // the built-in one, which refuses it there.
     if is_asset(path) {
         return None;
     }
@@ -126,9 +125,8 @@ fn external_theme(themes: &Path, short: &str) -> Option<PathBuf> {
     }
     let dist = root.join("dist").canonicalize().ok()?;
     // Only that the entry point exists, not what is in it: this runs on every
-    // request the theme serves, and reading a whole index.html to throw it away
-    // was the largest thing on that path. A symlinked one still gets read
-    // through `read_inside`, which is where escaping the directory is refused.
+    // request the theme serves. A symlinked one is still read through
+    // `read_inside`, which is where escaping the directory is refused.
     if !dist.starts_with(&root) || !dist.is_dir() || !dist.join("index.html").is_file() {
         return None;
     }
@@ -210,24 +208,23 @@ mod tests {
     }
 
     /// The two guards on a theme name, which the settings page runs together:
-    /// which strings may name a directory on disk at all, and which names the
-    /// panel is allowed to switch to.
+    /// which strings may name a directory on disk, and which names the panel
+    /// may switch to.
     #[test]
     fn a_theme_name_is_checked_before_it_reaches_the_disk_or_the_settings_row() {
         assert!(valid_short("aurora") && valid_short("my-theme_2"));
-        // Anything that could steer the join somewhere else.
+        // Anything that could steer the join elsewhere.
         for bad in ["", "..", "a/b", "a\\b", "./x", "~", "a b", "th\u{e9}me"] {
             assert!(!valid_short(bad), "{bad:?} must not name a theme directory");
         }
-        // The built-in theme is served out of the binary; a directory answering
-        // to its name would quietly take its place.
+        // The built-in theme is served from the binary; a directory answering
+        // to its name would take its place.
         assert!(!valid_short("default"));
 
-        // It is still a theme the panel can switch to, though -- along with the
-        // empty string it stores as. Switching back to the built-in one is the
-        // way out of a broken external theme, so it can never be refused, and
-        // `selectable` names it twice over for that reason: once in its own
-        // right, once through the list, which always leads with it.
+        // Still a theme the panel can switch to, along with the empty string
+        // it stores as: switching back is the way out of a broken external
+        // theme, so it can never be refused. `selectable` names it twice for
+        // that reason -- in its own right, and through the list it leads.
         let app = App::for_test(crate::db::Db::open(":memory:").unwrap());
         assert!(selectable(&app, "") && selectable(&app, "default"));
         assert!(!selectable(&app, "aurora"), "a theme that is not installed is not selectable");

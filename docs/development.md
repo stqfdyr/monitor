@@ -9,24 +9,19 @@ rustup component add clippy rustfmt
 cd web-admin && npm ci && cd ..
 ```
 
-**没有第三步。** 默认主题不需要 clone、不需要 Node —— `cargo build` 自己会按 `web-theme.pin`
-把发布好的主题包下载、校验 sha256、解到 `target/theme/`（`scripts/theme.sh` 干的，build.rs 调它）。
+**没有第三步。** 默认主题不需要 clone、不需要 Node：`cargo build` 按 `web-theme.pin` 下载发布好
+的主题包、校验 sha256、解到 `target/theme/`（`scripts/theme.sh` 做的，build.rs 调它）。理由见
+[decisions.md](decisions.md#hub-消费主题的构建产物不编译主题源码-用户)。
 
-以前这里要求把主题仓库 clone 到 `web-theme/`，那个目录已经删掉了。它同时是「人干活的地方」和
-「构建输入」，于是会静默漂移——本机那份曾经落后 6 个提交还带着未提交改动，构建照样成功，
-嵌进去的是旧主题。理由见 [decisions.md](decisions.md#hub-消费主题的构建产物不编译主题源码-用户)。
-
-**改主题**：在主题仓库自己的检出里改（本机是 `/opt/monitor-theme-default`），`npm run dev` 起
-Vite，它会把 `/api` 和 WebSocket 代理到 9911 的 hub。改完发版是两步：主题仓库打 tag（CI 自动
-发布 `theme.tar.gz` + `.sha256`），hub 这边把 `web-theme.pin` 换成新的 `<tag> <sha256>`。
+**改主题**：在主题仓库自己的检出里改，`npm run dev` 起 Vite，它把 `/api` 和 WebSocket 代理到
+9911 的 hub。发版两步：主题仓库打 tag（CI 自动发布 `theme.tar.gz` + `.sha256`），hub 这边把
+`web-theme.pin` 换成新的 `<tag> <sha256>`。
 
 想拿一个**还没发布**的主题构建 hub：把构建好的 `dist/` + `theme.json` 放进 `target/theme/`，
 再往 `target/theme/.pin` 写一行和 `web-theme.pin` 一样的内容，脚本就会跳过下载。
 
-**符号链接不行**，虽然看起来正好能解决这件事：rust-embed 的 debug 模式和 `frontend.rs` 里的
-`read_inside` 一样，会 canonicalize 之后确认文件仍在声明的目录内，跟出去的根目录一律拒绝。
-症状是 `/` 返回 404 而 `/admin` 正常，`an_unknown_api_path_is_a_404_not_the_single_page_app`
-会挂在这一行上。
+**符号链接不行**：rust-embed 的 debug 模式和 `frontend.rs` 的 `read_inside` 一样，canonicalize
+之后确认文件仍在声明目录内，跟出去的一律拒绝。症状是 `/` 返回 404 而 `/admin` 正常。
 
 ## 构建
 
@@ -58,21 +53,29 @@ cargo fmt --all
 | `src/frontend.rs` | 主题路径穿越与越界符号链接、主题短名的两道守卫 |
 | `src/main.rs` | `--site` 推出的 cookie 标志与明文告警、静态路由、账单滚动、首次运行 |
 
-写测试的原则（用户明确要求不要过度测试）：**一段非平凡逻辑留一个能跑的检查就够**，不要每个函数一个测试。优先测边界和不变量，不测 getter。
+写测试的原则：**一段非平凡逻辑留一个能跑的检查就够**，不要每个函数一个测试。优先测边界和不变量，
+不测 getter。
 
 ### 断言必须能被证伪
 
-一条在逻辑被改坏之后依然通过的断言，是摆设，不是测试。加断言之前先想清楚：**什么样的代码改动会让它变红？**想不出来就别写。这个仓库踩过的几种：
+一条在逻辑被改坏之后依然通过的断言是摆设。加断言之前先想清楚：**什么样的代码改动会让它变红？**
+想不出来就别写。这个仓库踩过的几种：
 
-- **主键替你去重。** `metric` 和 `ping_record` 都是 `INSERT OR REPLACE` + 复合主键。同一秒写进去的几条记录本来就会塌成一行，所以「五份上报只落一行」这种计数断言，不管每分钟落盘的门控还在不在都是绿的。要么让各条记录带上不同的键（不同 task_id），要么改断言别的东西（落盘时间戳是不是对齐到整分钟）。
-- **容器替你去重。** 「限流表不会无限增长」曾经断言 `map.len() <= 去重后的地址数`——`HashMap` 的键天生保证这一点，把清扫逻辑整个删掉照样绿。
-- **常量时间窗关不掉。** 锁定窗口写死成 15 分钟，「过期自动解锁」这条分支在测试里永远够不着。`Throttle` 的窗口因此是字段而不是常量，生产路径取 `LOCKOUT`，测试塞个几十毫秒的。
-- **重建出来的东西和缓存的一模一样。** 验证快照缓存生效，不能拿两次读取比相等——不走缓存重建一遍，字节也一样。得在两次读取之间悄悄改掉底层数据。
-- **`recv().await` 等的是永远不来的消息。** 断言通道已关闭要用 `try_recv()`：真出了回归，`recv().await` 会把整个测试挂死，CI 上是超时不是报错，比不测还难查。
+- **主键替你去重。** `metric` 和 `ping_record` 都是 `INSERT OR REPLACE` + 复合主键，同一秒写进去
+  的几条记录本来就会塌成一行。所以「五份上报只落一行」这种计数断言，不管每分钟落盘的门控在不在都是
+  绿的。要么让各条记录带上不同的键，要么改断言别的东西（落盘时间戳是不是对齐到整分钟）。
+- **容器替你去重。** 「限流表不会无限增长」曾经断言 `map.len() <= 去重后的地址数`，而 `HashMap`
+  的键天生保证这一点，把清扫逻辑整个删掉照样绿。
+- **常量时间窗关不掉。** 锁定窗口写死成 15 分钟，「过期自动解锁」这条分支在测试里永远够不着。
+  `Throttle` 的窗口因此是字段而不是常量，生产路径取 `LOCKOUT`，测试塞个几十毫秒的。
+- **重建出来的东西和缓存的一模一样。** 验证快照缓存生效不能拿两次读取比相等——不走缓存重建一遍
+  字节也一样。得在两次读取之间悄悄改掉底层数据。
+- **`recv().await` 等的是永远不来的消息。** 断言通道已关闭要用 `try_recv()`：真出了回归，
+  `recv().await` 会把整个测试挂死，CI 上是超时不是报错，比不测还难查。
 
 ### 变异检查
 
-想确认一批测试到底护住了什么，就把逻辑挨个改坏，看有没有测试变红：
+确认一批测试到底护住了什么：把逻辑挨个改坏，看有没有测试变红。
 
 ```bash
 # 例：让同 boot 的读数缩水时不再钳零，「总流量永不回退」应该立刻报警
@@ -81,7 +84,9 @@ cargo test        # 期望 db::tests::a_shrinking_reading... 变红
 git checkout -- src/db.rs
 ```
 
-批量跑的时候有两个坑：**改完源码要让 mtime 前进一秒**（同一秒内连着改，cargo 会拿旧产物糊弄你，好测试也显示成漏网），以及**别用 `git checkout` 还原**——手头没提交的改动会跟着一起没。存一份文件内容再写回去。
+批量跑有两个坑：**改完源码要让 mtime 前进一秒**（同一秒内连着改，cargo 会拿旧产物顶替，好测试
+也显示成漏网），以及**别用 `git checkout` 还原**——没提交的改动会跟着一起没。存一份文件内容再
+写回去。
 
 ## 本地跑起来
 
@@ -94,18 +99,22 @@ cargo run -- --listen 127.0.0.1:9911 --db /tmp/dev.db --themes /tmp/themes --sit
 cd web-admin && npm run dev
 ```
 
-后台开发服务器使用 `/admin/`。改默认主题在主题仓库自己的检出里做（本机 `/opt/monitor-theme-default`），那边 `npm run dev` 的 Vite 同样把 `/api` 和 WebSocket 代理到 9911。
+后台开发服务器使用 `/admin/`。默认主题在它自己的检出里改，那边 `npm run dev` 的 Vite 同样把
+`/api` 和 WebSocket 代理到 9911。
 
-第三方主题不用加入 hub 仓库。构建后按下面的形状复制到 `--themes` 指向的目录，再到后台「主题」页切换：
+第三方主题不用加入 hub 仓库。构建后按下面的形状复制到 `--themes` 指向的目录，再到后台「主题」页
+切换：
 
 ```text
 /tmp/themes/<short>/theme.json
 /tmp/themes/<short>/dist/index.html
 ```
 
-目录名必须等于 `theme.json` 的 `short`；短名只允许字母、数字、`-`、`_`。完整接口契约见默认主题仓库的 README。
+目录名必须等于 `theme.json` 的 `short`；短名只允许字母、数字、`-`、`_`。完整接口契约见默认主题
+仓库的 README。
 
-登录后建一个节点，拿到 token，在 [agent 仓库](https://github.com/stqfdyr/agent) 里跑一个指向自己的 agent：
+登录后建一个节点，拿到 token，在 [agent 仓库](https://github.com/stqfdyr/agent) 里跑一个指向本机
+hub 的 agent：
 
 ```bash
 cd /path/to/agent
@@ -147,27 +156,30 @@ df -B1 --output=size,used / | tail -1
 
 ## 截图检查前端
 
-机器上有 puppeteer 的 Chrome，可以直接驱动：
+装有 puppeteer 的 Chrome 时可以直接驱动：
 
 ```bash
-CHROME=$(find /root/.cache/puppeteer/chrome -name chrome -type f | head -1)
+CHROME=$(find / -path '*/chrome-linux64/chrome' -type f 2>/dev/null | head -1)
 "$CHROME" --headless --disable-gpu --no-sandbox --hide-scrollbars \
   --window-size=1280,1400 --screenshot=out.png --virtual-time-budget=6000 \
   http://127.0.0.1:9911/
 ```
 
-需要登录后的页面就用 `puppeteer-core` 写个几十行的脚本走一遍登录表单。
+需要登录后的页面就用 `puppeteer-core` 写个几十行的脚本走一遍登录表单。**图表用整页截图会拍成空白**
+——`ResponsiveContainer` 在整页模式改视口后来不及重绘，要截图表就用视口截图。
 
 ## 发布
 
-推一个 `v*` tag 触发 `.github/workflows/release.yml`。CI 会构建内置后台、按 `web-theme.pin` 取回并校验默认主题，再构建 hub 的 musl 静态二进制。agent 和主题由各自仓库独立发布。
+推一个 `v*` tag 触发 `.github/workflows/release.yml`：构建内置后台、按 `web-theme.pin` 取回并校验
+默认主题，再构建 hub 的 musl 静态二进制。agent 和主题由各自仓库独立发布。
 
 `install.sh` 默认走 hub 的 `/agent/{arch}` 拿二进制；只有 `--github-proxy` 会绕过 hub 直连 GitHub，
 拼的是 `src/main.rs` 里的 `AGENT_REPO` 常量。
 
 ## 几个容易踩的坑
 
-- **别用 `pkill -f`** 停进程。它会匹配到正在跑这条命令的 shell 自己，把会话一起干掉。用 `ss -lptn "sport = :9911"` 找 PID 再 `kill`
+- **别用 `pkill -f`** 停进程：它会匹配到正在跑这条命令的 shell 自己，把会话一起干掉。用
+  `ss -lptn "sport = :9911"` 找 PID 再 `kill`
 - shadcn 的组件（`web-admin/src/components/ui/` 和主题的 `src/components/ui/`）是 CLI 生成的，**不要手改**。改样式改各自 `src/index.css` 的 CSS 变量
 - `tsconfig` 里不要加 `baseUrl`，TypeScript 6 里已废弃会直接报错。`paths` 单独用就行
 - `erasableSyntaxOnly` 开着，构造函数参数属性（`constructor(public x: number)`）不能用

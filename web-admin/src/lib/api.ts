@@ -108,10 +108,9 @@ export function useNodes() {
     fetchOnce()
 
     const url = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/ws`
-    // A hub restart closes every stream. Reconnecting matters more than it
-    // looks: without it a page that outlived one deploy spent the rest of its
-    // life on the fallback poll, refreshing at a fifth of the live rate with
-    // nothing on screen to say so.
+    // A hub restart closes every stream. Without reconnecting, a page that
+    // outlives one deploy spends the rest of its life on the fallback poll,
+    // refreshing at a fifth of the live rate with nothing to say so.
     const connect = () => {
       try {
         socket = new WebSocket(url)

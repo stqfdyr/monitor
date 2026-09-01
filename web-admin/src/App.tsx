@@ -10,8 +10,8 @@ import { api, useNodes } from "@/lib/api"
 
 type Me = { authed: boolean; github: boolean; site_name: string; public_page: boolean; site: string }
 
-/// `/admin` on its own is not a page; normalise it to the first section so a
-/// bookmark and the OAuth redirect both land somewhere real.
+// `/admin` on its own is not a page; normalise it to the first section so a
+// bookmark and the OAuth redirect both land somewhere real.
 function normalise(p: string) {
   return p === "/admin" || p === "/admin/" ? "/admin/nodes" : p.replace(/\/$/, "") || "/admin/nodes"
 }
@@ -82,14 +82,14 @@ export default function App() {
     <div className="min-h-svh">
       <header className="sticky top-0 z-10 border-b bg-background/80 backdrop-blur">
         <div className="mx-auto flex max-w-7xl items-center gap-3 px-4 py-3">
-          {/* The site name is the way back to the status page, the same as it
-              is in the theme's own header. */}
+          {/* The site name is the way back to the status page, as in the
+              theme's own header. */}
           <a href="/" className="font-semibold transition-opacity hover:opacity-70">
             {me.site_name || "Monitor"}
           </a>
           <span className="text-xs text-muted-foreground">后台</span>
           <div className="flex-1" />
-          {/* The status page is a separate app now, so this is a real navigation. */}
+          {/* The status page is a separate app, so this is a navigation. */}
           <Button variant="ghost" size="sm" asChild>
             <a href="/">
               <ExternalLink /> 状态面板
@@ -115,8 +115,8 @@ export default function App() {
             nodes={sorted}
             refresh={refresh}
             // The hub's own public URL, not this browser's address: the panel
-            // is often reached over a loopback port behind a proxy, and both
-            // the install command and the OAuth callback need the real one.
+            // is often reached over a loopback port behind a proxy, and the
+            // install command and OAuth callback both need the real one.
             site={me.site || location.origin}
           />
         )}

@@ -5,9 +5,10 @@ Rust 服务器探针的 **hub**，功能只有四件事：看状态、看流量�
 agent 在 [独立仓库](https://github.com/stqfdyr/agent)。后台在 `web-admin/`；默认公开页主题在
 [monitor-theme-default](https://github.com/stqfdyr/monitor-theme-default)，**以发布好的
 `theme.tar.gz` 形式消费**——`web-theme.pin` 钉住 `<tag> <sha256>`，构建时下载校验解到
-`target/theme/`。两份产物都由 `rust-embed` 编译进二进制。外部主题由 hub 在运行时从磁盘读取。
+`target/theme/`。两份产物都由 `rust-embed` 编译进二进制，外部主题由 hub 在运行时从磁盘读取。
 
-**动手之前先读 [docs/](docs/)**，尤其是 [docs/decisions.md](docs/decisions.md)——里面记了每个选择的理由和被否决的方案。
+**动手之前先读 [docs/](docs/)**，尤其是 [docs/decisions.md](docs/decisions.md)：每个选择的理由和
+被否决的方案都在里面。
 
 ## 三条铁律
 
@@ -17,14 +18,17 @@ agent 在 [独立仓库](https://github.com/stqfdyr/agent)。后台在 `web-admi
 
 ## 明确不做的
 
-不要"顺手"加回来，想加先问用户：通知、远程 SSH、插件系统、ICMP/HTTP ping、agent 自动更新、跨平台 agent。
+不要「顺手」加回来，想加先问用户：通知、远程 SSH、插件系统、ICMP/HTTP ping、agent 自动更新、跨平台 agent。
 
 ## 工作方式
 
-- 用 `ponytail` skill（full），别过度设计、别过度测试。一段非平凡逻辑留一个能跑的检查就够，不要每个函数一个测试
+- 用 `ponytail` skill（full），别过度设计、别过度测试。一段非平凡逻辑留一个能跑的检查就够，不要
+  每个函数一个测试
+- 注释写约束，不写调试过程；解释比代码长就删解释
 - 用现成的主流组件，但过重的宁可自己写
 - 除了已经定下来的，其它取舍问用户，别自己定
 - 面板新接口的签名里必须有 `_: Admin`；新的节点字段默认放 `node_view()` 的 `full` 分支
+- 新增匿名可达的路径，先说清它单次请求的上界（内存、占锁时长、出网字节）
 
 ## 常用命令
 

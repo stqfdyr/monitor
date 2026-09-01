@@ -55,7 +55,8 @@ monitor-hub --site https://monitor.example.com
 
 首次启动打印一次性应急密码，用它登录 `/admin`：
 
-1. **设置** 配置 GitHub OAuth（回调 `<site>/api/auth/github/callback`）与允许登录的用户名，修改应急密码
+1. **设置** 配置 GitHub OAuth（回调 `<site>/api/auth/github/callback`）与允许登录的用户名，修改
+   应急密码
 2. **节点** 添加节点，点下载按钮生成安装命令，在目标主机执行
 3. 拖动手柄排序；展示与流量设置、续费设置分别编辑
 
@@ -71,7 +72,7 @@ agent 二进制由 hub 转发，节点无需直连 GitHub。hub 自身无法访�
 
 置于反向代理之后时，用 `--listen 127.0.0.1:8080` 限制监听，并注意：
 
-- 转发 `/api/agent/ws` 与 `/api/ws` 的 `Upgrade` / `Connection` 头，关闭缓冲，读写超时设为远大于 60 秒
+- 转发 `/api/agent/ws` 与 `/api/ws` 的 `Upgrade` / `Connection` 头，关闭缓冲，读写超时远大于 60 秒
 - 放行 `POST` / `PUT` / `DELETE`
 - 透传 `X-Forwarded-For`，否则登录限流会按代理地址计数
 - `--site` 填写对外地址，与 `--listen` 无关
@@ -84,9 +85,10 @@ agent 二进制由 hub 转发，节点无需直连 GitHub。hub 自身无法访�
 ## 安全
 
 - 节点 token 只在登录后的面板视图里出现，公开页拿不到；可随时换发，换发即踢掉旧 agent
-- 密码登录按来源地址限流，15 分钟 5 次
+- 密码登录按来源地址限流，15 分钟 5 次，另有一道并发闸门
 - 公开状态页按节点开关，且不输出 IP、主机名与备注
 - OAuth 回调校验 state；session cookie 为 HttpOnly + SameSite=Lax + Secure
+- 匿名可达的接口都有明确上界：历史窗口最宽 7 天，agent 二进制转发最多 4 个并发
 
 详见 [docs/security.md](docs/security.md)。
 

@@ -120,12 +120,8 @@ CREATE TABLE IF NOT EXISTS session (
 /// that is already in service.
 const SCHEMA_VERSION: i64 = 1;
 
-/// Adds a column that older databases lack.
-///
-/// A column already present is the one failure this is allowed to shrug at —
-/// it is what "the migration has nothing left to do" looks like. Everything
-/// else is real, and the `let _ =` this replaces hid a full disk and a corrupt
-/// page just as quietly as it hid a second run.
+/// Adds a column that older databases lack. A duplicate column means the
+/// migration has already run; every other error is real and must propagate.
 fn add_column(conn: &Connection, table: &str, column: &str) -> Result<()> {
     match conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column}"), []) {
         Ok(_) => Ok(()),
@@ -161,21 +157,17 @@ fn migrate_to_1(conn: &Connection) -> Result<()> {
     ] {
         add_column(conn, "node", column)?;
     }
-    // The column used to hold a sha256 of the token. It holds the token itself
-    // now, so the panel can show an install command without minting a new one
-    // to do it. Databases from before the change keep their old digests, which
-    // no agent can present: those nodes need a new token issued from the panel
-    // and their agent reinstalled, once.
+    // The column held a sha256 of the token and now holds the token itself.
+    // Databases from before the change keep digests no agent can present:
+    // those nodes need a new token issued from the panel.
     if schema_mentions(conn, "node", "token_hash")? {
         conn.execute("ALTER TABLE node RENAME COLUMN token_hash TO token", [])?;
         info!("renamed node.token_hash to node.token; existing nodes need a fresh token");
     }
-    // A key can only be reordered by rebuilding the table, and CREATE TABLE IF
-    // NOT EXISTS leaves an existing one exactly as it was. The old order put
-    // task_id between the node and the timestamp, so a chart request -- which
-    // needs no credentials, and holds the connection the agents report through
-    // -- read every probe result the node had ever kept to answer for one hour
-    // of it: 0.8 ms against 42 ms at a month of retention.
+    // Reordering a key means rebuilding the table; CREATE TABLE IF NOT EXISTS
+    // leaves an existing one alone. The old order put task_id between the node
+    // and the timestamp, so the chart query scanned the node's whole history to
+    // answer for one hour of it: 42 ms against 0.8 ms at a month of retention.
     if schema_mentions(conn, "ping_record", "(node_id, task_id, ts)")? {
         conn.execute_batch(
             "BEGIN;
@@ -301,15 +293,13 @@ pub struct PingTask {
     pub nodes: Vec<i64>,
 }
 
-/// Takes the database away from everyone but its owner.
+/// Restricts the database to its owner.
 ///
-/// This file is the credential store: node tokens are in it in the clear, next
-/// to the GitHub client secret and the password hash. SQLite creates it with
-/// whatever the umask allows, which on a default 022 is world-readable, and the
-/// WAL and shared-memory files beside it hold the same rows.
+/// It is the credential store: node tokens in the clear, the GitHub client
+/// secret, the password hash. SQLite creates it under the umask, which on a
+/// default 022 is world-readable, and the WAL and shm files hold the same rows.
 ///
-/// Best effort on purpose: a database on a filesystem with no Unix modes still
-/// works, and refusing to start over it would be worse than the exposure.
+/// Best effort: a filesystem with no Unix modes still works.
 fn restrict(path: &str) {
     #[cfg(unix)]
     for file in [path.to_owned(), format!("{path}-wal"), format!("{path}-shm")] {
@@ -319,19 +309,17 @@ fn restrict(path: &str) {
 }
 
 /// The chart's probe query: per bucket, the median round trip, the range it
-/// moved through, and how much of it was lost.
+/// spanned, and the share of it that was lost.
 ///
-/// The median rather than the mean, the way Smokeping draws it -- one SYN
-/// retransmit is tens of milliseconds and drags a mean, and it is the reading
-/// that is wrong rather than the link. It comes out of a window function
-/// because SQLite has no `median()`: rank each bucket's answers by latency and
-/// average the middle one, or the middle two when there is an even number.
-/// Ranking successes and timeouts in separate partitions is what keeps -1 out
-/// of the ordering without a second pass over the table.
+/// Median rather than mean, as Smokeping draws it: one SYN retransmit is tens
+/// of milliseconds and drags a mean, and it is the reading that is wrong rather
+/// than the link. SQLite has no `median()`, so it comes out of a window
+/// function -- rank each bucket's answers by latency, average the middle one or
+/// two. Successes and timeouts rank in separate partitions, which keeps -1 out
+/// of the ordering without a second pass.
 ///
-/// Named because the query plan is asserted on it in
-/// `rekeying_ping_record_keeps_the_rows_and_lets_the_window_query_seek`, and a
-/// second copy over there is a copy that stops matching what actually runs.
+/// A constant because the query plan is asserted on it in
+/// `rekeying_ping_record_keeps_the_rows_and_lets_the_window_query_seek`.
 const PING_WINDOW: &str = "WITH s AS (
        SELECT task_id, ts/?3 AS b, latency,
               ROW_NUMBER() OVER (PARTITION BY task_id, ts/?3, latency>=0 ORDER BY latency) AS r,
@@ -348,9 +336,8 @@ const PING_WINDOW: &str = "WITH s AS (
 impl Db {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
-        // Asked before CREATE TABLE runs: a file with no tables is a database
-        // that has never existed, and it gets today's schema outright rather
-        // than the history of how the schema arrived at it.
+        // Asked before CREATE TABLE runs: a file with no tables gets today's
+        // schema outright rather than the history of how it was arrived at.
         let fresh = conn
             .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table'", [], |r| r.get::<_, i64>(0))?
             == 0;
@@ -361,9 +348,7 @@ impl Db {
         if !fresh && version < 1 {
             migrate_to_1(&conn)?;
         }
-        // Stamped once the database matches this build. Before there was a
-        // version every migration below re-ran on every start, and each one
-        // decided for itself whether it had already happened.
+        // Stamped once the database matches this build.
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(Self(Mutex::new(conn)))
     }
@@ -409,16 +394,14 @@ impl Db {
 
     /// Creates a node and returns its id.
     ///
-    /// Both rows or neither: a node whose `traffic` row went missing cannot
-    /// report at all, because `accumulate` reads that row on every report and
-    /// a failure there drops the whole message, live metrics included.
+    /// Both rows or neither: `accumulate` reads the `traffic` row on every
+    /// report, so a node missing one cannot report at all.
     pub fn create_node(&self, n: &Node, token: &str) -> Result<i64> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         tx.execute(
-            // A new node belongs at the end of the list. `sort` comes from the
-            // caller as 0, which would otherwise tie it with whatever the last
-            // manual reorder put first.
+            // A new node belongs at the end. The caller sends sort 0, which
+            // would tie with whatever the last reorder put first.
             "INSERT INTO node (name, token, sort, public, price, currency, billing_cycle,
                                expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day, created_at)
              VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
@@ -443,8 +426,8 @@ impl Db {
         Ok(id)
     }
 
-    /// Records that the node reported. Called on the same beat as the metric
-    /// row, so it costs one row update a minute rather than one a report.
+    /// Records that the node reported. Written on the same beat as the metric
+    /// row, so it costs one update a minute rather than one a report.
     pub fn touch_seen(&self, id: i64, ts: i64) -> Result<()> {
         self.conn().execute("UPDATE node SET last_seen=?2 WHERE id=?1", params![id, ts])?;
         Ok(())
@@ -546,19 +529,13 @@ impl Db {
 
     // ---- traffic ----
 
-    /// Every node's counters in one query. The node list renders a row per node
-    /// and used to fetch each one separately: on a hub with a few hundred nodes
-    /// that was a few hundred round trips through the single connection, with
-    /// the agents' writes queued behind them.
+    /// Every node's counters in one query, because the node list renders a row
+    /// per node and a query per node queues the agents' writes behind it.
     ///
     /// The period counters are gated on the period they were written for. They
-    /// restart lazily, in `accumulate`, on the node's next report — so a node
-    /// that has been offline since before a boundary still holds the previous
-    /// period's bytes, and answering with those makes yesterday's transfer
-    /// today's and last month's usage the bar drawn against this month's quota.
-    /// The write side already knows the rule; this is the read side keeping it,
-    /// which is also why it is the only reader: a second one is a second place
-    /// for the rule to go missing from.
+    /// restart lazily in `accumulate`, on the node's next report, so a node
+    /// offline since before a boundary still holds the previous period's bytes
+    /// on disk. This is the only reader, so the rule lives in one place.
     pub fn all_traffic(&self) -> HashMap<i64, Traffic> {
         let conn = self.conn();
         let Ok(mut stmt) = conn.prepare_cached(
@@ -571,8 +548,8 @@ impl Db {
         let today = Local::now().date_naive();
         let day = today.to_string();
         let rows = stmt.query_map([], |r| {
-            // Zero rather than absent: the counter for this period really is
-            // nothing yet, and a theme drawing a meter needs a number.
+            // Zero rather than absent: a theme drawing a meter needs a
+            // number.
             let current = |stored: String, now: &str, rx: i64, tx: i64| {
                 if stored == now {
                     (rx, tx)
@@ -602,13 +579,11 @@ impl Db {
     /// Folds one report's raw kernel counters into the node's running totals.
     ///
     /// A changed boot_id, or a counter that moved backwards, means the kernel
-    /// started counting from zero again. This is what keeps the total from
-    /// collapsing every time a box reboots, which is what showing the kernel's
-    /// own counter would do.
+    /// restarted its counting; the total must not follow it down.
     ///
-    /// The billing reset day is read here rather than passed in: it lives one
-    /// join away from the row this already reads, and fetching it separately
-    /// cost every report a second turn at the single write connection.
+    /// The billing reset day is read here rather than passed in: it is one join
+    /// from a row this already reads, and fetching it separately cost every
+    /// report a second turn at the single write connection.
     pub fn accumulate(&self, node_id: i64, boot_id: &str, rx: i64, tx: i64) -> Result<Traffic> {
         let conn = self.conn();
         let (
@@ -649,24 +624,19 @@ impl Db {
 
         // One rule: only bytes this hub watched a counter climb through are
         // booked. Without a baseline under this exact boot there is nothing to
-        // subtract from, and a bare reading is not a delta -- it is the whole
-        // machine's history, which is why booking one is never safe.
+        // subtract from, and a bare reading is the machine's whole history.
         //
-        // That covers all three ways a baseline goes missing. A node's first
-        // report has none yet. A reading that shrank under the *same* boot lost
-        // one: an interface the sum counted has gone (wg0 down, a tunnel
-        // stopped), so the reading is the rest of the machine's history and
-        // booking it would count that history twice. And a changed boot_id
-        // means the counters restarted -- or, indistinguishably from here, that
-        // a second machine is reporting under the same token, alternating
-        // boot_ids several times a second and adding its entire lifetime
-        // counter each time. Re-aligning costs the seconds between a reboot and
-        // the first report after it; guessing wrong the other way costs
-        // hundreds of gigabytes against a total that only ever climbs.
+        // Three ways the baseline goes missing, all handled the same way. A
+        // first report has none. A reading that shrank under the same boot lost
+        // one -- an interface the sum counted has gone -- so the reading is the
+        // rest of that history and booking it would count it twice. A changed
+        // boot_id means the counters restarted, or, indistinguishably from
+        // here, that a second machine shares the token. Re-aligning costs the
+        // seconds since the reboot; the other way costs hundreds of gigabytes
+        // against a total that only ever climbs.
         let (d_rx, d_tx) = if prev_boot.is_empty() || prev_boot != boot_id {
-            // Worth a line either way: on a healthy node this is a real reboot,
-            // and a node "rebooting" every few seconds is two machines sharing
-            // one token, which nothing else here would ever make visible.
+            // Worth a line either way: on a healthy node this is a reboot, and
+            // one every few seconds is two machines sharing a token.
             if !prev_boot.is_empty() {
                 info!("node {node_id} reports a new boot; re-aligning to {rx} rx / {tx} tx");
             }
@@ -681,11 +651,9 @@ impl Db {
         day_rx += d_rx;
         day_tx += d_tx;
 
-        // Both boundaries are human dates — the day a provider resets an
-        // allowance, and the day a person means by "today" — so both follow the
-        // hub's own timezone. On UTC the billing month turned over eight hours
-        // into the reset day for a hub in CST, while "today" beside it turned
-        // at midnight: two counters on the same row disagreeing about the date.
+        // Both boundaries are human dates -- the day a provider resets an
+        // allowance, the day a person means by "today" -- so both follow the
+        // hub's timezone rather than UTC.
         let period = period_start(Local::now().date_naive(), reset_day).to_string();
         if month_start != period {
             // New billing period: the month counter restarts, the total does not.
@@ -756,33 +724,22 @@ impl Db {
 
     /// History for one node, thinned to one sample every `step` seconds.
     ///
-    /// Without the thinning a month-wide window is tens of thousands of rows
-    /// built into as many `serde_json` maps before any of it is written -- on a
-    /// path anyone on the internet can ask for, against the connection the
-    /// agents report through.
-    ///
     /// Bucketed rather than filtered on a multiple of `step`: rows normally
     /// land on the minute, but nothing enforces it, and a filter would answer a
-    /// stamp that sits between the grid lines with silence.
+    /// stamp between the grid lines with silence.
     ///
-    /// Averaged over the bucket, not sampled from it. `MAX(ts)` with bare
-    /// columns beside it answers with one arbitrary row, which is the 1/60
-    /// sampling decisions.md already threw out at the write side -- put back one
-    /// layer up, and worse: the seven-day window kept one minute in fourteen.
-    /// Measured on cc, that window integrated to 53.69 GB of traffic against
-    /// the 27.52 GB the minutes actually hold. Averaged it is 28.02 GB, so the
-    /// chart's integral matches the accumulator again.
+    /// Averaged over the bucket, not sampled from it. Keeping one row per
+    /// bucket is the 1/60 sampling the write side already rejected, applied a
+    /// layer up: the seven-day window integrated to 53.69 GB against the
+    /// 27.52 GB the minutes hold. Averaged it is 28.02 GB, matching the
+    /// accumulator.
     ///
-    /// `swap_used` and `load1` are stored but not answered with: nothing draws
-    /// either, and a number a row on every request is a cost with no reader.
-    /// The live load average is on the card, out of the snapshot the socket
-    /// pushes, not out of this. The columns stay -- they are a record of what
-    /// the machine was doing, and dropping them is a migration -- but the wire
-    /// does not carry them.
+    /// `load1`, `swap_used`, `tcp`, `udp` and `procs` are stored but not
+    /// answered with -- nothing draws them from history. The columns stay
+    /// because dropping them is a migration.
     ///
-    /// The stamp is the bucket's own start rather than a row inside it, so
-    /// every series lands on the same grid -- which is what lets the probe
-    /// lines below share rows instead of each carrying its own timestamps.
+    /// The stamp is the bucket's start rather than a row inside it, so every
+    /// series lands on one grid and the probe rows below can be shared.
     pub fn metrics(&self, node_id: i64, since: i64, step: i64) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
@@ -801,8 +758,8 @@ impl Db {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Drops history past the retention window. Traffic totals are unaffected:
-    /// they live in their own table precisely so history can be pruned freely.
+    /// Drops history past the retention window. Traffic totals live in their
+    /// own table precisely so history can be pruned freely.
     pub fn prune(&self, keep_days: i64) -> Result<usize> {
         let cutoff = Utc::now().timestamp() - keep_days * 86_400;
         let conn = self.conn();
@@ -839,8 +796,8 @@ impl Db {
     }
 
     /// The assignments are replaced wholesale, so they go in one transaction:
-    /// failing between the delete and the inserts would silently unassign every
-    /// node from a probe that still lists them in the panel.
+    /// failing between the delete and the inserts would unassign every node
+    /// from a probe the panel still lists them under.
     pub fn save_ping_task(&self, t: &PingTask) -> Result<i64> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -887,8 +844,7 @@ impl Db {
     }
 
     /// Probe names keyed by id, for labelling a latency chart. Names only:
-    /// what a probe is called says nothing a visitor could act on, while its
-    /// target and node assignments stay in the panel.
+    /// targets and node assignments stay behind `Admin`.
     pub fn ping_task_names(&self) -> Result<serde_json::Value> {
         let conn = self.conn();
         let mut stmt = conn.prepare("SELECT id, name FROM ping_task")?;
@@ -910,29 +866,20 @@ impl Db {
     }
 
     /// Probe results for one node, one sample per probe per `step` seconds:
-    /// the bucket's mean round trip, and how much of it was lost.
+    /// the bucket's median round trip, its range, and the share that was lost.
     ///
-    /// These stamps are whenever the probe finished rather than on a minute, so
-    /// the thinning buckets them instead of matching a multiple. Same reason as
-    /// `metrics` above -- and this is the larger half of that response, because
-    /// a probe reports far more often than once a minute.
+    /// These stamps fall wherever the probe finished rather than on a minute,
+    /// so the thinning buckets them instead of matching a multiple, as in
+    /// `metrics` above. This is the larger half of that response: a probe
+    /// reports far more often than once a minute.
     ///
-    /// A timeout is stored as -1, so it has to be kept out of the median and
-    /// counted instead. Keeping the newest row of the bucket was worse than
-    /// coarse: on cc's 移动v4 it dropped 389 of the 788 timeouts in a day and
-    /// then drew the survivors as an unbroken line, which is a probe losing
-    /// half its packets rendered as a healthy one. `latency` is null when the
-    /// whole bucket timed out; `loss` is the percentage that did, and rides
-    /// along only when there is any -- a healthy day is 2 880 rows, and
-    /// `"loss":0` on each of them is 29 kB of nothing.
+    /// A timeout is stored as -1, so it is kept out of the median and counted
+    /// instead. `latency` is null when a whole bucket timed out. `loss` is the
+    /// percentage that did and rides along only when there is any -- a healthy
+    /// day is 2 880 rows, and `"loss":0` on each is 29 kB of nothing.
     ///
-    /// **Rounded up, so that no `loss` key means no timeout and nothing else.**
-    /// Truncating folded the reader's two cases into one answer: a bucket of
-    /// 180 samples that lost one of them is 100/180, which integer division
-    /// calls 0, which drops the key, which reads as a clean bucket. A window
-    /// wide enough to fill a bucket that far is `hours=2160`, and this endpoint
-    /// accepts it. Rounding up costs under a percentage point and errs towards
-    /// saying a probe lost something, which is the safe direction.
+    /// Rounded up, so that no `loss` key means no timeout and nothing else.
+    /// Truncating reports a bucket that lost 1 of 180 as clean.
     pub fn ping_records(&self, node_id: i64, since: i64, step: i64) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(PING_WINDOW)?;
@@ -941,9 +888,9 @@ impl Db {
                 "task_id": r.get::<_, i64>(0)?, "ts": r.get::<_, i64>(1)?,
                 "latency": r.get::<_, Option<i64>>(2)?
             });
-            // Only when the bucket actually moved. Every bucket holds one
-            // sample at the hour and six-hour windows, where a band would be a
-            // zero-height ribbon under every line and pure payload.
+            // Only when the bucket actually moved. At the hour and six-hour
+            // windows a bucket holds one sample, and a band would be a
+            // zero-height ribbon under every line.
             if let (Some(lo), Some(hi)) = (r.get::<_, Option<i64>>(3)?, r.get::<_, Option<i64>>(4)?) {
                 if hi > lo {
                     row["band"] = serde_json::json!([lo, hi]);
@@ -1063,8 +1010,8 @@ mod tests {
         Db::open(":memory:").unwrap()
     }
 
-    /// PRAGMA settings are per connection, so a value read back through any
-    /// other handle proves nothing about the one the hub actually writes on.
+    /// PRAGMA settings are per connection, so a value read through any other
+    /// handle proves nothing about the one the hub writes on.
     #[test]
     fn the_tuning_pragmas_reach_the_connection_the_hub_uses() {
         let db = db();
@@ -1087,19 +1034,16 @@ mod tests {
         let db = db();
         let id = node(&db, 1);
 
-        // First report only establishes the baseline: the box's lifetime
-        // counters are not booked as traffic seen by this hub.
+        // The first report only establishes the baseline.
         let t = db.accumulate(id, "boot-a", 5_000, 3_000).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (0, 0));
 
         let t = db.accumulate(id, "boot-a", 9_000, 6_000).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (4_000, 3_000));
 
-        // Reboot: new boot_id, counters restart near zero. What this guards is
-        // that the total does not fall back to the fresh counter value, which
-        // is the collapse this hub exists to not have. The 700 bytes the box
-        // moved before its first report are not booked -- there is no baseline
-        // to have measured them against.
+        // Reboot: new boot_id, counters restart near zero. The total must not
+        // fall back to the fresh value, and the 700 bytes moved before the
+        // first report are not booked -- nothing measured them.
         let t = db.accumulate(id, "boot-b", 700, 400).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (4_000, 3_000), "a reboot must not reset the total");
 
@@ -1109,11 +1053,10 @@ mod tests {
         assert_eq!((t.month_rx, t.month_tx), (5_000, 3_500));
     }
 
-    /// One install command pasted onto a second machine. Both agents answer to
-    /// the same node, evict each other from `App.agents` and reconnect, so the
-    /// hub sees two boot_ids alternating a few times a second -- each carrying
-    /// its own machine's lifetime counter. Booking those readings added ~180 GB
-    /// per swap to a total that only ever climbs and cannot be walked back.
+    /// One install command pasted onto a second machine: both agents answer to
+    /// the same node and evict each other, so the hub sees two boot_ids
+    /// alternating, each carrying its own lifetime counter. Booking those adds
+    /// ~180 GB per swap to a total that only ever climbs.
     #[test]
     fn two_machines_sharing_one_token_cannot_inflate_the_total() {
         let db = db();
@@ -1124,8 +1067,8 @@ mod tests {
         let t = db.accumulate(id, "boot-a", a + 1_000, a + 1_000).unwrap();
         assert_eq!(t.total_rx, 1_000, "the real machine's own traffic still counts");
 
-        // Now they take turns. Every swap is a boot_id the hub has no baseline
-        // for, so every swap books nothing.
+        // Every swap is a boot_id with no baseline, so every swap books
+        // nothing.
         for round in 0..3 {
             db.accumulate(id, "boot-b", b + round, b + round).unwrap();
             db.accumulate(id, "boot-a", a + 1_000 + round, a + 1_000 + round).unwrap();
@@ -1143,9 +1086,7 @@ mod tests {
         assert_eq!((t.total_rx, t.total_tx), (2_000, 2_000));
 
         // Same boot, reading dropped: an interface the sum counted is gone, so
-        // this reading is the rest of the machine's history rather than fresh
-        // bytes. Booking it would land 2_500 here -- and tens of gigabytes on a
-        // box that has been up a month.
+        // this is the rest of the machine's history, not fresh bytes.
         let t = db.accumulate(id, "boot-a", 500, 500).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (2_000, 2_000));
 
@@ -1164,9 +1105,8 @@ mod tests {
     }
 
     /// The two counters that restart on their own schedule, against a total
-    /// that never does. They hang off separate stored dates, so each rollover
-    /// has to leave the other one alone -- which only shows up if both happen
-    /// to the same node, one after the other.
+    /// that never does. Each hangs off its own stored date, so a rollover has
+    /// to leave the other alone.
     #[test]
     fn day_and_month_restart_independently_while_the_total_keeps_climbing() {
         let db = db();
@@ -1176,8 +1116,7 @@ mod tests {
         assert_eq!((t.day_rx, t.day_tx), (8_000, 4_000));
         assert_eq!((t.month_rx, t.month_tx), (8_000, 4_000));
 
-        // Midnight passes. Forced through the stored date, which is what the
-        // rollover actually reads.
+        // Midnight passes, forced through the stored date the rollover reads.
         db.conn().execute("UPDATE traffic SET day_start='1999-01-01' WHERE node_id=?1", [id]).unwrap();
         let t = db.accumulate(id, "boot-a", 9_500, 4_600).unwrap();
         assert_eq!((t.day_rx, t.day_tx), (1_500, 600), "a new day counts only this report's delta");
@@ -1193,10 +1132,8 @@ mod tests {
     }
 
     /// The other half of the rollover: the counters restart on the node's next
-    /// report, so a node that has not reported since before a boundary still
-    /// holds the previous period's bytes on disk. Reading those back is how
-    /// yesterday's transfer became today's figure on the status page, and how
-    /// last month's usage drew the bar against this month's quota.
+    /// report, so a node quiet since before a boundary still holds the previous
+    /// period's bytes on disk. The read side must not answer with those.
     #[test]
     fn a_node_that_went_quiet_before_a_boundary_reads_as_zero_this_period() {
         let db = db();
@@ -1205,8 +1142,7 @@ mod tests {
         db.accumulate(id, "boot-a", 8_000, 4_000).unwrap();
         assert_eq!(db.all_traffic()[&id].day_rx, 8_000, "still today, so it still counts");
 
-        // The node goes offline; the day and the billing period both turn over
-        // with no report to restart the counters.
+        // Offline across both boundaries, with no report to restart either.
         db.conn()
             .execute(
                 "UPDATE traffic SET day_start='1999-01-01', month_start='1999-01-01' WHERE node_id=?1",
@@ -1253,8 +1189,8 @@ mod tests {
         let db = db();
         let id = db.create_node(&Node { name: "n".into(), ..Default::default() }, "first-token").unwrap();
 
-        // Readable, which is the whole point: the panel shows the install
-        // command without having to issue a new token to be able to.
+        // Readable, so the panel can show the install command without issuing
+        // a new token to do it.
         assert_eq!(db.node(id).unwrap().unwrap().token, "first-token");
         assert_eq!(db.node_by_token("first-token").unwrap(), Some(id));
 
@@ -1272,9 +1208,9 @@ mod tests {
         db.reorder_nodes(&[c, a, b]).unwrap();
         assert_eq!(order(), vec![c, a, b]);
 
-        // Every rejected shape leaves the order it found. The partial list is
-        // the one that matters: the panel sends the ids it has, and a stale tab
-        // that never saw a node would otherwise renumber the list around it.
+        // Every rejected shape leaves the order it found. The partial list
+        // matters most: a stale tab would otherwise renumber around a node it
+        // never saw.
         assert!(db.reorder_nodes(&[a, a, c]).is_err(), "duplicates");
         assert!(db.reorder_nodes(&[a, b]).is_err(), "a node left out");
         assert!(db.reorder_nodes(&[a, b, 9999]).is_err(), "an id that is not a node");
@@ -1299,11 +1235,10 @@ mod tests {
         assert_eq!(db.all_traffic()[&id].total_rx, 800);
     }
 
-    /// The rekeying in `open()`: rows have to survive it, and the chart's query
-    /// has to come out able to seek. Both halves matter -- a migration that
-    /// keeps every row on the old key is silent, and stays silent while the
-    /// query it exists for goes on reading the node's whole history to answer
-    /// for an hour of it.
+    /// The rekeying in `open()`: rows have to survive it, and the chart's
+    /// query has to come out able to seek. A migration that keeps every row on
+    /// the old key is silent, and stays silent while the query it exists for
+    /// scans the node's whole history.
     #[test]
     fn rekeying_ping_record_keeps_the_rows_and_lets_the_window_query_seek() {
         let file = std::env::temp_dir().join(format!("monitor-rekey-{}.db", std::process::id()));
@@ -1334,8 +1269,8 @@ mod tests {
             .unwrap();
         assert_eq!(rows, vec![(1, 7, 100, 12), (1, 8, 100, 34), (1, 7, 200, 56), (2, 7, 100, 78)]);
 
-        // What the rebuild was for. Without the timestamp second in the key the
-        // plan stops at `node_id=?` and scans everything under it.
+        // Without the timestamp second in the key the plan stops at
+        // `node_id=?` and scans everything under it.
         let plan: String = conn
             .prepare(&format!("EXPLAIN QUERY PLAN {PING_WINDOW}"))
             .unwrap()

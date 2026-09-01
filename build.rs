@@ -1,17 +1,15 @@
 //! Puts the pinned default theme where `rust-embed` will find it.
 //!
-//! The hub embeds a built theme, and `scripts/theme.sh` is what fetches one.
-//! Running it here means a plain `cargo build` needs no setup step and cannot
-//! be pointed at the wrong theme by accident: the build derives its own input
-//! from `web-theme.pin` instead of trusting a directory somebody maintained by
-//! hand. See that script for why the directory is gone.
+//! The hub embeds a built theme; `scripts/theme.sh` fetches one. Running it
+//! here means a plain `cargo build` needs no setup step and derives its input
+//! from `web-theme.pin` rather than a hand-maintained directory.
 
 use std::process::Command;
 
 fn main() {
-    // Cargo reruns this only when one of these changes, so an untouched pin
-    // costs nothing. The stamp is listed too: delete `target/theme` and the
-    // fetch happens again rather than failing later inside rust-embed.
+    // Cargo reruns this only when one of these changes. The stamp is listed
+    // too: delete `target/theme` and the fetch happens again rather than
+    // failing later inside rust-embed.
     println!("cargo:rerun-if-changed=web-theme.pin");
     println!("cargo:rerun-if-changed=target/theme/.pin");
     println!("cargo:rerun-if-changed=scripts/theme.sh");

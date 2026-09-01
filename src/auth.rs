@@ -32,28 +32,20 @@ const LOCKOUT: Duration = Duration::from_secs(900);
 
 /// How many password checks may run at once.
 ///
-/// argon2 is meant to be expensive: one attempt costs 19 MiB and about a tenth
-/// of a second of a core, on purpose. Unbounded, that cost is a lever rather
-/// than a defence -- this path takes no credentials, and the per-address
-/// lockout bounds attempts per address while nothing bounds the addresses,
-/// which on IPv6 is a /64 the caller already owns. The hub's own rule for an
-/// anonymous path applies here: what a request can spend needs a ceiling.
-/// See docs/security.md.
+/// argon2 is deliberately expensive: one attempt costs 19 MiB and a tenth of a
+/// second of a core. Unbounded, that cost is a lever rather than a defence --
+/// the lockout below bounds attempts per address while nothing bounds the
+/// addresses, which on IPv6 is a /64 the caller already owns.
 ///
-/// **One, because any number at or above what the machine can actually run at
-/// once is not a limit.** This was first written as four, which reads as
-/// generous and measured as nothing at all: argon2 saturates a core, so a
-/// three-core hub never had four in flight to refuse, and a flood went through
-/// a gate of four exactly as if there were no gate -- 570 MB either way,
-/// against a unit file that allows 256. At one the same flood is refused at
-/// the door: 633 of 640 attempts turned away, and the hub stays inside its
-/// budget. A number tied to the core count would only re-open the hole on
-/// smaller machines.
-///
-/// The cost is that two people signing in at the same instant means one retries.
-/// This panel has one administrator.
+/// One, because any number at or above what the machine can run at once is not
+/// a limit: argon2 saturates a core, so a gate of four on a three-core hub
+/// never had four in flight to refuse and passed a flood through untouched --
+/// 570 MB against a unit file allowing 256. At one, 633 of 640 attempts are
+/// turned away at the door. Tying it to the core count would re-open the hole
+/// on smaller machines.
 ///
 /// Refused rather than queued: a queue lets the flood in anyway, only later.
+/// The cost is that two simultaneous sign-ins mean one retries.
 const PASSWORD_CHECKS: usize = 1;
 static PASSWORD_GATE: Semaphore = Semaphore::const_new(PASSWORD_CHECKS);
 
@@ -84,7 +76,7 @@ fn verify_password(password: &str, stored: &str) -> bool {
 pub struct Throttle {
     seen: Mutex<HashMap<IpAddr, (u32, Instant)>>,
     /// How long a failure is remembered. A field rather than the constant so a
-    /// test can watch a lockout expire without sleeping for a quarter of an hour.
+    /// test can watch a lockout expire without sleeping for 15 minutes.
     window: Duration,
 }
 
@@ -165,7 +157,7 @@ pub async fn login(
     if app.throttle.locked(ip) {
         return (StatusCode::TOO_MANY_REQUESTS, "too many attempts, try again later").into_response();
     }
-    // Held until the check below is done, which is the whole point of it.
+    // Held across the check below, which is the point of it.
     let Ok(_permit) = PASSWORD_GATE.try_acquire() else {
         return (StatusCode::TOO_MANY_REQUESTS, "too many attempts, try again later").into_response();
     };
@@ -203,10 +195,9 @@ pub async fn github_start(State(app): State<crate::Shared>) -> Response {
     with_cookies(Redirect::to(&url), [set_cookie(STATE_COOKIE, &state, 600, app.secure_cookies())])
 }
 
-/// Every field is optional on purpose. With required fields axum rejects a
-/// malformed callback before the handler runs, which returns a bare 400 and
-/// logs nothing — and GitHub reports a refusal by sending `error` with no
-/// `code` at all, so that shape is not even unusual.
+/// Every field is optional. With required fields axum rejects a malformed
+/// callback before the handler runs, returning a bare 400 and logging nothing
+/// -- and GitHub reports a refusal with `error` and no `code` at all.
 #[derive(Deserialize, Default)]
 pub struct Callback {
     #[serde(default)]
@@ -247,12 +238,11 @@ pub async fn github_callback(
     with_cookies(Redirect::to("/admin"), [clear_state(&app), session])
 }
 
-/// Sends the browser back to the sign-in page carrying the reason, so the
-/// failure is readable in the UI instead of being a bare plain-text 401 at a
-/// callback URL the user cannot navigate away from.
+/// Sends the browser back to the sign-in page with the reason, rather than
+/// leaving a bare 401 at a callback URL there is no way out of.
 fn sign_in_failed(app: &App, reason: &str) -> Response {
-    // A rejected sign-in must leave a server-side trace; the browser only ever
-    // sees the redirect, and without this the operator is debugging blind.
+    // A rejected sign-in must leave a server-side trace: the browser only sees
+    // the redirect.
     warn!("GitHub sign-in rejected: {reason}");
     let target = format!("/admin?login_error={}", urlencode(reason));
     with_cookies(Redirect::to(&target), [clear_state(app), String::new()])
@@ -262,11 +252,9 @@ fn clear_state(app: &App) -> String {
     set_cookie(STATE_COOKIE, "", 0, app.secure_cookies())
 }
 
-/// Attaches several `Set-Cookie` headers to one response.
-///
-/// An array of header tuples cannot be used here: axum applies those with
-/// `HeaderMap::insert`, so a second `Set-Cookie` silently replaces the first
-/// rather than adding to it. Empty entries are skipped.
+/// Attaches several `Set-Cookie` headers to one response. An array of header
+/// tuples will not do: axum applies those with `HeaderMap::insert`, so a second
+/// `Set-Cookie` replaces the first. Empty entries are skipped.
 pub fn with_cookies<const N: usize>(response: impl IntoResponse, cookies: [String; N]) -> Response {
     let mut response = response.into_response();
     for cookie in cookies {
@@ -343,17 +331,16 @@ async fn github_login(app: &App, code: &str) -> Result<()> {
         .context("user request")?;
     let status = response.status();
     let body = response.text().await.context("user response")?;
-    // Decoding an error page into GithubUser would report a misleading
-    // "missing field login" instead of what GitHub actually said.
+    // Decoding an error page into GithubUser reports "missing field login"
+    // instead of what GitHub said.
     let user: GithubUser = serde_json::from_str(&body).with_context(|| {
         format!("user response ({status}): {}", body.chars().take(200).collect::<String>())
     })?;
 
     if !allowed.contains(&user.login.to_lowercase()) {
-        // The list stays in the log and out of the reason, which rides back to
-        // the sign-in page in a query string. Anyone with a GitHub account can
-        // reach that page and authorize this app, so a reason carrying the
-        // allow list hands every one of them the names worth phishing.
+        // The list stays in the log and out of the reason, which rides back in
+        // a query string: anyone with a GitHub account can reach that page, and
+        // a reason carrying the allow list hands them the names worth phishing.
         warn!("GitHub user {} is not on the allowed list {allowed:?}", user.login);
         bail!("GitHub user {} is not on the allowed list", user.login);
     }
@@ -361,14 +348,13 @@ async fn github_login(app: &App, code: &str) -> Result<()> {
     Ok(())
 }
 
-/// Peer address, or the first hop in X-Forwarded-For when the request arrived
-/// through a local reverse proxy. Only consulted for throttling and for the
-/// address shown next to a node, never for authorization.
+/// Peer address, or the first hop in X-Forwarded-For when the request came
+/// through a local reverse proxy. Used for throttling and for the address shown
+/// next to a node, never for authorization.
 ///
-/// The header is honoured only when the peer itself is local. A hub reachable
-/// directly from the internet would otherwise let a caller mint a fresh
-/// identity on every request, which both walks straight past the lockout and
-/// grows the throttle map without bound.
+/// The header is honoured only when the peer is itself local. Otherwise a
+/// caller mints a fresh identity per request, walking past the lockout and
+/// growing the throttle map without bound.
 pub fn client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
     if !behind_local_proxy(peer) {
         return peer;
@@ -385,8 +371,8 @@ pub fn client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
 fn behind_local_proxy(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
-        // Unique-local (fc00::/7) and link-local (fe80::/10). The stable
-        // standard library still has no predicate for either.
+        // Unique-local (fc00::/7) and link-local (fe80::/10); the stable
+        // standard library has no predicate for either.
         IpAddr::V6(v6) => {
             let head = v6.segments()[0];
             v6.is_loopback() || head & 0xfe00 == 0xfc00 || head & 0xffc0 == 0xfe80
@@ -404,19 +390,18 @@ mod tests {
         assert!(verify_password("correct horse battery staple", &hash));
         assert!(!verify_password("Correct horse battery staple", &hash));
         assert!(!verify_password("", &hash));
-        // A corrupt or empty stored hash must fail closed, not open.
+        // A corrupt or empty stored hash must fail closed.
         assert!(!verify_password("anything", "not-a-hash"));
         assert!(!verify_password("anything", ""));
-        // Same password, different hash: the salt is per-hash, so one cracked
-        // row does not read off as every other row using that password.
+        // The salt is per hash, so one cracked row does not identify every
+        // other row using that password.
         assert_ne!(hash_password("same").unwrap(), hash_password("same").unwrap());
     }
 
-    /// One address through the whole lockout lifecycle, in the order it
-    /// happens: attempts up to the limit are allowed, the next one shuts the
-    /// address out, the window runs out on its own, and a success clears it
-    /// early. The window is shortened so that expiry is reachable at all --
-    /// against the real quarter of an hour those branches can never be tested.
+    /// One address through the whole lockout lifecycle: attempts up to the
+    /// limit are allowed, the next shuts the address out, the window runs out
+    /// on its own, and a success clears it early. The window is shortened so
+    /// that expiry is reachable at all.
     #[test]
     fn a_lockout_lands_expires_on_its_own_and_clears_on_success() {
         let window = Duration::from_millis(60);
@@ -434,27 +419,27 @@ mod tests {
         assert!(t.locked(ip), "the attempt past the limit is shut out");
         assert!(!t.locked(other), "the lockout must not spread to other addresses");
 
-        // Nobody tries again while the window runs out. A lockout is a delay,
-        // not a ban: the address has to be let back in by itself.
+        // A lockout is a delay, not a ban: the address is let back in by
+        // itself.
         std::thread::sleep(window * 2);
         assert!(!t.locked(ip), "an expired lockout must lift on its own");
 
-        // `stale` is never asked about, so the only thing that can drop it is
-        // the sweep on the way in. Without it this map grows one entry per
-        // address a caller cares to present, for the life of the process.
+        // `stale` is never asked about, so only the sweep on the way in can
+        // drop it. Without that the map grows one entry per address presented,
+        // for the life of the process.
         assert_eq!(held(), 1, "the expired lockout is gone, stale is still held");
         t.record_failure(other);
         assert_eq!(held(), 1, "the stale address is swept, not carried");
 
-        // A correct password clears the count at once, so someone who mistyped
-        // a couple of times is not left one slip away from a lockout.
+        // A correct password clears the count, so two typos do not leave the
+        // next slip a lockout.
         t.clear(other);
         assert_eq!(held(), 0);
     }
 
-    /// The gate has to refuse rather than queue: a queue lets a flood arrive
-    /// anyway, just later, and each attempt that lands costs 19 MiB that stays
-    /// in a thread's arena for the life of the process.
+    /// The gate has to refuse rather than queue: a queue lets the flood arrive
+    /// anyway, and each attempt that lands costs 19 MiB that stays in a
+    /// thread's arena for the life of the process.
     #[test]
     fn the_password_gate_refuses_a_flood_rather_than_queueing_it() {
         let held: Vec<_> =
@@ -464,10 +449,9 @@ mod tests {
         assert!(PASSWORD_GATE.try_acquire().is_ok(), "permits come back when the checks finish");
     }
 
-    /// Both ends of the same redirect: every shape GitHub can send has to parse
-    /// -- one that does not never reaches the handler, so it can be neither
-    /// logged nor explained -- and the reason the hub sends back has to survive
-    /// the query string it is written into.
+    /// Both ends of the same redirect: every shape GitHub can send has to
+    /// parse, or it never reaches the handler and can be neither logged nor
+    /// explained; and the reason sent back has to survive its query string.
     #[test]
     fn every_callback_shape_parses_and_a_failure_reason_survives_the_round_trip() {
         let parse = |q: &str| serde_urlencoded::from_str::<Callback>(q);
@@ -487,9 +471,9 @@ mod tests {
         assert!(parse("state=xyz").is_ok());
         assert!(parse("").is_ok());
 
-        // The hub's own failures ride back the same way. Anything that would
-        // break out of the query string has to be encoded on the way in, or the
-        // reason arrives truncated at the first stray separator.
+        // Anything that would break out of the query string has to be encoded
+        // on the way in, or the reason arrives truncated at the first stray
+        // separator.
         assert_eq!(urlencode("a&b=c#d"), "a%26b%3Dc%23d");
         assert_eq!(urlencode("用户"), "%E7%94%A8%E6%88%B7");
         let reason = "no allowed GitHub users configured (a&b=c)";
@@ -497,8 +481,8 @@ mod tests {
         assert_eq!(back.error.as_deref(), Some(reason), "the whole reason comes back");
     }
 
-    /// A session cookie's whole round trip: the flags it goes out with, riding
-    /// a response next to a second cookie, and being picked back out of the one
+    /// A session cookie's round trip: the flags it goes out with, riding a
+    /// response beside a second cookie, and being picked back out of the one
     /// header the browser returns them all in.
     #[test]
     fn a_session_cookie_goes_out_locked_down_alongside_others_and_parses_back() {
@@ -507,8 +491,8 @@ mod tests {
         assert!(session.contains("Secure"));
         assert!(!set_cookie(COOKIE, "abc123", 3_600, false).contains("Secure"));
 
-        // axum applies an array of header tuples with insert(), which silently
-        // drops all but the last Set-Cookie. This helper must append instead.
+        // axum applies an array of header tuples with insert(), dropping all
+        // but the last Set-Cookie; this helper appends.
         let response = with_cookies(StatusCode::OK, [session, set_cookie(STATE_COOKIE, "s", 0, true)]);
         let set: Vec<_> = response.headers().get_all(header::SET_COOKIE).iter().collect();
         assert_eq!(set.len(), 2, "both cookies must reach the browser");
@@ -530,14 +514,13 @@ mod tests {
         h.insert("x-forwarded-for", "198.51.100.9, 10.0.0.2".parse().unwrap());
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
 
-        // A proxy on loopback or in a private range: the header is the client.
+        // A proxy on loopback or a private range: the header is the client.
         assert_eq!(client_ip(&h, ip("127.0.0.1")).to_string(), "198.51.100.9");
         assert_eq!(client_ip(&h, ip("10.0.0.1")).to_string(), "198.51.100.9");
         assert_eq!(client_ip(&h, ip("::1")).to_string(), "198.51.100.9");
         assert_eq!(client_ip(&h, ip("fd00::1")).to_string(), "198.51.100.9");
-        // Straight off the internet, the header is whatever the caller typed:
-        // honouring it would hand out a fresh identity per request and let the
-        // lockout be walked past for free.
+        // Straight off the internet the header is whatever the caller typed,
+        // and honouring it walks past the lockout for free.
         assert_eq!(client_ip(&h, ip("203.0.113.5")), ip("203.0.113.5"));
         assert_eq!(client_ip(&h, ip("2001:db8::5")), ip("2001:db8::5"));
         // No header at all: the peer, wherever it is.

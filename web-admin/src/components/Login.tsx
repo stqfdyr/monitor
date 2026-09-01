@@ -17,8 +17,8 @@ function GithubMark() {
   )
 }
 
-/// The hub redirects a failed GitHub sign-in back here with the reason
-/// attached, so it is readable in context instead of as a bare 401 page.
+// The hub redirects a failed GitHub sign-in back here with the reason
+// attached, so it is readable in context instead of as a bare 401 page.
 function callbackError(): string {
   const reason = new URLSearchParams(location.search).get("login_error")
   if (reason) history.replaceState({}, "", location.pathname)

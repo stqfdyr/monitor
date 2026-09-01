@@ -1,6 +1,6 @@
 //! The agent side of the hub: one WebSocket per node carrying JSON-RPC 2.0
 //! notifications. One long-lived connection either end can speak first on, and
-//! a frame that names its own method, which `curl` and a browser console read.
+//! frames that name their own method, readable with curl or a browser console.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -24,21 +24,19 @@ use crate::{App, Shared};
 const HEARTBEAT: Duration = Duration::from_secs(30);
 const SILENCE: Duration = Duration::from_secs(120);
 
-/// Tells one agent session on a node apart from the next. A connection can now
-/// outlive its usefulness by up to SILENCE, which is long enough for the agent
-/// to have given up and reconnected; without this tag the late teardown would
-/// remove the live session that replaced it and strand a node that is in fact
-/// reporting normally.
+/// Tells one agent session on a node apart from the next. A connection can
+/// outlive its usefulness by up to SILENCE, long enough for the agent to have
+/// given up and reconnected; without this tag a late teardown would remove the
+/// live session that replaced it.
 static SESSION: AtomicU64 = AtomicU64::new(0);
 
-/// One connected agent. Lives in memory only: it is rebuilt within a report
-/// interval of a hub restart, so persisting it would buy nothing.
+/// One connected agent. In memory only: it is rebuilt within a report interval
+/// of a hub restart.
 ///
-/// One map holds all of this because "the node is online" and "the node has
-/// current figures" are the same fact. Split across two, they were two facts
-/// kept in step by hand at every site that touched either — and they already
-/// disagreed: the connection went into one map at the handshake and the
-/// metrics into the other at the first report, so a node that had connected
+/// One map, because "the node is online" and "the node has current figures" are
+/// the same fact. Split across two they had to be kept in step by hand at every
+/// site touching either, and they disagreed: the connection went in at the
+/// handshake and the metrics at the first report, so a node that had connected
 /// and not yet reported read as offline for a whole `--interval`.
 #[derive(Debug)]
 pub struct Agent {
@@ -52,11 +50,9 @@ pub struct Agent {
     /// Wall-clock minute of the last row written to `metric`.
     pub last_minute: i64,
     /// `(unix seconds, total_rx, total_tx)` as they stood at the last history
-    /// row, so the next one can carry the average rate over the gap between
-    /// them. Without it the row held one report's instantaneous reading, which
-    /// is a 1-in-60 sample of the minute it claims to describe — and the chart
-    /// is drawn from it, so a burst that started and ended between two samples
-    /// simply never happened. See [`report`].
+    /// row, so the next one carries the average rate over the gap. Without it
+    /// the row held one instantaneous reading -- a 1-in-60 sample of the minute
+    /// it claims to describe. See [`report`].
     pub mark: Option<(i64, i64, i64)>,
     /// Running mean of the minute in progress, for the same reason.
     minute: Minute,
@@ -76,15 +72,13 @@ impl Agent {
     }
 }
 
-/// Fields a history row carries as the mean of its minute rather than as the
-/// one reading that happened to land on the boundary. A 30-second spike that
-/// began and ended between two samples is real load; a point sample says the
-/// machine was idle.
+/// Fields a history row carries as the mean of its minute rather than the one
+/// reading that landed on the boundary. A 30-second spike between two samples
+/// is real load; a point sample says the machine was idle.
 ///
-/// `load1` is deliberately absent: the kernel already averages it over the
-/// last minute, so averaging it again would smear it across two. `net_rx` and
-/// `net_tx` are absent because [`report`] fills them from the traffic
-/// accumulator, which is exact rather than merely averaged.
+/// `load1` is absent because the kernel already averages it over the last
+/// minute, and averaging again smears it across two. `net_rx` and `net_tx` are
+/// absent because [`report`] fills them from the accumulator, which is exact.
 const MEAN_FLOAT: [&str; 1] = ["cpu"];
 const MEAN_INT: [&str; 6] = ["mem_used", "swap_used", "disk_used", "tcp", "udp", "procs"];
 
@@ -105,7 +99,7 @@ impl Minute {
 
     /// Replaces each averaged field with the mean of the reports folded in so
     /// far, keeping whole numbers whole: `insert_metric` reads those with
-    /// `as_i64`, which answers nothing at all for a value carrying a fraction.
+    /// `as_i64`, which answers nothing for a value carrying a fraction.
     fn write_into(&self, row: &mut serde_json::Value) {
         let Some(obj) = row.as_object_mut() else { return };
         if self.reports == 0.0 {
@@ -161,9 +155,9 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<String>(16);
     let session = SESSION.fetch_add(1, Ordering::Relaxed);
-    // Online from the handshake, not from the first report: the node is
-    // connected, and a panel that says otherwise for a whole report interval
-    // is describing the hub's bookkeeping rather than the machine.
+    // Online from the handshake, not from the first report: a panel that says
+    // otherwise for a whole report interval is describing the hub's
+    // bookkeeping rather than the machine.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).insert(node_id, Agent::new(session, tx));
     info!("node {node_id} connected from {ip}");
 
@@ -181,11 +175,10 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
                 None => break Ok(()),
             },
             // A machine that drops off the network without closing its socket
-            // leaves the hub waiting on a receive that will never return: the
-            // node reads as online with metrics frozen at the moment it died,
-            // until the kernel eventually gives up on the TCP session hours
-            // later. A ping every HEARTBEAT proves the path both ways, and any
-            // frame coming back — including the pong — counts as a sign of life.
+            // leaves this receive waiting until the kernel gives up on the TCP
+            // session hours later, with the node reading as online and its
+            // metrics frozen. A ping every HEARTBEAT proves the path both ways;
+            // any frame back, the pong included, counts as a sign of life.
             _ = heartbeat.tick() => {
                 let quiet = last_frame.elapsed();
                 if quiet > SILENCE {
@@ -216,12 +209,11 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
 }
 
 /// Drops a node's connection state, but only while `session` is still the one
-/// holding it. Returns whether anything was actually released.
+/// holding it. Returns whether anything was released.
 ///
-/// A teardown can arrive late — up to SILENCE after the agent gave up — by
-/// which time a reconnect may already have installed a newer session under the
-/// same node id. Clearing that one would mark a node offline and cut it off
-/// from probe pushes while it is reporting perfectly well.
+/// A teardown can arrive up to SILENCE after the agent gave up, by which time a
+/// reconnect may have installed a newer session under the same node id.
+/// Clearing that one marks a node offline while it is reporting normally.
 fn release(app: &App, node_id: i64, session: u64) -> bool {
     let mut agents = app.agents.write().unwrap_or_else(|e| e.into_inner());
     if !agents.get(&node_id).is_some_and(|a| a.session == session) {
@@ -250,11 +242,9 @@ fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<()> {
 
 /// Everything a report has to carry for the hub to store a complete row.
 ///
-/// The hub and the agent ship as two binaries from two repositories, and every
-/// reader here ends in `unwrap_or(0)` — so a field the agent renames does not
-/// fail, it silently records zero, for as long as nobody happens to look at
-/// that chart. That is precisely the shape the second of the three ground
-/// rules exists to catch, so it is worth one line in the log.
+/// Hub and agent ship as two binaries from two repositories, and every reader
+/// here ends in `unwrap_or(0)`: a field the agent renames does not fail, it
+/// records zero until somebody looks at that chart. Worth one line in the log.
 const REPORT_FIELDS: [&str; 13] = [
     "boot_id",
     "cpu",
@@ -271,9 +261,9 @@ const REPORT_FIELDS: [&str; 13] = [
     "procs",
 ];
 
-/// Says so, once per connection, when an agent's report is missing fields the
-/// hub stores. A version number could not do this job: the agent that renames
-/// a field carries a *higher* version, not a lower one.
+/// Says so, once per connection, when a report is missing fields the hub
+/// stores. A version number cannot do this: the agent that renames a field
+/// carries a higher version, not a lower one.
 fn check_contract(node_id: i64, metrics: &serde_json::Value) {
     let missing: Vec<&str> = REPORT_FIELDS.iter().copied().filter(|k| metrics.get(k).is_none()).collect();
     if !missing.is_empty() {
@@ -288,9 +278,8 @@ fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()>
     let tx = metrics.get("net_tx_total").and_then(|v| v.as_i64()).unwrap_or(0);
     let traffic = app.db.accumulate(node_id, &boot_id, rx, tx)?;
 
-    // The hub's accumulated figures are what the UI shows, so fold them into
-    // the live payload and let the raw kernel counters stay an implementation
-    // detail of the wire protocol.
+    // The UI shows the hub's accumulated figures, so they are folded into the
+    // live payload and the raw kernel counters stay a wire-protocol detail.
     if let Some(obj) = metrics.as_object_mut() {
         obj.insert("total_rx".into(), json!(traffic.total_rx));
         obj.insert("total_tx".into(), json!(traffic.total_tx));
@@ -300,9 +289,9 @@ fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()>
 
     let minute = now / 60;
     let mut agents = app.agents.write().unwrap_or_else(|e| e.into_inner());
-    // Gone means this session was retired mid-flight — the panel rotated the
-    // token, or the socket is unwinding. The bytes above are still real and
-    // stay booked; there is simply no longer a session to file them under.
+    // Gone means the session was retired mid-flight: the panel rotated the
+    // token, or the socket is unwinding. The bytes above are real and stay
+    // booked; there is no longer a session to file them under.
     let Some(entry) = agents.get_mut(&node_id) else { return Ok(()) };
     if entry.last_seen == 0 {
         check_contract(node_id, &metrics);
@@ -313,12 +302,11 @@ fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()>
     entry.last_seen = now;
     entry.minute.add(&metrics);
 
-    // The stored row summarises the interval since the previous row rather
-    // than the instant it was stamped on: its network rate comes from the
-    // totals this hub watched the counters climb through, and every other
-    // averaged field from the mean of the reports in between. That makes the
-    // chart integrate to the same bytes the totals beside it show. The live
-    // view keeps this report as it arrived, which is what "current" means.
+    // The stored row summarises the interval since the previous row, not the
+    // instant it is stamped on: the network rate comes from the totals this hub
+    // watched climb, every other averaged field from the mean of the reports in
+    // between. That is what makes the chart integrate to the totals beside it.
+    // The live view keeps the report as it arrived.
     let row = store.then(|| {
         let mut row = metrics.clone();
         entry.minute.write_into(&mut row);
@@ -346,8 +334,8 @@ fn ping_tasks_message(app: &App, node_id: i64) -> String {
     json!({"jsonrpc": "2.0", "method": "ping.tasks", "params": tasks}).to_string()
 }
 
-/// Pushes the current probe list to every connected agent. Called after the
-/// panel edits tasks so changes take effect without waiting for a reconnect.
+/// Pushes the current probe list to every connected agent, so a panel edit
+/// takes effect without waiting for a reconnect.
 pub fn push_ping_tasks(app: &App) {
     let connected: Vec<(i64, mpsc::Sender<String>)> = app
         .agents
@@ -376,8 +364,8 @@ mod tests {
             .unwrap()
     }
 
-    /// A connected agent, which is now the precondition for a report being
-    /// filed at all: the session is what holds the node's live state.
+    /// A connected agent, which is the precondition for filing a report at
+    /// all: the session holds the node's live state.
     fn connect(app: &App) -> (i64, mpsc::Receiver<String>) {
         let id = node(app);
         let (tx, rx) = mpsc::channel(4);
@@ -394,9 +382,8 @@ mod tests {
         .to_string()
     }
 
-    /// A burst of reports inside one minute: every one of them moves the live
-    /// view and the running totals, while history takes a single row stamped on
-    /// the minute boundary.
+    /// A burst of reports inside one minute: each moves the live view and the
+    /// running totals, while history takes one row on the minute boundary.
     #[test]
     fn a_burst_of_reports_moves_the_live_view_but_writes_one_history_row() {
         let app = app();
@@ -409,16 +396,16 @@ mod tests {
         let live = app.agents.read().unwrap();
         let entry = live.get(&id).unwrap();
         assert_eq!(entry.metrics["cpu"], 12.5);
-        // First report is the baseline, so only the second one counts.
+        // The first report is the baseline, so only the second counts.
         assert_eq!(entry.metrics["total_rx"], 2_000);
         assert_eq!(entry.metrics["total_tx"], 1_000);
         assert_eq!(entry.metrics["month_rx"], 2_000);
         assert_eq!(entry.last_minute, minute / 60, "the minute already written is remembered");
         drop(live);
 
-        // History rows are keyed by (node, ts), so counting them proves nothing
-        // on its own: five reports a second apart collapse onto one row whether
-        // the minute gate is there or not. The stamp is what shows the gate.
+        // History rows are keyed by (node, ts), so counting them proves
+        // nothing on its own: reports a second apart collapse onto one row
+        // with or without the minute gate. The stamp is what shows it.
         let rows = app.db.metrics(id, 0, 60).unwrap();
         assert_eq!(rows.len(), 1, "a minute of reports is one row");
         assert_eq!(rows[0]["ts"], minute, "stamped on the minute, not on the report");
@@ -427,10 +414,8 @@ mod tests {
     }
 
     /// A history row describes the minute behind it, not the instant it is
-    /// stamped on. The network rate comes from the totals the hub watched the
-    /// counters climb through; everything else from the mean of the reports in
-    /// between. A burst that begins and ends between two samples moved real
-    /// bytes and cost real CPU; a point sample says the machine was idle.
+    /// stamped on: the network rate from the totals the hub watched climb,
+    /// everything else from the mean of the reports in between.
     #[test]
     fn a_history_row_describes_its_whole_minute_not_one_instant() {
         let app = app();
@@ -443,13 +428,13 @@ mod tests {
             .to_string()
         };
 
-        // A connection's first report always opens a row, which also clears
-        // the running mean — so the minute under test starts after it.
+        // A connection's first report opens a row and clears the running
+        // mean, so the minute under test starts after it.
         dispatch(&app, id, "ip", &burst(1_000, 0, 0.0, 0)).unwrap();
         // Busy half the minute, then quiet.
         dispatch(&app, id, "ip", &burst(1_000, 0, 100.0, 100)).unwrap();
-        // Rewind the bookkeeping by a minute so the next report crosses the
-        // boundary and writes a row, with a minute of elapsed time behind it.
+        // Rewind the bookkeeping a minute, so the next report crosses the
+        // boundary with a minute of elapsed time behind it.
         let now = Utc::now().timestamp();
         {
             let mut agents = app.agents.write().unwrap();
@@ -457,15 +442,15 @@ mod tests {
             entry.last_minute -= 1;
             entry.mark = Some((now - 60, 0, 0));
         }
-        // 60 MB arrived during that minute and the machine was busy for half
-        // of it; by the time the agent is sampled again both are over.
+        // 60 MB arrived and the machine was busy for half the minute; by the
+        // next sample both are over.
         dispatch(&app, id, "ip", &burst(1_000 + 60_000_000, 0, 0.0, 201)).unwrap();
 
         let row = &app.db.metrics(id, 0, 60).unwrap()[0];
         assert_eq!(row["net_rx"], 1_000_000, "60 MB over 60 s is 1 MB/s, not the agent's 0");
         assert_eq!(row["cpu"], 50.0, "the mean of the minute, not the idle second it ended on");
         // Whole numbers stay whole: the column is read with as_i64, which
-        // answers nothing at all for the 150.5 the raw mean would have been.
+        // answers nothing for the 150.5 the raw mean would be.
         assert_eq!(row["mem_used"], 151);
         // And the live view still shows the instant, which is what it is for.
         assert_eq!(app.agents.read().unwrap()[&id].metrics["net_rx"], 0);
@@ -497,14 +482,13 @@ mod tests {
             .to_string()
         };
         dispatch(&app, id, "ip", &result(7, 42)).unwrap();
-        // Records are keyed by (node, task, ts), so the rejected ones carry a
-        // task id of their own: a bare count would be satisfied by the key
-        // collapsing them onto the good row.
+        // The rejected results carry task ids of their own: a bare count would
+        // be satisfied by the key collapsing them onto a good row.
         dispatch(&app, id, "ip", &result(8, 15)).unwrap();
         dispatch(&app, id, "ip", &result(0, 42)).unwrap(); // no such task
         dispatch(&app, id, "ip", &result(-1, 42)).unwrap(); // nor this one
 
-        // Sorted rather than indexed: both rows land in the same second, and
+        // Sorted rather than indexed: both rows land in the same second and
         // the query orders by timestamp.
         let mut seen: Vec<(i64, i64)> = app
             .db
@@ -535,7 +519,7 @@ mod tests {
         let id = node(&app);
         let live = || app.agents.read().unwrap().contains_key(&id);
         // release() reads the session tag, not the channel, so the receiver
-        // going away here changes nothing.
+        // going away changes nothing.
         let connect = |session| {
             let (tx, _) = mpsc::channel(1);
             app.agents.write().unwrap().insert(id, Agent::new(session, tx));
@@ -546,8 +530,8 @@ mod tests {
         assert!(release(&app, id, 1));
         assert!(!live(), "its own teardown clears the node");
 
-        // The race: the agent gave up and reconnected while the old socket sat
-        // half-open, so session 2 is live when session 1 finally unwinds.
+        // The race: the agent gave up and reconnected while the old socket was
+        // half-open, so session 2 is live when session 1 unwinds.
         connect(1);
         connect(2);
         assert!(!release(&app, id, 1), "a stale session must release nothing");

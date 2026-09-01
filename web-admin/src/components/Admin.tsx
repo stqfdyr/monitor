@@ -16,8 +16,8 @@ import { api, type Node, type PingTask } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, monthUsage, uptime } from "@/lib/format"
 
 const GIB = 1024 ** 3
-/// Counters the panel can correct by hand, e.g. after a node moved to new
-/// hardware and the hub booked the new machine's lifetime traffic in one go.
+// Counters the panel can correct by hand, after a node moves to new hardware
+// and the hub books the new machine's lifetime traffic in one go.
 const TRAFFIC_FIELDS = [
   ["total_rx", "累计下行"],
   ["total_tx", "累计上行"],
@@ -31,8 +31,8 @@ const TRAFFIC_MODES: Record<string, string> = {
   down: "仅下行",
 }
 
-/// Reordering rides on the browser's own view transitions, so the rows that
-/// make way slide instead of jumping. Browsers without it just jump.
+// Reordering rides on the browser's view transitions, so rows that make way
+// slide. Browsers without it jump.
 function animate(update: () => void) {
   if (document.startViewTransition) document.startViewTransition(() => flushSync(update))
   else update()
@@ -45,11 +45,11 @@ function copy(text: string) {
   )
 }
 
-/// Every address a node has, on one line, each click-to-copy: reading one off
-/// the screen to paste into an ssh command is the whole reason it is shown.
+// Every address a node has, each click-to-copy: pasting one into an ssh
+// command is the reason it is shown at all.
 function Addresses({ node }: { node: Node }) {
   const reported = [node.ipv4, node.ipv6].filter(Boolean) as string[]
-  // `ip` is only where the agent's connection came from — the fallback for an
+  // `ip` is only where the agent's connection came from: the fallback for an
   // agent too old to report its own interfaces.
   const list = reported.length ? reported : ([node.ip].filter(Boolean) as string[])
   if (!list.length) return <span className="text-sm text-muted-foreground">—</span>
@@ -164,8 +164,8 @@ function NodeForm({ node, onClose, onSaved }: {
   const [traffic, setTraffic] = useState(() =>
     Object.fromEntries(TRAFFIC_FIELDS.map(([k]) => [k, gib(node[k])])) as Record<string, string>,
   )
-  // Compared as typed, not as bytes: rounding to GB would otherwise look like
-  // an edit and zero out a node that has only moved a few MB.
+  // Compared as typed, not as bytes: rounding to GB reads as an edit and would
+  // zero out a node that has moved a few MB.
   const pristine = useRef(traffic)
   const set = <K extends keyof Node>(k: K, v: Node[K]) => setForm((f) => ({ ...f, [k]: v }))
 
@@ -275,7 +275,7 @@ function BillingForm({ node, onClose, onSaved }: {
 }) {
   const [form, setForm] = useState(node)
   // Text, not a number: a numeric state cannot hold "empty", so clearing the
-  // box used to snap back to 0 while you were still typing. Empty means free.
+  // box snaps back to 0 mid-typing. Empty means free.
   const [price, setPrice] = useState(node.price > 0 ? String(node.price) : "")
   const [saving, setSaving] = useState(false)
   const set = <K extends keyof Node>(k: K, v: Node[K]) => setForm((f) => ({ ...f, [k]: v }))
@@ -359,9 +359,9 @@ function shellArg(value: string) {
   return `'${value.replaceAll("'", `'"'"'`)}'`
 }
 
-/// Built here rather than fetched: the node list already carries the token, so
-/// looking at an install command is a read, not an act. Reissuing one to be
-/// able to show it is what used to knock the running agent offline.
+// Built here rather than fetched: the node list already carries the token, so
+// looking at an install command is a read, not an act. Reissuing one to show
+// it knocks the running agent offline.
 function installCommand(site: string, token: string, seconds: number, proxy: string) {
   const args = [`--server ${site}`, `--token ${token}`, `--interval ${seconds}`]
   if (proxy) args.push(`--github-proxy ${shellArg(proxy.includes("://") ? proxy : `https://${proxy}`)}`)
@@ -416,8 +416,8 @@ function InstallDialog({ node, site, onClose, onRotated }: {
           <div className="space-y-2">
             <Label className="text-sm font-medium">安装命令</Label>
             <pre className="h-28 overflow-auto whitespace-pre-wrap break-all rounded-lg border bg-muted/40 p-3 text-xs leading-relaxed select-all">
-              {/* A node added before the hub kept the token has nothing to show
-                  until its agent reconnects and hands it back. */}
+              {/* A node added before the hub kept tokens has nothing to show
+                  until one is reissued. */}
               {command || "旧版本创建的凭证不可读取，换发后显示"}
             </pre>
           </div>
@@ -486,8 +486,7 @@ function Nodes({ nodes, refresh, site }: { nodes: Node[]; refresh: () => void; s
     }
   }
 
-  /// Rows make way while the pointer is still down; the order is only saved
-  /// once it is dropped.
+  // Rows make way while the pointer is down; the order is saved on drop.
   function move(from: number, to: number) {
     if (from < 0 || to < 0 || to >= order.length || from === to) return
     const next = [...order]
@@ -497,7 +496,7 @@ function Nodes({ nodes, refresh, site }: { nodes: Node[]; refresh: () => void; s
     return ids
   }
 
-  /// Dropped outside the table, or cancelled with Escape: back where it was.
+  // Dropped outside the table, or cancelled with Escape: back where it was.
   function cancel() {
     setDragging(null)
     const rollback = orderBeforeDrag.current
@@ -526,9 +525,8 @@ function Nodes({ nodes, refresh, site }: { nodes: Node[]; refresh: () => void; s
       <Card className="overflow-x-auto p-0">
         <Table>
           <TableHeader>
-            {/* Percentages, so the columns keep an even rhythm instead of the
-                address column swallowing every spare pixel and pushing status
-                across the table. */}
+            {/* Percentages, or the address column swallows every spare pixel
+                and pushes status across the table. */}
             <TableRow>
               <TableHead className="w-[20%]">名称</TableHead>
               <TableHead className="w-[22%]">IP</TableHead>
@@ -589,17 +587,16 @@ function Nodes({ nodes, refresh, site }: { nodes: Node[]; refresh: () => void; s
                     {n.online ? "在线" : "离线"}
                   </Badge>
                   {!n.public && <Badge variant="outline" className="ml-1 font-normal">不公开</Badge>}
-                  {/* Under the badge rather than inside it: the column is a
-                      tenth of the table, and "离线" plus a duration plus the
-                      不公开 badge do not share one line. */}
+                  {/* Under the badge, not inside it: the column is a tenth of
+                      the table and the three do not share one line. */}
                   {!n.online && n.last_seen > 0 && Date.now() / 1000 - n.last_seen >= 60 && (
                     <div className="tnum mt-1 text-xs text-muted-foreground">
                       {uptime(Date.now() / 1000 - n.last_seen)}
                     </div>
                   )}
                 </TableCell>
-                {/* Counted by the node's own billing rule, the same way the
-                    public page and the quota below it are. */}
+                {/* Counted by the node's own billing rule, as on the public
+                    page. */}
                 <TableCell className="tnum text-sm">
                   {bytes(monthUsage(n))}
                   <span className="text-muted-foreground">
@@ -1004,8 +1001,8 @@ function SettingsTab({ site }: { site: string }) {
   )
 }
 
-/// Each admin area is its own route rather than a tab, so a page can be
-/// linked to and survives a reload on the section you were actually in.
+// Each area is its own route rather than a tab, so a page can be linked to
+// and a reload lands on the section it was on.
 const ADMIN_SECTIONS = [
   { path: "/admin/nodes", label: "节点", icon: Server },
   { path: "/admin/ping", label: "延迟监控", icon: Radio },
