@@ -51,10 +51,9 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         "sort": node.sort,
         "public": node.public,
         "online": current.is_some(),
-        // The live entry while it is connected, the stored one after it goes:
-        // "offline" is worth much more with a "since when" attached.
-        // Zero means connected but not yet reporting, which is not a time:
-        // fall back to the stored one so "offline since" survives the gap.
+        // The live entry while connected, the stored one after. Zero means
+        // connected but not yet reporting, which is not a time, so it falls
+        // back to the stored one and "offline since" survives the gap.
         "last_seen": current.map(|a| a.last_seen).filter(|t| *t > 0).unwrap_or(node.last_seen),
         "metrics": current.map(|a| a.metrics.clone()).unwrap_or(Value::Null),
         "os": node.os,
@@ -84,9 +83,8 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         "day_rx": traffic.day_rx,
         "day_tx": traffic.day_tx,
     });
-    // Raw kernel counters are a wire-protocol detail: the hub's accumulated
-    // figures above are the truth, and the raw ones expose a machine's whole
-    // lifetime traffic to anyone loading the public page.
+    // Raw kernel counters are a wire-protocol detail, and they expose a
+    // machine's whole lifetime traffic to anyone loading the public page.
     if !full {
         if let Some(m) = view["metrics"].as_object_mut() {
             m.remove("boot_id");
@@ -94,9 +92,8 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
             m.remove("net_tx_total");
         }
     }
-    // Address, private notes and the node's token never leave the panel. The
-    // token is here so the install command can be shown whenever it is asked
-    // for, rather than reissued to be read — see docs/decisions.md.
+    // Address, private notes and the token never leave the panel. The token is
+    // here so the install command can be shown without reissuing it.
     if full {
         view["hostname"] = json!(node.hostname);
         view["ip"] = json!(node.ip);
@@ -109,8 +106,8 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
 }
 
 fn visible_nodes(app: &App, full: bool) -> Result<Vec<Value>, anyhow::Error> {
-    // One traffic query and one lock for the whole list, not one of each per
-    // node: this list is what every visitor to the public page loads.
+    // One traffic query and one lock for the whole list: this is what every
+    // visitor to the public page loads.
     let nodes = app.db.nodes()?;
     let traffic = app.db.all_traffic();
     let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
@@ -127,10 +124,9 @@ pub async fn nodes(State(app): State<Shared>, headers: HeaderMap) -> Response {
     if !full && !app.public_page() {
         return (StatusCode::UNAUTHORIZED, "sign-in required").into_response();
     }
-    // The same rendered frame the browser streams get, for the same reason: a
-    // public status page that gets linked somewhere busy would otherwise
-    // rebuild every node's row once per visitor, against the connection the
-    // agents are writing through.
+    // The same rendered frame the browser streams get, and for the same
+    // reason: otherwise every visitor rebuilds every node's row against the
+    // connection the agents write through.
     ([(axum::http::header::CONTENT_TYPE, "application/json")], live_snapshot(&app, full).as_str().to_owned())
         .into_response()
 }
@@ -139,13 +135,11 @@ pub async fn nodes(State(app): State<Shared>, headers: HeaderMap) -> Response {
 pub struct Window {
     #[serde(default = "default_hours")]
     hours: i64,
-    /// How many points the caller can actually draw. Optional: an old theme,
-    /// or curl, gets the full budget.
+    /// How many points the caller can draw. Absent means the full budget.
     points: Option<i64>,
-    /// Which half of the answer the caller will draw, `metrics` or `ping`.
-    /// Each tab draws one of them, and the one it does not draw was between a
-    /// third and two thirds of every response. Absent means both, which is
-    /// what curl and an older theme get.
+    /// Which half the caller will draw, `metrics` or `ping`. Each tab draws
+    /// one, and the other was a third to two thirds of every response. Absent
+    /// means both.
     series: Option<String>,
 }
 
@@ -159,18 +153,18 @@ pub async fn metrics(
     Path(id): Path<i64>,
     Query(w): Query<Window>,
 ) -> Response {
-    if !readable(&app, &headers, id) {
+    let full = authed(&app, &headers);
+    if !readable(&app, full, id) {
         return (StatusCode::UNAUTHORIZED, "sign-in required").into_response();
     }
-    let hours = w.hours.clamp(1, 24 * 90);
+    let hours = w.hours.clamp(1, if full { ADMIN_HOURS } else { PUBLIC_HOURS });
     let since = Utc::now().timestamp() - hours * 3_600;
     let step = sample_step(hours, w.points);
     let wants = |name: &str| w.series.as_deref().is_none_or(|s| s == name);
-    // Probe names ride along with the samples they label, so the chart reads
-    // the same for a visitor as for the admin and the page needs no second
-    // request. Only the names: targets and assignments stay behind `Admin`.
-    // Only when the probes themselves were asked for: the resources tab has
-    // nothing to label, and this is a turn at the write connection either way.
+    // Probe names ride along with the samples they label, so the page needs no
+    // second request. Names only: targets and assignments stay behind `Admin`.
+    // Skipped when the probes were not asked for -- the resources tab has
+    // nothing to label, and this is a turn at the write connection.
     let probes =
         if wants("ping") { app.db.ping_task_names().unwrap_or_else(|_| json!({})) } else { json!({}) };
     let metrics = if wants("metrics") { app.db.metrics(id, since, step) } else { Ok(vec![]) };
@@ -181,22 +175,29 @@ pub async fn metrics(
     }
 }
 
+/// Widest history window each audience may ask for.
+///
+/// The thinning below bounds the response, not the scan behind it: `hours=2160`
+/// answers with 320 rows after reading every probe result the node has kept.
+/// Measured at a month of retention that is 224 ms holding the single write
+/// connection the agents report through, and it grows with `retention_days`.
+///
+/// The public ceiling is a week because that is the widest chart the themes
+/// draw, so it costs nothing anyone was asking for. The panel keeps the quarter
+/// year: it is one signed-in operator, not an anonymous caller.
+const PUBLIC_HOURS: i64 = 24 * 7;
+const ADMIN_HOURS: i64 = 24 * 90;
+
 /// Seconds between the samples a window is drawn from.
 ///
-/// **Thinning is what the screen cannot draw, never a house style.** A day at
-/// the rate the hub writes is 1 440 metric rows and as many probe results per
-/// probe; a screen has a thousand-odd pixels of chart. Where the samples fit,
-/// every one of them is sent — a chart of a hundred points looks like a hundred
-/// samples were taken, whatever the sampler underneath it was really doing, and
-/// on a probe that is a claim about the network. Whole minutes, because that is
-/// the grid the metric rows sit on.
+/// Thinning is for what the screen cannot draw, not a house style: where the
+/// samples fit, every one is sent. A chart of a hundred points reads as a
+/// hundred samples taken, and on a probe that is a claim about the network.
+/// Whole minutes, because that is the grid the metric rows sit on.
 ///
-/// `points` is what the caller says it can draw, the way Grafana's panels send
-/// their own width. It only ever lowers the budget: `SAMPLES` is the hub's
-/// ceiling, not the caller's, because this path takes no credentials, and the
-/// unthinned quarter-year behind it is 129 600 rows a series. The ceiling is
-/// set at a day of minutes, so the widest window a probe is charted over comes
-/// back whole.
+/// `points` is what the caller says it can draw. It only lowers the budget:
+/// `SAMPLES` is the hub's ceiling, not the caller's, and it sits at a day of
+/// minutes so the widest charted probe window comes back whole.
 // ponytail: the budget is per series, so a response is SAMPLES × (1 + probes) --
 // bounded by how many probes the admin created, not by the caller. Four probes
 // at a day is ~90 kB gzipped; if that list ever grows long, scale SAMPLES by
@@ -204,79 +205,68 @@ pub async fn metrics(
 fn sample_step(hours: i64, points: Option<i64>) -> i64 {
     const SAMPLES: i64 = 1_440;
     let budget = points.unwrap_or(SAMPLES).clamp(60, SAMPLES);
-    // Rounded up, or the budget is not one. Dividing down, a window that does
-    // not divide evenly keeps the finer step and overruns: `hours=23` answered
-    // with 1 380 points a series against the 720 this exists to hold it to, and
-    // that ceiling is the whole reason the thinning is here -- it is the size
-    // of a response anyone at all can ask the hub to build.
-    //
-    // `i64::div_ceil` is still unstable, and both sides are positive here.
+    // Rounded up, or the budget is not one: a window that does not divide
+    // evenly keeps the finer step and overruns it. `i64::div_ceil` is still
+    // unstable, and both sides are positive here.
     60 * ((hours * 60 + budget - 1) / budget).max(1)
 }
 
 /// Guards a per-node read: the panel sees everything, the public page only
-/// sees nodes that were explicitly published.
-fn readable(app: &App, headers: &HeaderMap, id: i64) -> bool {
-    authed(app, headers) || (app.public_page() && app.db.node(id).ok().flatten().is_some_and(|n| n.public))
+/// sees nodes that were explicitly published. `full` is the caller's own
+/// `authed`, passed in because the handler needs it for the window ceiling too.
+fn readable(app: &App, full: bool, id: i64) -> bool {
+    full || (app.public_page() && app.db.node(id).ok().flatten().is_some_and(|n| n.public))
 }
 
-/// Per-connection read buffer for both WebSocket surfaces. The default is
-/// 128 KiB, which at a few hundred agents is tens of megabytes of buffer for
-/// frames that are a few hundred bytes each.
+/// Per-connection read buffer for both WebSocket surfaces. The 128 KiB default
+/// is tens of megabytes at a few hundred agents, for frames a few hundred bytes
+/// long.
 pub const SOCKET_BUFFER: usize = 4 * 1024;
 
-/// Largest frame either socket will accept, matching the 64 KiB cap the HTTP
-/// body already carries — a report is a few hundred bytes, and nothing on
-/// either socket is legitimately larger.
-///
-/// The body limit is a tower layer, so it never applied here: without this the
-/// default ceiling is 64 MiB. A node's own token buys the whole of it, and what
-/// arrives on it is stored and then handed to every viewer of the public page.
+/// Largest frame either socket accepts, matching the 64 KiB cap on the HTTP
+/// body. The body limit is a tower layer and never applied here, where the
+/// default ceiling is 64 MiB -- which a node's own token would buy, for content
+/// that is stored and then handed to every viewer of the public page.
 pub const MAX_FRAME: usize = 64 * 1024;
 
 /// How long one rendered snapshot is reused. Just under the push interval, so
 /// every tick still rebuilds once and no viewer is served a stale frame twice.
 const SNAPSHOT_TTL_MS: i64 = 1_900;
 
-/// The payload every browser stream sends, built at most once per tick no
-/// matter how many tabs are watching.
-///
-/// The public status page is open to anonymous visitors, so the old
-/// per-connection build made viewer count a multiplier on database work: each
-/// one queried every node's traffic row every two seconds, against the same
-/// connection the agents write through. Two slots, because the admin view
-/// carries fields the public one must never see.
+/// The payload every browser stream sends, built at most once per tick however
+/// many tabs are watching: the public page is anonymous, so a per-connection
+/// build makes viewer count a multiplier on database work. Two slots, because
+/// the admin view carries fields the public one must never see.
 fn live_snapshot(app: &App, full: bool) -> Utf8Bytes {
     let now = Utc::now().timestamp_millis();
     let slot = usize::from(full);
     let mut cache = app.snapshot.lock().unwrap_or_else(|e| e.into_inner());
-    // A cached frame's age has to be an age: non-negative. A wall clock can step
-    // backwards -- NTP correcting a fresh boot -- and against a bare upper bound
-    // the negative that produces reads as "young", pinning the panel to a stale
-    // frame until real time catches up to where the clock had been.
+    // A cached frame's age has to be non-negative. A wall clock can step back
+    // -- NTP correcting a fresh boot -- and against a bare upper bound the
+    // negative that produces reads as young, pinning the panel to a stale
+    // frame until real time catches up.
     if (0..SNAPSHOT_TTL_MS).contains(&now.saturating_sub(cache[slot].0)) {
         return cache[slot].1.clone();
     }
     let nodes = visible_nodes(app, full).unwrap_or_default();
-    // `admin` rides along so the panel's first fetch and its stream can share
-    // one cached frame; the stream's consumers only ever read `nodes`.
+    // `admin` rides along so the panel's first fetch and its stream share one
+    // cached frame.
     let payload = Utf8Bytes::from(json!({"nodes": nodes, "admin": full}).to_string());
     cache[slot] = (now, payload.clone());
     payload
 }
 
-/// Drops the cached frames so the next push rebuilds. A write the panel just
-/// made has to be in that push: without this the node it added blinks back out
-/// of the list, and the one it deleted reappears, until the frame ages out.
+/// Drops the cached frames so the next push rebuilds. Without it a node the
+/// panel just added blinks back out of the list until the frame ages out.
 fn invalidate_snapshot(app: &App) {
     for slot in app.snapshot.lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
         slot.0 = 0;
     }
 }
 
-/// Live stream for the browser. Each connection runs its own timer, which is
-/// cheaper to reason about than a fan-out channel; the snapshot behind it is
-/// shared, so the timers cost nothing but a send.
+/// Live stream for the browser. Each connection runs its own timer -- cheaper
+/// to reason about than a fan-out channel -- over a shared snapshot, so a timer
+/// costs nothing but a send.
 pub async fn live_ws(State(app): State<Shared>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
     let full = authed(&app, &headers);
     if !full && !app.public_page() {
@@ -325,9 +315,8 @@ pub async fn create_node(
     node.name = node.name.trim().to_owned();
     let token = random_token();
     match app.db.create_node(&node, &token) {
-        // The node is usable straight away: its install command is readable
-        // from the node list, so adding and deploying stay separate steps
-        // without a reissue standing between them.
+        // Usable straight away: the install command is readable from the node
+        // list, so adding and deploying need no reissue between them.
         Ok(id) => {
             invalidate_snapshot(&app);
             Json(json!({"id": id})).into_response()
@@ -361,10 +350,9 @@ pub struct NodeOrder {
     ids: Vec<i64>,
 }
 
-/// The list must name every node exactly once. That is checked inside the
-/// transaction that does the renumbering rather than here: a duplicate, a
-/// missing node and an unknown id are the same three rejections either way, and
-/// re-reading the node list first only made the check race the write it guards.
+/// The list must name every node exactly once, checked inside the transaction
+/// that renumbers rather than here: re-reading the node list first only makes
+/// the check race the write it guards.
 pub async fn reorder_nodes(_: Admin, State(app): State<Shared>, Json(order): Json<NodeOrder>) -> Response {
     match app.db.reorder_nodes(&order.ids) {
         Ok(()) => {
@@ -386,30 +374,27 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     }
 }
 
-/// Issues a fresh token, which immediately invalidates the old one.
+/// Issues a fresh token, invalidating the old one at once.
 ///
-/// Only ever an explicit act now — rotate a token you think has leaked, and
-/// reinstall the agent afterwards. Reading the install command no longer goes
-/// through here, so nothing routine lands on it by accident.
+/// Always an explicit act: rotate a token you think has leaked, then reinstall
+/// the agent. Reading the install command does not go through here.
 pub async fn reset_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
     let token = random_token();
     let updated = app.db.node(id).map(|n| n.is_some()).unwrap_or(false);
     if !updated {
         return (StatusCode::NOT_FOUND, "no such node").into_response();
     }
-    // The token is only checked during the handshake, so a session opened with
-    // the old one would otherwise keep reporting indefinitely — a rotation
-    // after a leak has to close the door that token already walked through.
-    // Dropping the sender ends the agent's loop; it reconnects and is refused.
-    // The live entry goes with it: that loop no longer owns it, so its own
-    // teardown will leave it alone.
+    // The token is checked only at the handshake, so a session opened with the
+    // old one would keep reporting. Dropping the sender ends that loop; it
+    // reconnects and is refused. Its own teardown leaves the entry alone,
+    // because the session tag no longer matches.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
-    // The token is part of the admin frame, so the panel would otherwise keep
+    // The token is part of the admin frame, which would otherwise go on
     // showing an install command for the credential just retired.
     invalidate_snapshot(&app);
     match app.db.reset_token(id, &token) {
-        // Just the token: the panel builds the command, and one place that
-        // knows its shape is enough.
+        // Just the token: the panel builds the command, and one place knowing
+        // its shape is enough.
         Ok(()) => Json(json!({"token": token})).into_response(),
         Err(e) => fail(e),
     }
@@ -506,9 +491,8 @@ pub async fn save_settings(_: Admin, State(app): State<Shared>, Json(body): Json
         let Some(value) = value.as_str() else { continue };
         let stored = match key.as_str() {
             "theme" if !crate::frontend::selectable(&app, value) => return bad("theme is not installed"),
-            // Housekeeping clamps whatever it reads back, so anything it cannot
-            // parse would be stored, shown back in the panel, and quietly mean
-            // 30 days forever. Refuse it here instead.
+            // Housekeeping clamps whatever it reads, so an unparseable value
+            // would be stored, shown back, and quietly mean 30 days forever.
             "retention_days" if !value.parse::<i64>().is_ok_and(|d| (1..=3_650).contains(&d)) => {
                 return bad("retention days must be a number from 1 to 3650")
             }
@@ -519,7 +503,7 @@ pub async fn save_settings(_: Admin, State(app): State<Shared>, Json(body): Json
                     return bad("password must be at least 12 characters");
                 }
                 // Every existing session dies with the old password; the
-                // browser doing the change gets a replacement below.
+                // caller gets a replacement below.
                 match hash_password(value).and_then(|h| {
                     app.db.set("admin_password_hash", &h)?;
                     app.db.drop_all_sessions()?;
@@ -552,9 +536,9 @@ mod tests {
         App::for_test(Db::open(":memory:").unwrap())
     }
 
-    /// A connected agent holding one report, as `App.agents` carries it. The
-    /// receiver comes back because dropping it closes the channel, which is
-    /// itself the signal `reset_token` is tested for.
+    /// A connected agent holding one report. The receiver comes back because
+    /// dropping it closes the channel, which is the signal `reset_token` is
+    /// tested for.
     fn connect(app: &App, id: i64, metrics: Value) -> tokio::sync::mpsc::Receiver<String> {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let mut agent = crate::agent_ws::Agent::new(7, tx);
@@ -573,20 +557,17 @@ mod tests {
             .unwrap()
     }
 
-    /// A chart request costs about the same whatever it spans. Nothing on this
-    /// path asks for a session, so an unbounded month-wide window is a few
-    /// megabytes of JSON that anyone at all can ask the hub to build, over and
-    /// over, on the connection the agents are reporting through.
+    /// A chart request costs about the same whatever it spans. This path asks
+    /// for no session, so an unbounded window is megabytes of JSON that anyone
+    /// can ask the hub to build on the connection the agents report through.
     #[test]
     fn a_history_window_costs_the_same_however_wide_it_is() {
         let app = app();
         let id = node(&app, "n", true);
         let now = Utc::now().timestamp();
-        // A month of history at the rate the hub actually writes it: a metric
-        // row a minute, and a probe result rather more often than that. Two
-        // probes, because each one is a line of its own on the chart and so
-        // gets its own samples -- the budget is per series, not per response,
-        // and a single-probe fixture would hide that.
+        // A month of history at the rate the hub writes it. Two probes,
+        // because the budget is per series and a single-probe fixture would
+        // hide that.
         const PROBES: i64 = 2;
         for i in 0..30 * 1440 {
             app.db.insert_metric(id, now - i * 60, &json!({"cpu": 1.0})).unwrap();
@@ -595,17 +576,16 @@ mod tests {
             }
         }
 
-        // Windows that do not divide evenly into the budget included, because
-        // those are the ones a step rounded the wrong way overruns on.
+        // Windows that do not divide evenly included: those are the ones a
+        // step rounded the wrong way overruns on.
         for hours in [1, 6, 13, 23, 24, 168, 2_160] {
             let step = sample_step(hours, None);
             let since = now - hours * 3_600;
             let metrics = app.db.metrics(id, since, step).unwrap();
             let ping = app.db.ping_records(id, since, step).unwrap();
             // Against the budget itself, not against whatever the step worked
-            // out to -- derived from the step this says only that division
-            // works, and stays green while the step lets the budget be blown.
-            // One bucket of slack: the window rarely divides evenly.
+            // out to: derived from the step, this would only say that division
+            // works. One bucket of slack, as the window rarely divides evenly.
             let cap = 1_441;
             assert!(metrics.len() <= cap, "{hours}h returned {} metric rows", metrics.len());
             assert!(
@@ -615,61 +595,54 @@ mod tests {
             );
             // Thin, but not empty, and not reaching outside the window.
             assert!(!metrics.is_empty() && !ping.is_empty(), "{hours}h returned nothing");
-            // A row is stamped with its bucket's start, and a bucket the
-            // window opens halfway through starts before the window does.
+            // A bucket the window opens halfway through starts before it.
             assert!(
                 metrics.iter().all(|m| m["ts"].as_i64().unwrap() >= since - step),
                 "{hours}h reached back too far"
             );
         }
-        // The whole point: the widest window is no dearer than a narrow one.
-        // Against a month of history, unthinned, this was 43 200 rows.
+        // The widest window is no dearer than a narrow one: unthinned, a month
+        // of history is 43 200 rows.
         assert!(app.db.metrics(id, now - 2_160 * 3_600, sample_step(2_160, None)).unwrap().len() <= 1_441);
 
-        // A day comes back as every minute it holds. A chart of a hundred
-        // points reads as a hundred samples taken, however densely the sampler
-        // under it really ran -- and on a probe that is a claim about the
-        // network. Thinning is for what the screen cannot draw, nothing else.
+        // A day comes back as every minute it holds: thinning is for what the
+        // screen cannot draw, nothing else.
         assert_eq!(sample_step(24, Some(2_000)), 60, "a day of minutes fits under the ceiling");
         assert_eq!(sample_step(6, Some(2_000)), 60, "and so does six hours");
 
-        // A caller may ask for less than it can draw, and no caller may ask for
-        // more: the ceiling on this path is the hub's, since it takes no
-        // credentials. A phone asking for its 390 pixels gets a coarser step.
+        // A caller may ask for less than the budget, never more: the ceiling
+        // belongs to the hub, since this path takes no credentials.
         assert!(sample_step(24, Some(390)) > sample_step(24, None));
         assert_eq!(sample_step(24, Some(100_000)), sample_step(24, None));
         assert_eq!(sample_step(24, Some(0)), sample_step(24, Some(60)));
 
         // Asking for one half leaves the other empty rather than shipping it:
-        // on the day window the half a tab does not draw was two thirds of the
-        // response, and nothing on the page ever looked at it.
+        // on the day window that half was two thirds of the response.
         let series = |q: &str| serde_urlencoded::from_str::<Window>(q).unwrap().series;
         assert_eq!(series("hours=24&series=ping").as_deref(), Some("ping"));
         assert!(series("hours=24").is_none(), "no series means both, which is what curl gets");
     }
 
-    /// What a thinned bucket is allowed to answer with. Keeping one row of it
-    /// and dropping the rest is how the seven-day traffic chart came to
-    /// integrate to twice the traffic the minutes hold, and how a probe losing
-    /// half its packets came to draw as an unbroken line.
+    /// What a thinned bucket may answer with. Keeping one row and dropping the
+    /// rest made the seven-day chart integrate to twice the traffic the minutes
+    /// hold, and drew a probe losing half its packets as an unbroken line.
     #[test]
     fn a_thinned_bucket_answers_with_its_mean_and_says_what_it_lost() {
         let app = app();
         let id = node(&app, "n", true);
-        // Anchored on a bucket boundary, and a whole bucket into the past.
-        // Hung off `now` instead, the rows straddle the boundary or not
-        // depending on what second the suite is run at, and the assertions
-        // below are green on a developer's machine and red on CI.
+        // Anchored on a bucket boundary, a whole bucket into the past. Hung
+        // off `now`, the rows straddle the boundary depending on what second
+        // the suite runs at.
         let base = Utc::now().timestamp() / 120 * 120 - 120;
-        // One bucket's worth: a quiet minute and a busy one, then a probe that
+        // One bucket: a quiet minute and a busy one, then a probe that
         // answered once and timed out three times.
         app.db.insert_metric(id, base + 10, &json!({"cpu": 0.0, "net_rx": 0})).unwrap();
         app.db.insert_metric(id, base + 70, &json!({"cpu": 40.0, "net_rx": 1_000})).unwrap();
         for (i, latency) in [30, -1, -1, -1].into_iter().enumerate() {
             app.db.insert_ping(id, 1, base + 10 + i as i64 * 20, latency).unwrap();
         }
-        // A second probe that never answered at all, which used to vanish, and
-        // a third that answered cleanly.
+        // A second probe that never answered, and a third that answered
+        // cleanly.
         app.db.insert_ping(id, 2, base + 10, -1).unwrap();
         app.db.insert_ping(id, 3, base + 10, 12).unwrap();
 
@@ -678,8 +651,8 @@ mod tests {
         assert_eq!(m["net_rx"], 500);
         assert_eq!(m["ts"], base, "stamped with the bucket, so every series shares a grid");
 
-        // By task, not by index: the three rows share a timestamp, so the
-        // query's `ORDER BY ts` leaves their order to SQLite.
+        // By task, not by index: the rows share a timestamp, so `ORDER BY ts`
+        // leaves their order to SQLite.
         let rows = app.db.ping_records(id, base, 120).unwrap();
         let probe = |task: i64| {
             rows.iter().find(|r| r["task_id"] == task).unwrap_or_else(|| panic!("no probe {task}"))
@@ -690,15 +663,13 @@ mod tests {
         assert_eq!(probe(2)["loss"], 100);
         // One answer, so there is nothing for a band to span.
         assert!(probe(1).get("band").is_none(), "{:?}", probe(1));
-        // A clean bucket carries no loss key at all: it is per row, per probe,
-        // on a response that is already a quarter of a megabyte. Which is
-        // exactly why the percentage rounds up -- the absence of the key is
-        // read as "nothing was lost", so nothing lost has to be the only way
-        // to produce it.
+        // A clean bucket carries no loss key at all, which is why the
+        // percentage rounds up: the key's absence reads as "nothing was lost",
+        // so nothing lost has to be the only way to produce it.
         assert!(probe(3).get("loss").is_none(), "{:?}", probe(3));
 
-        // One timeout in a bucket too full for it to be a whole percent.
-        // Truncating divides this into the same answer as a clean bucket.
+        // One timeout in a bucket too full for it to be a whole percent:
+        // truncating answers the same as a clean bucket.
         let wide = node(&app, "wide", true);
         let wide_base = base / 180 * 180;
         for i in 0..180 {
@@ -709,9 +680,8 @@ mod tests {
         let row = &rows[0];
         assert_eq!(row["loss"], 1, "a bucket that lost one of 180 has not lost none");
 
-        // What the band is for: the middle reading, and the two ends the bucket
-        // actually reached. Drawing 20 here and nothing else is a link that
-        // swung 40 ms inside two minutes rendered as a flat point.
+        // What the band is for: the middle reading and the two ends the bucket
+        // reached. Drawing 20 alone renders a 40 ms swing as a flat point.
         let jitter = node(&app, "jitter", true);
         for (i, latency) in [10, 20, 50, 20, 20].into_iter().enumerate() {
             app.db.insert_ping(jitter, 1, wide_base + i as i64, latency).unwrap();
@@ -735,8 +705,7 @@ mod tests {
         let public = visible_nodes(&app, false).unwrap();
         assert_eq!(public.len(), 1, "a node marked private must not be listed");
         assert_eq!(public[0]["name"], "open");
-        // The token joined this list once the panel started reading it back;
-        // handing it out would let any visitor impersonate the node.
+        // Handing the token out would let any visitor impersonate the node.
         for hidden in ["ip", "remark", "hostname", "token"] {
             assert!(public[0].get(hidden).is_none(), "{hidden} must not be public");
         }
@@ -764,10 +733,9 @@ mod tests {
 
         let response = reset_token(Admin, axum::extract::State(app.clone()), Path(id)).await;
         assert_eq!(response.status(), StatusCode::OK);
-        // The agent loop selects on this receiver; a closed channel is how it
-        // learns to go. Asked for with try_recv, because `recv().await` on a
-        // channel wrongly left open never returns: the regression this guards
-        // would hang the suite rather than fail it.
+        // The agent loop selects on this receiver, so a closed channel is how
+        // it learns to go. `try_recv`, because `recv().await` on a channel
+        // wrongly left open would hang the suite rather than fail it.
         assert!(
             matches!(rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)),
             "the old agent's channel must be closed"
@@ -789,9 +757,8 @@ mod tests {
         assert!(!public.as_str().contains("hidden"), "the public frame must carry no private node");
         assert!(admin.as_str().contains("198.51.100.9") && admin.as_str().contains("hidden"));
 
-        // A second read inside the window is the cached frame. Two reads over
-        // unchanged data prove nothing -- a rebuild returns the same bytes --
-        // so the data moves underneath first.
+        // Two reads over unchanged data prove nothing, since a rebuild returns
+        // the same bytes, so the data moves underneath first.
         node(&app, "late", true);
         assert_eq!(live_snapshot(&app, false), public, "the frame is reused, not rebuilt per viewer");
     }
@@ -803,8 +770,7 @@ mod tests {
         live_snapshot(&app, false);
 
         // NTP correcting a fresh boot leaves the cached stamp in the future.
-        // That is not a young frame, and serving it would freeze the panel until
-        // real time caught up to where the clock had been.
+        // That is not a young frame.
         app.snapshot.lock().unwrap()[0].0 = Utc::now().timestamp_millis() + 60_000;
         node(&app, "added-after", true);
         assert!(live_snapshot(&app, false).as_str().contains("added-after"));
@@ -819,16 +785,16 @@ mod tests {
         assert!(!live_snapshot(&app, true).as_str().contains("added"));
 
         let added: Node = serde_json::from_value(json!({"name": "added"})).unwrap();
-        // The defaults the panel leans on by not sending them. `public` most of
-        // all: defaulting the other way would publish a node nobody published.
+        // The defaults the panel leans on by not sending them. `public` above
+        // all: the other way publishes a node nobody published.
         assert!(added.public);
         assert_eq!(added.billing_cycle, "monthly");
         assert_eq!(added.traffic_reset_day, 1);
 
         let created = create_node(Admin, State(app.clone()), Ok(Json(added))).await;
         assert_eq!(created.status(), StatusCode::OK);
-        // Frames are cached for nearly two seconds. Without dropping that cache
-        // the node the panel just added blinks straight back out of the list.
+        // Frames are cached for nearly two seconds, so without dropping the
+        // cache the node just added blinks back out of the list.
         assert!(live_snapshot(&app, true).as_str().contains("added"));
 
         // A name of nothing but spaces is refused, and leaves no node behind.
@@ -851,8 +817,8 @@ mod tests {
         assert_eq!(view["metrics"], Value::Null);
         assert_eq!(view["total_rx"], 800, "traffic is stored, not derived from the live state");
         assert_eq!(view["total_tx"], 400);
-        // The live entry is gone with the connection; "offline since when" has
-        // to come off the node row or the badge has nothing to count from.
+        // The live entry went with the connection, so "offline since" has to
+        // come off the node row.
         assert_eq!(view["last_seen"], 1_700_000_000);
     }
 
@@ -861,15 +827,49 @@ mod tests {
         let app = app();
         let open = node(&app, "open", true);
         let hidden = node(&app, "hidden", false);
-        let anonymous = HeaderMap::new();
 
-        assert!(readable(&app, &anonymous, open), "a published node is readable by anyone");
-        assert!(!readable(&app, &anonymous, hidden), "a private node is not");
-        assert!(!readable(&app, &anonymous, 9999), "an unknown id is not");
+        assert!(readable(&app, false, open), "a published node is readable by anyone");
+        assert!(!readable(&app, false, hidden), "a private node is not");
+        assert!(!readable(&app, false, 9999), "an unknown id is not");
+        assert!(readable(&app, true, hidden), "the panel sees a private node");
 
         // Switching the public page off closes even the published node.
         app.db.set("public_page", "off").unwrap();
-        assert!(!readable(&app, &anonymous, open));
+        assert!(!readable(&app, false, open));
+        assert!(readable(&app, true, open), "and never closes it for the panel");
+    }
+
+    /// The window ceiling, which is a scan bound rather than a response bound:
+    /// the thinning already holds the row count, and a quarter-year still reads
+    /// every row behind it while holding the write connection.
+    #[tokio::test]
+    async fn an_anonymous_history_window_stops_at_a_week() {
+        let app = std::sync::Arc::new(app());
+        let id = node(&app, "n", true);
+        let now = Utc::now().timestamp();
+        // One sample a day for a month, so a row's presence names its window.
+        for day in 0..30 {
+            app.db.insert_metric(id, now - day * 86_400, &json!({"cpu": 1.0})).unwrap();
+        }
+        let ask = |hours| {
+            let query = format!("hours={hours}&series=metrics");
+            metrics(
+                State(app.clone()),
+                HeaderMap::new(),
+                Path(id),
+                Query(serde_urlencoded::from_str::<Window>(&query).unwrap()),
+            )
+        };
+        let rows =
+            |body: &str| serde_json::from_str::<Value>(body).unwrap()["metrics"].as_array().unwrap().len();
+
+        let week = axum::body::to_bytes(ask(168).await.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(rows(std::str::from_utf8(&week).unwrap()), 8, "a week reaches back seven days");
+
+        // Asking for the quarter year an anonymous caller used to get answers
+        // with the week: the extra rows exist, and reading them is the cost.
+        let quarter = axum::body::to_bytes(ask(2_160).await.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(quarter, week, "an anonymous window past a week is clamped to one");
     }
 
     #[tokio::test]
@@ -883,8 +883,8 @@ mod tests {
 
         assert!(!app.db.session_valid(&sha256(&stale)), "sessions must not outlive the old password");
 
-        // The browser that made the change is handed a replacement, so it is
-        // not logged out by its own password change.
+        // The caller is handed a replacement rather than logged out by its own
+        // password change.
         let cookie = response
             .headers()
             .get(axum::http::header::SET_COOKIE)
@@ -909,9 +909,9 @@ mod tests {
         assert!(app.db.session_valid(&sha256(&live)), "a rejected change must not log anyone out");
     }
 
-    /// Housekeeping clamps whatever it finds, so a value it cannot parse is not
-    /// an error anywhere downstream -- it just silently means 30 days, in a box
-    /// that goes on displaying what was typed.
+    /// Housekeeping clamps whatever it finds, so an unparseable value is not an
+    /// error downstream -- it silently means 30 days, in a box still displaying
+    /// what was typed.
     #[tokio::test]
     async fn a_retention_window_that_would_never_apply_is_refused() {
         let app = std::sync::Arc::new(app());

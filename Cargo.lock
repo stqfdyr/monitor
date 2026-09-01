@@ -910,6 +910,7 @@ dependencies = [
  "argon2",
  "axum",
  "chrono",
+ "futures-core",
  "hex",
  "mime_guess",
  "rand 0.9.5",

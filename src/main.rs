@@ -81,9 +81,8 @@ impl App {
     }
 }
 
-/// Where the agent binaries are published. Deliberately not a setting: the only
-/// person who would ever point this elsewhere is someone forking the project,
-/// and they are already rebuilding this line.
+/// Where the agent binaries are published. Not a setting: anyone pointing this
+/// elsewhere is forking the project and already rebuilding this line.
 const AGENT_REPO: &str = "stqfdyr/agent";
 
 /// The one-liner pasted onto a new VPS.
@@ -92,26 +91,60 @@ async fn install_script() -> Response {
     ([(header::CONTENT_TYPE, "text/x-shellscript")], script).into_response()
 }
 
-/// Hands out the agent binary from the hub itself. A node that can reach the
-/// hub can now install, even when it cannot reach GitHub at all: IPv6-only
-/// machines never resolve github.com, and neither do blocked networks.
+/// How many release downloads the hub relays at once.
+///
+/// This route takes no credentials, and one request costs an outbound fetch of
+/// GitHub plus 1.8 MB of egress -- the most expensive thing an anonymous caller
+/// can ask this process to do. Streaming bounds the memory each one holds;
+/// nothing bounded how many there could be, the same gap the password gate in
+/// `auth` closes.
+///
+/// Four, because a node installs once: a handful of machines set up together,
+/// not a workload. Refused rather than queued, for the same reason as there.
+const RELAY_SLOTS: usize = 4;
+static RELAY_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(RELAY_SLOTS);
+
+/// Holds a relay permit until the last byte has gone out. The handler returns
+/// once the response head is built, so a permit dropped there would gate the
+/// fetch and leave the transfer -- the part that costs -- unbounded.
+struct Metered<S> {
+    inner: S,
+    _permit: tokio::sync::SemaphorePermit<'static>,
+}
+
+impl<S: futures_core::Stream + Unpin> futures_core::Stream for Metered<S> {
+    type Item = S::Item;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+/// Hands out the agent binary from the hub itself, so a node that can reach
+/// the hub can install without reaching GitHub: IPv6-only machines never
+/// resolve github.com, and neither do blocked networks.
 async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Response {
     if !matches!(arch.as_str(), "x86_64" | "aarch64") {
         return (StatusCode::NOT_FOUND, "unknown architecture").into_response();
     }
+    let Ok(permit) = RELAY_GATE.try_acquire() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "too many downloads in flight, try again").into_response();
+    };
     let url = format!(
         "https://github.com/{AGENT_REPO}/releases/latest/download/monitor-agent-{arch}-unknown-linux-musl"
     );
-    // The default client timeout is tuned for API calls, not a 1.6 MB download.
+    // The default client timeout is tuned for API calls, not a 1.8 MB download.
     let fetched = app.http.get(&url).timeout(std::time::Duration::from_secs(120)).send().await;
     match fetched {
-        // Streamed rather than collected: this route needs no credentials, and
-        // holding each release whole meant a few hundred parallel requests --
-        // from anyone at all -- could reach the memory ceiling the unit sets.
-        // Passing the bytes through as they arrive costs a buffer per request.
+        // Streamed rather than collected: holding each release whole put a few
+        // hundred parallel requests within reach of the unit file's memory
+        // ceiling. Passing the bytes through costs one buffer per request.
         Ok(res) if res.status().is_success() => (
             [(header::CONTENT_TYPE, "application/octet-stream")],
-            axum::body::Body::from_stream(res.bytes_stream()),
+            axum::body::Body::from_stream(Metered { inner: Box::pin(res.bytes_stream()), _permit: permit }),
         )
             .into_response(),
         Ok(res) => {
@@ -215,15 +248,11 @@ async fn main() -> Result<()> {
         .fallback(frontend::serve)
         // A report is a few hundred bytes; anything larger is not one.
         .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
-        // A day of one node's chart is 236 kB of JSON and 30 kB of gzip, and
-        // the theme's bundle is much the same shape. The public page is behind
-        // a CDN that already does this; the panel, and anyone reaching the hub
-        // directly, were paying it in full.
-        //
-        // Not on a 101: both sockets upgrade through one, and a body encoder
-        // has no business wrapping a connection that is about to stop being
-        // HTTP. The default predicate skips images, SSE and anything under
-        // 32 bytes.
+        // A day of one node's chart is 236 kB of JSON against 30 kB gzipped,
+        // and the theme's bundle is much the same shape. Not on a 101: both
+        // sockets upgrade through one, and a body encoder has no business
+        // wrapping a connection about to stop being HTTP. The default predicate
+        // skips images, SSE and anything under 32 bytes.
         .layer(tower_http::compression::CompressionLayer::new().compress_when(
             tower_http::compression::predicate::DefaultPredicate::new().and(
                 |status: StatusCode, _: Version, _: &HeaderMap, _: &Extensions| {
@@ -241,15 +270,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Waits for whichever stop signal arrives first.
-///
-/// SIGTERM is the one that matters: it is how systemd stops and restarts a
-/// service, and without it every deploy killed the hub outright rather than
-/// letting it finish the requests it was holding. Ctrl-C is the same event
-/// from a terminal.
+/// Waits for whichever stop signal arrives first. SIGTERM is the one that
+/// matters: it is how systemd stops a service, and without it a deploy kills
+/// the hub outright rather than letting it finish the requests it holds.
 async fn shutdown() {
     // SIGTERM is always registerable; a failure here is a broken runtime, and
-    // falling back to Ctrl-C alone would quietly reinstate the bug above.
+    // falling back to Ctrl-C alone would reinstate the bug above.
     let mut term = signal(SignalKind::terminate()).expect("listen for SIGTERM");
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
@@ -258,13 +284,12 @@ async fn shutdown() {
     info!("shutting down");
 }
 
-/// True when `--site` would send cookies and tokens over the wire in the clear.
-/// Plain HTTP to a loopback address is just local development; plain HTTP to
-/// anything else means the session cookie is readable by every hop in between.
+/// True when `--site` would send cookies and tokens in the clear. Plain HTTP to
+/// loopback is local development; to anything else it means the session cookie
+/// is readable by every hop in between.
 ///
-/// A hub behind a TLS-terminating proxy or a Cloudflare tunnel is *not* this
-/// case: there `--site` is the https:// address, even though the listener
-/// itself speaks plain HTTP on loopback.
+/// A hub behind a TLS-terminating proxy or tunnel is not this case: there
+/// `--site` is the https:// address even though the listener speaks plain HTTP.
 fn exposed_over_plain_http(site: &str) -> bool {
     let Some(rest) = site.strip_prefix("http://") else {
         return false;
@@ -273,8 +298,8 @@ fn exposed_over_plain_http(site: &str) -> bool {
 }
 
 /// Loopback test over an `authority` like `example.com:8080` or `[::1]:8080`.
-/// IPv6 literals are bracketed, so the port cannot simply be split off at the
-/// first colon.
+/// IPv6 literals are bracketed, so the port cannot be split off at the first
+/// colon.
 fn host_is_loopback(authority: &str) -> bool {
     let authority = authority.split('/').next().unwrap_or("");
     let host = match authority.strip_prefix('[') {
@@ -284,8 +309,8 @@ fn host_is_loopback(authority: &str) -> bool {
     host.is_empty() || host == "localhost" || host == "::1" || host.starts_with("127.")
 }
 
-/// Prints a one-time admin password the first time the database is created.
-/// Without it a fresh hub would have no way in until GitHub is configured.
+/// Prints a one-time admin password when the database is first created.
+/// Without it a fresh hub has no way in until GitHub is configured.
 fn first_run(app: &App) -> Result<()> {
     if app.db.get("admin_password_hash").is_some() {
         return Ok(());
@@ -315,8 +340,8 @@ fn cycle_months(cycle: &str) -> Option<u32> {
     })
 }
 
-/// A node still reporting after its expiry date was plainly renewed, so roll
-/// the date forward by whole cycles until it is in the future again.
+/// A node still reporting past its expiry date was renewed, so roll the date
+/// forward by whole cycles until it is in the future.
 fn renewed(expires: NaiveDate, cycle: &str, today: NaiveDate) -> Option<NaiveDate> {
     let months = Months::new(cycle_months(cycle)?);
     let mut next = expires;
@@ -327,11 +352,9 @@ fn renewed(expires: NaiveDate, cycle: &str, today: NaiveDate) -> Option<NaiveDat
 }
 
 fn renew_online_nodes(app: &App) -> Result<()> {
-    // The hub's own timezone, the same as the traffic boundaries: an expiry
-    // date is a date a person wrote down, and on a CST hub `Utc` answers
-    // "yesterday" until 08:00, so a node expiring today is not rolled until
-    // then -- while the panel beside it, which reads local dates, already says
-    // it has expired.
+    // The hub's timezone, as with the traffic boundaries: an expiry date is a
+    // date a person wrote down, and on a CST hub `Utc` answers "yesterday"
+    // until 08:00, while the panel beside it already says it has expired.
     let today = Local::now().date_naive();
     let online: Vec<i64> = app.agents.read().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
     for node in app.db.nodes()? {
@@ -379,9 +402,9 @@ mod tests {
     #[test]
     fn an_expired_node_that_is_still_up_rolls_forward_whole_cycles() {
         let d = |s: &str| s.parse::<NaiveDate>().unwrap();
-        // One day past a monthly expiry: next natural month, clamped to its last day.
+        // One day past a monthly expiry: the next month, clamped to its end.
         assert_eq!(renewed(d("2026-01-31"), "monthly", d("2026-02-01")), Some(d("2026-02-28")));
-        // Years overdue: keep adding cycles until the date is ahead of today.
+        // Years overdue: add cycles until the date is ahead of today.
         assert_eq!(renewed(d("2024-03-10"), "yearly", d("2026-08-28")), Some(d("2027-03-10")));
         // Not due yet, and one-off billing: left alone.
         assert_eq!(renewed(d("2026-09-01"), "monthly", d("2026-08-28")), None);
@@ -393,8 +416,7 @@ mod tests {
         let app = Arc::new(app("http://localhost:8080"));
         let spa = |p: &str| frontend::serve(State(app.clone()), p.parse::<Uri>().unwrap());
 
-        // The shape that hid a misconfigured OAuth callback for an entire
-        // debugging session.
+        // The shape that hides a misconfigured OAuth callback.
         assert_eq!(spa("/api/oauth_callback?code=x").await.status(), StatusCode::NOT_FOUND);
         assert_eq!(spa("/api/nope").await.status(), StatusCode::NOT_FOUND);
         assert_eq!(spa("/api").await.status(), StatusCode::NOT_FOUND);
@@ -407,10 +429,9 @@ mod tests {
     }
 
     /// A build writes hashed filenames under `assets/`, so a miss there is a
-    /// tab left open across a deploy -- and answering it with index.html hands
-    /// a script tag HTML, which fails on MIME type well after the request that
-    /// caused it. Both bundles are served through the same fallback, so both
-    /// have to refuse.
+    /// tab left open across a deploy. Answering with index.html hands a script
+    /// tag HTML, which fails on MIME type long after the request that caused
+    /// it. Both bundles go through the same fallback, so both have to refuse.
     #[tokio::test]
     async fn a_missing_hashed_asset_is_a_404_not_the_single_page_app() {
         let app = Arc::new(app("http://localhost:8080"));
@@ -426,12 +447,12 @@ mod tests {
     }
 
     /// Both things `--site` decides: whether the session cookie may be marked
-    /// Secure, and whether the hub warns that it is answering in the clear.
-    /// Plain HTTP on loopback is where the two answers part ways.
+    /// Secure, and whether the hub warns that it answers in the clear. Plain
+    /// HTTP on loopback is where the two answers part ways.
     #[test]
     fn the_site_scheme_decides_the_cookie_flag_and_the_plain_http_warning() {
-        // Local development: no Secure flag, because the browser would then
-        // refuse to keep the cookie at all -- and no warning either.
+        // Local development: no Secure flag, or the browser refuses to keep
+        // the cookie at all, and no warning either.
         for local in ["http://127.0.0.1:8080", "http://localhost:8080", "http://[::1]:8080"] {
             assert!(!app(local).secure_cookies(), "{local}");
             assert!(!exposed_over_plain_http(local), "{local} is not exposed");
@@ -439,8 +460,8 @@ mod tests {
         // Behind TLS, including a tunnel that forwards to a loopback listener.
         assert!(app("https://hub.example.com").secure_cookies());
         assert!(!exposed_over_plain_http("https://m.example.com"));
-        // Genuinely in the clear over the network: warn, and still no Secure,
-        // which is exactly why the warning is worth printing.
+        // Genuinely in the clear: warn, and still no Secure, which is why the
+        // warning is worth printing.
         for remote in ["http://203.0.113.10:8080", "http://hub.example.com"] {
             assert!(!app(remote).secure_cookies(), "{remote}");
             assert!(exposed_over_plain_http(remote), "{remote} is exposed");
@@ -455,6 +476,35 @@ mod tests {
         assert!(!app.public_page());
         app.db.set("public_page", "on").unwrap();
         assert!(app.public_page());
+    }
+
+    /// A stream that is over before it starts, standing in for a release.
+    struct Nothing;
+
+    impl futures_core::Stream for Nothing {
+        type Item = ();
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<()>> {
+            std::task::Poll::Ready(None)
+        }
+    }
+
+    /// The gate is worth nothing if the permit is released when the handler
+    /// returns: the head is built in microseconds and the 1.8 MB behind it is
+    /// the cost. The permit has to live on the body.
+    #[test]
+    fn a_relay_permit_is_held_for_as_long_as_the_body_is() {
+        let queued: Vec<_> =
+            (1..RELAY_SLOTS).map(|_| RELAY_GATE.try_acquire().expect("up to the limit")).collect();
+        let body = Metered { inner: Nothing, _permit: RELAY_GATE.try_acquire().expect("the last slot") };
+
+        assert!(RELAY_GATE.try_acquire().is_err(), "the request past the limit must be refused");
+        drop(body);
+        assert!(RELAY_GATE.try_acquire().is_ok(), "a finished download gives its slot back");
+        drop(queued);
     }
 
     #[test]
