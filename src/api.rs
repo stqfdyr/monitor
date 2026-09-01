@@ -548,6 +548,21 @@ mod tests {
         rx
     }
 
+    /// A probe assigned to `nodes`. The window query draws a node's current
+    /// assignments only, so a fixture holding ping records needs one behind
+    /// them.
+    fn task(app: &App, nodes: Vec<i64>) -> i64 {
+        app.db
+            .save_ping_task(&PingTask {
+                id: 0,
+                name: "probe".into(),
+                target: "1.1.1.1:443".into(),
+                interval: 60,
+                nodes,
+            })
+            .unwrap()
+    }
+
     fn node(app: &App, name: &str, public: bool) -> i64 {
         app.db
             .create_node(
@@ -569,6 +584,9 @@ mod tests {
         // because the budget is per series and a single-probe fixture would
         // hide that.
         const PROBES: i64 = 2;
+        for _ in 0..PROBES {
+            task(&app, vec![id]);
+        }
         for i in 0..30 * 1440 {
             app.db.insert_metric(id, now - i * 60, &json!({"cpu": 1.0})).unwrap();
             for task in 1..=PROBES {
@@ -638,6 +656,9 @@ mod tests {
         // answered once and timed out three times.
         app.db.insert_metric(id, base + 10, &json!({"cpu": 0.0, "net_rx": 0})).unwrap();
         app.db.insert_metric(id, base + 70, &json!({"cpu": 40.0, "net_rx": 1_000})).unwrap();
+        for _ in 0..3 {
+            task(&app, vec![id]);
+        }
         for (i, latency) in [30, -1, -1, -1].into_iter().enumerate() {
             app.db.insert_ping(id, 1, base + 10 + i as i64 * 20, latency).unwrap();
         }
@@ -671,9 +692,10 @@ mod tests {
         // One timeout in a bucket too full for it to be a whole percent:
         // truncating answers the same as a clean bucket.
         let wide = node(&app, "wide", true);
+        let wide_probe = task(&app, vec![wide]);
         let wide_base = base / 180 * 180;
         for i in 0..180 {
-            app.db.insert_ping(wide, 1, wide_base + i, if i == 0 { -1 } else { 20 }).unwrap();
+            app.db.insert_ping(wide, wide_probe, wide_base + i, if i == 0 { -1 } else { 20 }).unwrap();
         }
         let rows = app.db.ping_records(wide, wide_base, 180).unwrap();
         assert_eq!(rows.len(), 1, "the fixture has to be one bucket for this to mean anything");
@@ -683,8 +705,9 @@ mod tests {
         // What the band is for: the middle reading and the two ends the bucket
         // reached. Drawing 20 alone renders a 40 ms swing as a flat point.
         let jitter = node(&app, "jitter", true);
+        let jitter_probe = task(&app, vec![jitter]);
         for (i, latency) in [10, 20, 50, 20, 20].into_iter().enumerate() {
-            app.db.insert_ping(jitter, 1, wide_base + i as i64, latency).unwrap();
+            app.db.insert_ping(jitter, jitter_probe, wide_base + i as i64, latency).unwrap();
         }
         let row = &app.db.ping_records(jitter, wide_base, 180).unwrap()[0];
         assert_eq!(row["latency"], 20, "the middle answer, not the mean of 24");

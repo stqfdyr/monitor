@@ -352,7 +352,7 @@ pub fn push_ping_tasks(app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{Db, Node};
+    use crate::db::{Db, Node, PingTask};
 
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
@@ -476,15 +476,29 @@ mod tests {
     fn ping_results_are_recorded_and_bad_ones_ignored() {
         let app = app();
         let id = node(&app);
+        // Assigned probes: a result is only readable back through a node's
+        // current assignments.
+        let probe = |name: &str| {
+            app.db
+                .save_ping_task(&PingTask {
+                    id: 0,
+                    name: name.into(),
+                    target: "1.1.1.1:443".into(),
+                    interval: 60,
+                    nodes: vec![id],
+                })
+                .unwrap()
+        };
+        let (one, two) = (probe("one"), probe("two"));
         let result = |task, latency| {
             json!({"jsonrpc": "2.0", "method": "ping.result",
                    "params": {"task_id": task, "latency_ms": latency}})
             .to_string()
         };
-        dispatch(&app, id, "ip", &result(7, 42)).unwrap();
+        dispatch(&app, id, "ip", &result(one, 42)).unwrap();
         // The rejected results carry task ids of their own: a bare count would
         // be satisfied by the key collapsing them onto a good row.
-        dispatch(&app, id, "ip", &result(8, 15)).unwrap();
+        dispatch(&app, id, "ip", &result(two, 15)).unwrap();
         dispatch(&app, id, "ip", &result(0, 42)).unwrap(); // no such task
         dispatch(&app, id, "ip", &result(-1, 42)).unwrap(); // nor this one
 
@@ -498,7 +512,7 @@ mod tests {
             .map(|r| (r["task_id"].as_i64().unwrap(), r["latency"].as_i64().unwrap()))
             .collect();
         seen.sort();
-        assert_eq!(seen, vec![(7, 42), (8, 15)], "each real task keeps its own result, and only those");
+        assert_eq!(seen, vec![(one, 42), (two, 15)], "each real task keeps its own result, and only those");
     }
 
     #[test]

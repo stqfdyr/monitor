@@ -325,6 +325,7 @@ const PING_WINDOW: &str = "WITH s AS (
               ROW_NUMBER() OVER (PARTITION BY task_id, ts/?3, latency>=0 ORDER BY latency) AS r,
               COUNT(*)     OVER (PARTITION BY task_id, ts/?3, latency>=0)                  AS n
        FROM ping_record WHERE node_id=?1 AND ts>=?2
+              AND task_id IN (SELECT task_id FROM ping_node WHERE node_id=?1)
      )
      SELECT task_id, b*?3,
             CAST(AVG(CASE WHEN latency>=0 AND r IN ((n+1)/2, (n+2)/2) THEN latency END) AS INTEGER),
@@ -1286,6 +1287,38 @@ mod tests {
         drop(db);
         assert!(Db::open(path).is_ok());
         let _ = std::fs::remove_file(&file);
+    }
+
+    /// Removing a node from a probe has to take the probe off that node's
+    /// chart. `ping_record` carries no foreign key to the assignment that
+    /// produced it, so the rows outlive it until retention -- the window query
+    /// is what has to stop drawing them, and it has to do so at once rather
+    /// than an hour later when the sweep next runs.
+    #[test]
+    fn a_probe_taken_off_a_node_stops_appearing_in_its_history() {
+        let db = db();
+        let id = node(&db, 1);
+        let probe = |nodes: Vec<i64>, task| {
+            db.save_ping_task(&PingTask {
+                id: task,
+                name: "cm".into(),
+                target: "1.1.1.1:443".into(),
+                interval: 60,
+                nodes,
+            })
+            .unwrap()
+        };
+        let task = probe(vec![id], 0);
+        db.insert_ping(id, task, 100, 42).unwrap();
+        assert_eq!(db.ping_records(id, 0, 60).unwrap().len(), 1, "an assigned probe draws");
+
+        probe(vec![], task);
+        assert!(db.ping_records(id, 0, 60).unwrap().is_empty(), "an unassigned one does not");
+
+        // The rows are still there: reassigning brings the history back rather
+        // than starting over.
+        probe(vec![id], task);
+        assert_eq!(db.ping_records(id, 0, 60).unwrap().len(), 1, "and it comes back with its history");
     }
 
     #[test]
