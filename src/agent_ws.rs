@@ -76,9 +76,9 @@ impl Agent {
 /// reading that landed on the boundary. A 30-second spike between two samples
 /// is real load; a point sample says the machine was idle.
 ///
-/// `load1` is absent because the kernel already averages it over the last
-/// minute, and averaging again smears it across two. `net_rx` and `net_tx` are
-/// absent because [`report`] fills them from the accumulator, which is exact.
+/// `load` is absent because no history row carries it -- it is a live figure
+/// the card reads off the report. `net_rx` and `net_tx` are absent because
+/// [`report`] fills them from the accumulator, which is exact.
 const MEAN_FLOAT: [&str; 1] = ["cpu"];
 const MEAN_INT: [&str; 6] = ["mem_used", "swap_used", "disk_used", "tcp", "udp", "procs"];
 
@@ -240,7 +240,8 @@ fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// Everything a report has to carry for the hub to store a complete row.
+/// Everything a report has to carry for the hub to store a complete row, plus
+/// `load`, which is stored nowhere and drawn live on the node card.
 ///
 /// Hub and agent ship as two binaries from two repositories, and every reader
 /// here ends in `unwrap_or(0)`: a field the agent renames does not fail, it

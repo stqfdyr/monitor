@@ -132,7 +132,7 @@ WHERE node_id=?1 AND ts>=?2 GROUP BY task_id, ts/?3 ORDER BY ts
 自查是同一件事，只是维度从内存换成了 CPU。
 
 `Db::open` 里带一次性重建，靠 `sqlite_master` 里存的建表语句判断要不要做，做完不再做。
-守着它的是 `rekeying_ping_record_keeps_the_rows_and_lets_the_window_query_seek`——
+守着它的是 `rekeying_ping_record_keeps_the_rows_and_lets_the_chart_query_seek`——
 它同时断言行没丢、以及查询计划里确实出现了 `ts>?`；只查前者的话，一次什么都没换键的「迁移」也能过。
 
 顺带两处：
@@ -157,6 +157,35 @@ WHERE node_id=?1 AND ts>=?2 GROUP BY task_id, ts/?3 ORDER BY ts
 
 同一轮还给 `/agent/{arch}` 加了并发闸门（`main::RELAY_GATE`，4 个 permit）。它是这个进程上单次最
 贵的匿名操作：无凭证、无缓存，一次请求让 hub 去 GitHub 拉一趟、转出 1.8 MB、耗时 0.78 s。
+
+## 8. 又下一轮：把排序从查询里拿掉
+
+上一轮给窗口封了上限，这一轮问的是**这个上限本身值多少**。`hours=168` 的延迟图仍要 284 ms，
+而且全部占着 agent 上报用的那条唯一的写连接。
+
+拆开看（`node 1`，29 760 行，7 天保留）：
+
+| 这一步 | 耗时 |
+|---|---:|
+| 索引 seek + 过滤，什么都不算 | 17 ms |
+| 加一次 `GROUP BY`（一次排序） | 101 ms |
+| 加一个窗口函数（两次排序） | 197 ms |
+| 线上那条（三次排序） | 298 ms |
+
+**贵的是排序，不是读盘。** 而主键 `(node_id, ts, task_id)` 读出来的行本来就是时间序，
+下一个桶一开始上一个桶就齐了——所以桶改成在 Rust 里边读边折，同时只持有一个桶。
+
+| 窗口 | 之前 | 之后 | |
+|---|---:|---:|---|
+| `hours=1` | 4.7 ms | **2.8 ms** | 1.7× |
+| `hours=6` | 26.2 ms | **9.3 ms** | 2.8× |
+| `hours=24` | 61.7 ms | **16.5 ms** | 3.7× |
+| `hours=168` | 284.0 ms | **54.1 ms** | 5.2× |
+
+同一轮量过、**没做**的：`temp_store = MEMORY`（实测更慢）、把 `prune` 的两条全表 `DELETE` 换成
+按节点 seek（27 ms → 3 ms，但一小时才跑一次，而且 `ping_record` 没有外键，按节点删会漏掉
+已删节点的遗留行）、给 `metric` 砍掉不画的五列（省 585 KB / 21%，库总共才 5.7 MB）。
+**都是量完判定边际收益不够的。**
 
 ---
 

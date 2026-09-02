@@ -712,6 +712,16 @@ mod tests {
         let row = &app.db.ping_records(jitter, wide_base, 180).unwrap()[0];
         assert_eq!(row["latency"], 20, "the middle answer, not the mean of 24");
         assert_eq!(row["band"], json!([10, 50]));
+
+        // An even count has no middle answer, so it is the mean of the two
+        // that straddle it. Every neighbouring pair is a different number, so
+        // reaching one rank either way answers 20 or 30 rather than 25.
+        let even = node(&app, "even", true);
+        let even_probe = task(&app, vec![even]);
+        for (i, latency) in [40, 10, 30, 20].into_iter().enumerate() {
+            app.db.insert_ping(even, even_probe, wide_base + i as i64, latency).unwrap();
+        }
+        assert_eq!(app.db.ping_records(even, wide_base, 180).unwrap()[0]["latency"], 25);
     }
 
     #[test]

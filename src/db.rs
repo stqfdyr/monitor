@@ -80,7 +80,7 @@ CREATE TABLE IF NOT EXISTS traffic (
 CREATE TABLE IF NOT EXISTS metric (
   node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
   ts      INTEGER NOT NULL,
-  cpu REAL NOT NULL, load1 REAL NOT NULL,
+  cpu REAL NOT NULL,
   mem_used INTEGER NOT NULL, swap_used INTEGER NOT NULL, disk_used INTEGER NOT NULL,
   net_rx INTEGER NOT NULL, net_tx INTEGER NOT NULL,
   tcp INTEGER NOT NULL, udp INTEGER NOT NULL, procs INTEGER NOT NULL,
@@ -118,7 +118,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Bump it and add a `migrate_to_N` when the schema changes under a database
 /// that is already in service.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Adds a column that older databases lack. A duplicate column means the
 /// migration has already run; every other error is real and must propagate.
@@ -182,6 +182,22 @@ fn migrate_to_1(conn: &Connection) -> Result<()> {
              COMMIT;",
         )?;
         info!("rebuilt ping_record on a key the latency chart can seek");
+    }
+    Ok(())
+}
+
+/// `metric.load1` was written on every history row and read by nothing: the
+/// card draws the live `load` array off the report, and no chart draws load
+/// from history. Dropping it is 21% of what the five unread columns cost, and
+/// the only one of them the hub can lose without also losing a number the UI
+/// shows.
+///
+/// The column is `NOT NULL` with no default, so this is not optional: skip it
+/// and every metric insert this build makes fails the constraint.
+fn migrate_to_2(conn: &Connection) -> Result<()> {
+    if schema_mentions(conn, "metric", "load1")? {
+        conn.execute("ALTER TABLE metric DROP COLUMN load1", [])?;
+        info!("dropped metric.load1; nothing read it");
     }
     Ok(())
 }
@@ -308,31 +324,23 @@ fn restrict(path: &str) {
     }
 }
 
-/// The chart's probe query: per bucket, the median round trip, the range it
-/// spanned, and the share of it that was lost.
+/// The rows behind the latency chart: one node's probe results over a window,
+/// bucketed and in time order. Everything the chart draws is folded out of
+/// them in [`close_bucket`].
 ///
-/// Median rather than mean, as Smokeping draws it: one SYN retransmit is tens
-/// of milliseconds and drags a mean, and it is the reading that is wrong rather
-/// than the link. SQLite has no `median()`, so it comes out of a window
-/// function -- rank each bucket's answers by latency, average the middle one or
-/// two. Successes and timeouts rank in separate partitions, which keeps -1 out
-/// of the ordering without a second pass.
+/// The key is `(node_id, ts, task_id)`, so this is a seek and the rows come out
+/// sorted with no sorter behind them -- which is what lets the fold hold one
+/// bucket at a time. Asking SQLite for the summary instead cost three sorts of
+/// the whole window -- two window passes and a GROUP BY -- against this one
+/// scan: measured on a week of four probes, 284 ms against 54 ms, all of it
+/// holding the single connection the agents write through.
 ///
 /// A constant because the query plan is asserted on it in
-/// `rekeying_ping_record_keeps_the_rows_and_lets_the_window_query_seek`.
-const PING_WINDOW: &str = "WITH s AS (
-       SELECT task_id, ts/?3 AS b, latency,
-              ROW_NUMBER() OVER (PARTITION BY task_id, ts/?3, latency>=0 ORDER BY latency) AS r,
-              COUNT(*)     OVER (PARTITION BY task_id, ts/?3, latency>=0)                  AS n
-       FROM ping_record WHERE node_id=?1 AND ts>=?2
-              AND task_id IN (SELECT task_id FROM ping_node WHERE node_id=?1)
-     )
-     SELECT task_id, b*?3,
-            CAST(AVG(CASE WHEN latency>=0 AND r IN ((n+1)/2, (n+2)/2) THEN latency END) AS INTEGER),
-            MIN(CASE WHEN latency>=0 THEN latency END),
-            MAX(CASE WHEN latency>=0 THEN latency END),
-            (100*SUM(latency<0) + COUNT(*) - 1)/COUNT(*)
-     FROM s GROUP BY task_id, b ORDER BY b";
+/// `rekeying_ping_record_keeps_the_rows_and_lets_the_chart_query_seek`.
+const PING_ROWS: &str = "SELECT ts/?3, task_id, latency FROM ping_record
+     WHERE node_id=?1 AND ts>=?2
+           AND task_id IN (SELECT task_id FROM ping_node WHERE node_id=?1)
+     ORDER BY ts";
 
 impl Db {
     pub fn open(path: &str) -> Result<Self> {
@@ -348,6 +356,9 @@ impl Db {
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if !fresh && version < 1 {
             migrate_to_1(&conn)?;
+        }
+        if !fresh && version < 2 {
+            migrate_to_2(&conn)?;
         }
         // Stamped once the database matches this build.
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
@@ -699,18 +710,16 @@ impl Db {
     pub fn insert_metric(&self, node_id: i64, ts: i64, m: &serde_json::Value) -> Result<()> {
         let f = |k: &str| m.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
         let n = |k: &str| m.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
-        let load1 = m.get("load").and_then(|v| v.get(0)).and_then(|v| v.as_f64()).unwrap_or(0.0);
         self.conn()
             .prepare_cached(
                 "INSERT OR REPLACE INTO metric
-               (node_id, ts, cpu, load1, mem_used, swap_used, disk_used, net_rx, net_tx, tcp, udp, procs)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+               (node_id, ts, cpu, mem_used, swap_used, disk_used, net_rx, net_tx, tcp, udp, procs)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             )?
             .execute(params![
                 node_id,
                 ts,
                 f("cpu"),
-                load1,
                 n("mem_used"),
                 n("swap_used"),
                 n("disk_used"),
@@ -735,19 +744,19 @@ impl Db {
     /// 27.52 GB the minutes hold. Averaged it is 28.02 GB, matching the
     /// accumulator.
     ///
-    /// `load1`, `swap_used`, `tcp`, `udp` and `procs` are stored but not
-    /// answered with -- nothing draws them from history. The columns stay
-    /// because dropping them is a migration.
+    /// `swap_used`, `tcp`, `udp` and `procs` are stored but not answered with
+    /// -- nothing draws them from history. The columns stay by the user's
+    /// call; `load1` was the fifth and is gone, see `migrate_to_2`.
     ///
     /// The stamp is the bucket's start rather than a row inside it, so every
     /// series lands on one grid and the probe rows below can be shared.
     pub fn metrics(&self, node_id: i64, since: i64, step: i64) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT (MIN(ts)/?3)*?3, AVG(cpu), CAST(AVG(mem_used) AS INTEGER),
                     CAST(AVG(disk_used) AS INTEGER),
                     CAST(AVG(net_rx) AS INTEGER), CAST(AVG(net_tx) AS INTEGER)
-             FROM metric WHERE node_id=?1 AND ts>=?2 GROUP BY ts/?3 ORDER BY ts",
+             FROM metric WHERE node_id=?1 AND ts>=?2 GROUP BY ts/?3 ORDER BY ts/?3",
         )?;
         let rows = stmt.query_map(params![node_id, since, step], |r| {
             Ok(serde_json::json!({
@@ -874,35 +883,41 @@ impl Db {
     /// `metrics` above. This is the larger half of that response: a probe
     /// reports far more often than once a minute.
     ///
-    /// A timeout is stored as -1, so it is kept out of the median and counted
-    /// instead. `latency` is null when a whole bucket timed out. `loss` is the
-    /// percentage that did and rides along only when there is any -- a healthy
-    /// day is 2 880 rows, and `"loss":0` on each is 29 kB of nothing.
-    ///
-    /// Rounded up, so that no `loss` key means no timeout and nothing else.
-    /// Truncating reports a bucket that lost 1 of 180 as clean.
+    /// [`PING_ROWS`] answers in time order, so a bucket is finished the moment
+    /// the next one opens and only that one is ever held -- at most the probes
+    /// assigned to the node times the results one bucket spans.
     pub fn ping_records(&self, node_id: i64, since: i64, step: i64) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(PING_WINDOW)?;
-        let rows = stmt.query_map(params![node_id, since, step], |r| {
-            let mut row = serde_json::json!({
-                "task_id": r.get::<_, i64>(0)?, "ts": r.get::<_, i64>(1)?,
-                "latency": r.get::<_, Option<i64>>(2)?
-            });
-            // Only when the bucket actually moved. At the hour and six-hour
-            // windows a bucket holds one sample, and a band would be a
-            // zero-height ribbon under every line.
-            if let (Some(lo), Some(hi)) = (r.get::<_, Option<i64>>(3)?, r.get::<_, Option<i64>>(4)?) {
-                if hi > lo {
-                    row["band"] = serde_json::json!([lo, hi]);
+        let mut stmt = conn.prepare_cached(PING_ROWS)?;
+        let mut rows = stmt.query(params![node_id, since, step])?;
+        let mut out = Vec::new();
+        // Per probe in the bucket being filled: what answered, and how many
+        // did not.
+        let mut open: Vec<(i64, Vec<i64>, i64)> = Vec::new();
+        let mut bucket = 0;
+        while let Some(row) = rows.next()? {
+            let (b, task, latency) = (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?);
+            if b != bucket {
+                close_bucket(&mut out, &mut open, bucket * step);
+                bucket = b;
+            }
+            let probe = match open.iter().position(|(id, ..)| *id == task) {
+                Some(at) => &mut open[at],
+                None => {
+                    open.push((task, Vec::new(), 0));
+                    open.last_mut().expect("just pushed")
                 }
+            };
+            // A timeout is stored as -1: kept out of the median and counted
+            // instead.
+            if latency < 0 {
+                probe.2 += 1;
+            } else {
+                probe.1.push(latency);
             }
-            if let loss @ 1.. = r.get::<_, i64>(5)? {
-                row["loss"] = loss.into();
-            }
-            Ok(row)
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        }
+        close_bucket(&mut out, &mut open, bucket * step);
+        Ok(out)
     }
 
     // ---- sessions ----
@@ -942,6 +957,46 @@ impl Db {
     pub fn expire_sessions(&self) -> Result<()> {
         self.conn().execute("DELETE FROM session WHERE expires_at <= ?1", [Utc::now().timestamp()])?;
         Ok(())
+    }
+}
+
+/// Turns one finished bucket into a row per probe, stamped with the bucket's
+/// start so every series lands on the same grid.
+///
+/// Median rather than mean, as Smokeping draws it: one SYN retransmit is tens
+/// of milliseconds and drags a mean, and it is the reading that is wrong rather
+/// than the link.
+///
+/// `latency` is null when a whole bucket timed out. `loss` is the percentage
+/// that did and rides along only when there is any -- a healthy day is 2 880
+/// rows, and `"loss":0` on each is 29 kB of nothing. Rounded up, so that no
+/// `loss` key means no timeout and nothing else: truncating reports a bucket
+/// that lost 1 of 180 as clean.
+fn close_bucket(out: &mut Vec<serde_json::Value>, open: &mut Vec<(i64, Vec<i64>, i64)>, ts: i64) {
+    // By probe, not by whichever answered first in this bucket: the chart
+    // shades its lines by the order they arrive in.
+    open.sort_unstable_by_key(|(task, ..)| *task);
+    for (task, mut answered, lost) in open.drain(..) {
+        answered.sort_unstable();
+        let middle = match answered.len() {
+            0 => None,
+            n if n % 2 == 1 => Some(answered[n / 2]),
+            n => Some((answered[n / 2 - 1] + answered[n / 2]) / 2),
+        };
+        let mut row = serde_json::json!({"task_id": task, "ts": ts, "latency": middle});
+        // Only when the bucket actually moved. At the hour and six-hour
+        // windows a bucket holds one sample, and a band would be a
+        // zero-height ribbon under every line.
+        if let (Some(lo), Some(hi)) = (answered.first(), answered.last()) {
+            if hi > lo {
+                row["band"] = serde_json::json!([lo, hi]);
+            }
+        }
+        if lost > 0 {
+            let total = answered.len() as i64 + lost;
+            row["loss"] = ((100 * lost + total - 1) / total).into();
+        }
+        out.push(row);
     }
 }
 
@@ -1241,7 +1296,7 @@ mod tests {
     /// the old key is silent, and stays silent while the query it exists for
     /// scans the node's whole history.
     #[test]
-    fn rekeying_ping_record_keeps_the_rows_and_lets_the_window_query_seek() {
+    fn rekeying_ping_record_keeps_the_rows_and_lets_the_chart_query_seek() {
         let file = std::env::temp_dir().join(format!("monitor-rekey-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&file);
         let path = file.to_str().unwrap();
@@ -1271,9 +1326,11 @@ mod tests {
         assert_eq!(rows, vec![(1, 7, 100, 12), (1, 8, 100, 34), (1, 7, 200, 56), (2, 7, 100, 78)]);
 
         // Without the timestamp second in the key the plan stops at
-        // `node_id=?` and scans everything under it.
+        // `node_id=?` and scans everything under it -- and the fold in
+        // `ping_records` needs the rows in time order, which only the seek
+        // gives without a sorter.
         let plan: String = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {PING_WINDOW}"))
+            .prepare(&format!("EXPLAIN QUERY PLAN {PING_ROWS}"))
             .unwrap()
             .query_map(params![1, 0, 60], |r| r.get::<_, String>(3))
             .unwrap()
@@ -1281,9 +1338,53 @@ mod tests {
             .unwrap()
             .join(" | ");
         assert!(plan.contains("node_id=? AND ts>?"), "the window has to be a seek, not a scan: {plan}");
+        assert!(!plan.contains("ORDER BY"), "the time order has to come off the key, not a sorter: {plan}");
 
         // Opening again must not rebuild a table that is already right.
         drop(conn);
+        drop(db);
+        assert!(Db::open(path).is_ok());
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// Dropping `metric.load1` under a database in service. The column is
+    /// `NOT NULL` with no default, so a migration that quietly did not run
+    /// does not leave a stale column -- it stops every history row from being
+    /// written, for as long as nobody looks at a chart.
+    #[test]
+    fn dropping_load1_keeps_the_history_and_lets_new_rows_in() {
+        let file = std::env::temp_dir().join(format!("monitor-load1-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let path = file.to_str().unwrap();
+
+        // A database as a hub before this build left it: one metric row with
+        // a load average in it, stamped at the schema version of the day.
+        let old = Connection::open(path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE metric (
+               node_id INTEGER NOT NULL, ts INTEGER NOT NULL,
+               cpu REAL NOT NULL, load1 REAL NOT NULL,
+               mem_used INTEGER NOT NULL, swap_used INTEGER NOT NULL, disk_used INTEGER NOT NULL,
+               net_rx INTEGER NOT NULL, net_tx INTEGER NOT NULL,
+               tcp INTEGER NOT NULL, udp INTEGER NOT NULL, procs INTEGER NOT NULL,
+               PRIMARY KEY (node_id, ts)
+             ) WITHOUT ROWID;
+             INSERT INTO metric VALUES (1,60,12.5,0.75,100,0,0,0,0,0,0,0);
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        drop(old);
+
+        let db = Db::open(path).unwrap();
+        assert!(!schema_mentions(&db.conn(), "metric", "load1").unwrap(), "the column has to be gone");
+        // The row it was written on stays, and so does everything else on it.
+        let kept = &db.metrics(1, 0, 60).unwrap()[0];
+        assert_eq!((kept["ts"].as_i64(), kept["cpu"].as_f64()), (Some(60), Some(12.5)));
+        // And the shape this build inserts now fits the table.
+        db.insert_metric(1, 120, &serde_json::json!({"cpu": 2.0, "load": [0.5, 0.4, 0.3]})).unwrap();
+        assert_eq!(db.metrics(1, 0, 60).unwrap().len(), 2);
+
+        // Opening again must not try to drop a column that is already gone.
         drop(db);
         assert!(Db::open(path).is_ok());
         let _ = std::fs::remove_file(&file);
