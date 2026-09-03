@@ -50,14 +50,43 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
     steps:
+      # The Dockerfile lives in the repo; the binaries it copies do not.
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
+          path: bin
           merge-multiple: true
       # A manual dispatch builds and collects the binaries; only a tag publishes,
       # so the whole path can be exercised without cutting a release. gh ships on
       # the runner, keeping a third-party action out of the contents:write step.
+      #
+      # sha256sums.txt is written from inside bin/ so the names in it are bare
+      # asset names, which is what install-hub.sh matches on before it puts the
+      # binary in /usr/local/bin.
       - if: startsWith(github.ref, 'refs/tags/')
-        run: gh release create "$GITHUB_REF_NAME" monitor-hub-* --generate-notes --repo "$GITHUB_REPOSITORY"
+        run: |
+          (cd bin && sha256sum monitor-hub-* > sha256sums.txt)
+          gh release create "$GITHUB_REF_NAME" bin/monitor-hub-* bin/sha256sums.txt \
+            --generate-notes --repo "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      # The image carries the binary this release already published, so the two
+      # cannot disagree about what "v0.1.15" is. docker and buildx ship on the
+      # runner, the same reason gh does above.
+      - if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          cp bin/monitor-hub-x86_64-unknown-linux-musl monitor-hub-amd64
+          cp bin/monitor-hub-aarch64-unknown-linux-musl monitor-hub-arm64
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          # The default builder cannot do two platforms in one manifest.
+          docker buildx create --use --driver docker-container
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker buildx build --platform linux/amd64,linux/arm64 --push \
+            -t "$IMAGE:${GITHUB_REF_NAME#v}" -t "$IMAGE:latest" .
         env:
           GH_TOKEN: ${{ github.token }}
