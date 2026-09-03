@@ -253,7 +253,21 @@ UNIT
 # ---- uninstall ----
 uninstall_hub() {
 	if [ ! -f "$BIN" ] && [ ! -f "$UNIT" ]; then
-		[ ! -e "$DATA" ] || die "服务已经卸载了，数据还留在 $DATA，确认之后手动删除即可"
+		# The data outlives the unit, so --purge still has a job here. The
+		# marker went with the unit, so ownership is inferred from the shape
+		# this script leaves: StateDirectory= under DynamicUser= puts the real
+		# directory in /var/lib/private and makes $DATA a symlink to it. A
+		# hand-rolled deployment has a real directory at $DATA and no twin,
+		# and that is someone else's database.
+		if [ -n "$PURGE" ] && [ -e "$DATA" ]; then
+			[ -L "$DATA" ] && [ -d /var/lib/private/monitor ] ||
+				die "$DATA 不是这个脚本留下的形状，不敢删；请自己确认后手动删除"
+			confirm "服务已经卸载了。删除 $DATA 下的数据库？不可撤销" || return 0
+			rm -rf "$DATA" /var/lib/private/monitor
+			ok "数据" "已删除"
+			return 0
+		fi
+		[ ! -e "$DATA" ] || die "服务已经卸载了，数据还留在 $DATA；要一并删掉就加 --purge"
 		die "这台机器上没有装 monitor hub"
 	fi
 	if foreign_unit; then refuse_foreign; fi
