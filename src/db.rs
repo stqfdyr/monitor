@@ -202,6 +202,27 @@ fn migrate_to_2(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Brings a database that is already in service up to `SCHEMA_VERSION` and
+/// stamps it. `from` is the version it is at now, so a fresh file passes
+/// `SCHEMA_VERSION` and only gets the stamp.
+///
+/// Restoring a backup lands here too: the copy brings its own version with it,
+/// and it needs the same migrations a restart would have run.
+fn migrate(conn: &Connection, from: i64) -> Result<()> {
+    if from < 1 {
+        migrate_to_1(conn)?;
+    }
+    if from < 2 {
+        migrate_to_2(conn)?;
+    }
+    conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+    Ok(())
+}
+
+/// Every table a backup has to carry before this build will restore it.
+const TABLES: [&str; 8] =
+    ["setting", "node", "traffic", "metric", "ping_task", "ping_node", "ping_record", "session"];
+
 /// One node's stored configuration and last known facts.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct Node {
@@ -317,11 +338,38 @@ pub struct PingTask {
 ///
 /// Best effort: a filesystem with no Unix modes still works.
 fn restrict(path: &str) {
-    #[cfg(unix)]
     for file in [path.to_owned(), format!("{path}-wal"), format!("{path}-shm")] {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
+        own_only(&file);
     }
+}
+
+/// One file, owner-only. Also used on the backup copy `VACUUM INTO` writes,
+/// which is the whole credential store in one portable file and is created
+/// under the umask like any other.
+fn own_only(file: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+/// The `main` database's path as SQLite itself reports it, empty for
+/// `:memory:`. Asked rather than remembered so there is one answer to what
+/// file is open.
+fn main_file(conn: &Connection) -> String {
+    conn.query_row("PRAGMA database_list", [], |r| r.get(2)).unwrap_or_default()
+}
+
+fn bytes_of(file: &str) -> i64 {
+    std::fs::metadata(file).map(|m| m.len() as i64).unwrap_or(0)
+}
+
+/// Bytes the database occupies. The WAL counts: committed rows sit there
+/// until a checkpoint folds them into the main file, so the two together are
+/// what an operator sees on disk.
+fn on_disk(file: &str) -> i64 {
+    bytes_of(file) + bytes_of(&format!("{file}-wal"))
 }
 
 /// The rows behind the latency chart: one node's probe results over a window,
@@ -354,14 +402,7 @@ impl Db {
         restrict(path);
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !fresh && version < 1 {
-            migrate_to_1(&conn)?;
-        }
-        if !fresh && version < 2 {
-            migrate_to_2(&conn)?;
-        }
-        // Stamped once the database matches this build.
-        conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+        migrate(&conn, if fresh { SCHEMA_VERSION } else { version })?;
         Ok(Self(Mutex::new(conn)))
     }
 
@@ -920,6 +961,143 @@ impl Db {
         Ok(out)
     }
 
+    // ---- the database file itself ----
+
+    /// The file this connection is open on, empty for `:memory:`.
+    pub fn file(&self) -> String {
+        main_file(&self.conn())
+    }
+
+    /// What the panel's data page reads: how much room the file takes, how
+    /// much of it is free pages waiting for a `VACUUM`, and how many rows are
+    /// behind that.
+    pub fn stats(&self) -> Result<serde_json::Value> {
+        let conn = self.conn();
+        let file = main_file(&conn);
+        let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        let free_pages: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+        let mut rows = serde_json::Map::new();
+        for table in TABLES {
+            let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+            rows.insert(table.to_owned(), serde_json::json!(n));
+        }
+        Ok(serde_json::json!({
+            "path": file,
+            "size": bytes_of(&file),
+            "wal": bytes_of(&format!("{file}-wal")),
+            "free": free_pages * page_size,
+            "rows": rows,
+        }))
+    }
+
+    /// Writes a consistent copy of the live database to `dest`, which must not
+    /// exist yet.
+    ///
+    /// `VACUUM INTO` is SQLite's own answer for this: one statement, a single
+    /// read transaction, and the copy comes out compacted with the free pages
+    /// already dropped. It reads the whole file, so the caller runs it off the
+    /// runtime -- every other statement here is sub-millisecond, this one is
+    /// not.
+    pub fn backup_into(&self, dest: &str) -> Result<()> {
+        self.conn().execute("VACUUM INTO ?1", [dest])?;
+        // The copy is the credential store in one portable file: node tokens
+        // in the clear, the GitHub secret, the password hash. SQLite creates
+        // it under the umask, which on the usual 022 is world-readable.
+        own_only(dest);
+        Ok(())
+    }
+
+    /// Rebuilds the file, giving back the pages that deleted history left
+    /// behind. Returns the bytes recovered.
+    ///
+    /// SQLite's rules for `VACUUM`, and why they hold here: it cannot run
+    /// inside a transaction or with a live statement on the connection (one
+    /// connection, and this call owns it); it needs about as much free disk as
+    /// the database itself, and a failure rolls back leaving the original
+    /// untouched; and it can renumber rowids, which nothing here keys on --
+    /// `metric` and `ping_record` are WITHOUT ROWID and every other table
+    /// declares its own primary key.
+    ///
+    /// In WAL mode the rewrite lands in the WAL first, so without the
+    /// checkpoint the file on disk grows instead of shrinking.
+    pub fn vacuum(&self) -> Result<i64> {
+        let conn = self.conn();
+        let file = main_file(&conn);
+        let before = on_disk(&file);
+        conn.execute_batch("VACUUM")?;
+        // Best effort: the space is already reclaimed inside the database, and
+        // a checkpoint that cannot run right now is not a failed vacuum.
+        let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        Ok((before - on_disk(&file)).max(0))
+    }
+
+    /// What a file has to be before a single page of it is copied over the
+    /// live database. Restore is the one button here that destroys data, and
+    /// the file behind it came from a disk this hub knows nothing about.
+    pub fn check_backup(&self, src: &str) -> Result<()> {
+        // Read-write, not read-only: a plain copy of a running hub's database
+        // is in WAL mode, and SQLite cannot open one of those read-only
+        // without its -shm file.
+        let candidate = Connection::open(src)?;
+        let health: String = candidate
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .map_err(|e| anyhow::anyhow!("not a readable SQLite database: {e}"))?;
+        if health != "ok" {
+            anyhow::bail!("the file is a damaged database: {health}");
+        }
+        // Pages are copied verbatim, so whatever schema the file carries is
+        // the schema this hub then runs its own statements against. A view or
+        // a trigger where a table belongs turns every later write into
+        // someone else's code.
+        let plotted: i64 = candidate.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('view', 'trigger')",
+            [],
+            |r| r.get(0),
+        )?;
+        if plotted > 0 {
+            anyhow::bail!("the file carries views or triggers, which a hub backup never does");
+        }
+        for table in TABLES {
+            let found: i64 = candidate.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |r| r.get(0),
+            )?;
+            if found == 0 {
+                anyhow::bail!("the file is not a hub backup: no {table} table");
+            }
+        }
+        let version: i64 = candidate.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version > SCHEMA_VERSION {
+            anyhow::bail!(
+                "the backup is from a newer hub (schema {version}, this one reads {SCHEMA_VERSION}); upgrade first"
+            );
+        }
+        // The online backup API refuses a page size change while the
+        // destination is in WAL mode. Saying so beats SQLITE_READONLY.
+        let theirs: i64 = candidate.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        let ours: i64 = self.conn().query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        if theirs != ours {
+            anyhow::bail!("the backup uses a {theirs}-byte page, this database uses {ours}");
+        }
+        Ok(())
+    }
+
+    /// Copies a checked backup over the live database, page by page, through
+    /// SQLite's online backup API -- the destination keeps its file, its
+    /// permissions and its journal mode, and a failure part way through rolls
+    /// back rather than leaving half a database behind.
+    ///
+    /// Call [`Db::check_backup`] first. Like the other two, this reads and
+    /// writes the whole file, so it belongs off the runtime.
+    pub fn restore_from(&self, src: &str) -> Result<()> {
+        let mut conn = self.conn();
+        conn.restore(rusqlite::MAIN_DB, src, None::<fn(rusqlite::backup::Progress)>)?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        migrate(&conn, version)?;
+        Ok(())
+    }
+
     // ---- sessions ----
 
     pub fn create_session(&self, token_hash: &str, expires_at: i64) -> Result<()> {
@@ -1077,6 +1255,130 @@ mod tests {
         assert_eq!(read("wal_autocheckpoint"), 256);
         assert_eq!(read("journal_size_limit"), 1_048_576);
         assert_eq!(read("busy_timeout"), 5_000);
+    }
+
+    /// A real file, because the whole point of these three is what happens
+    /// to one. Cleaned up by the test that made it.
+    struct Scratch(String);
+
+    impl Scratch {
+        fn new() -> Self {
+            Self(
+                std::env::temp_dir()
+                    .join(format!("monitor-test-{}.db", rand::random::<u64>()))
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm", ".copy"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", self.0));
+            }
+        }
+    }
+
+    /// Backup and restore are the two buttons that can lose every row in the
+    /// database, so this walks the whole path: take a copy, change the live
+    /// database, put the copy back, and see the change gone.
+    #[test]
+    fn a_backup_restores_the_database_it_was_taken_from() {
+        let scratch = Scratch::new();
+        let copy = format!("{}.copy", scratch.0);
+        let db = Db::open(&scratch.0).unwrap();
+        let kept =
+            db.create_node(&Node { name: "backed-up".into(), ..Default::default() }, "token-kept").unwrap();
+        db.backup_into(&copy).unwrap();
+
+        // Everything after the copy has to disappear when it is restored --
+        // including a node that took the deleted one's id back.
+        db.delete_node(kept).unwrap();
+        db.create_node(&Node { name: "after".into(), ..Default::default() }, "token-after").unwrap();
+
+        db.check_backup(&copy).unwrap();
+        db.restore_from(&copy).unwrap();
+        let back = db.nodes().unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!((back[0].name.as_str(), back[0].token.as_str()), ("backed-up", "token-kept"));
+        assert!(db.node_by_token("token-after").unwrap().is_none(), "the row made after the copy is gone");
+
+        // The connection is still the hub's: it can write, it is still on the
+        // schema this build expects, and it is still journalling the way the
+        // hub was opened -- the copy `VACUUM INTO` wrote is not in WAL mode.
+        node(&db, 1);
+        let conn = db.conn();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(conn.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0)).unwrap(), "wal");
+        drop(conn);
+        let _ = std::fs::remove_file(&copy);
+    }
+
+    /// The upload behind restore is a file from somewhere else. Each of these
+    /// is a way for it to not be a hub backup, and every one of them has to be
+    /// caught before a single page is copied over live data.
+    #[test]
+    fn restore_refuses_anything_that_is_not_a_backup_of_this_hub() {
+        let scratch = Scratch::new();
+        let db = Db::open(&scratch.0).unwrap();
+        let bad = format!("{}.copy", scratch.0);
+
+        std::fs::write(&bad, b"this is not a database at all").unwrap();
+        assert!(db.check_backup(&bad).is_err(), "not SQLite");
+
+        let _ = std::fs::remove_file(&bad);
+        let empty = Connection::open(&bad).unwrap();
+        empty.execute_batch("CREATE TABLE unrelated (a)").unwrap();
+        assert!(db.check_backup(&bad).is_err(), "SQLite, but not this schema");
+
+        // A file carrying its own code where a table belongs: the restore
+        // copies pages, so that schema would be the one the hub then runs
+        // every statement against.
+        empty.execute_batch(&SCHEMA.replace("PRAGMA journal_mode = WAL;", "")).unwrap();
+        empty
+            .execute_batch(
+                "DROP TABLE session; CREATE VIEW session AS SELECT 1 AS token_hash, 2 AS expires_at",
+            )
+            .unwrap();
+        assert!(db.check_backup(&bad).is_err(), "a view where a table belongs");
+
+        // From a hub that knows a schema this build has never seen.
+        let _ = std::fs::remove_file(&bad);
+        let newer = Connection::open(&bad).unwrap();
+        newer.execute_batch(SCHEMA).unwrap();
+        newer.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1)).unwrap();
+        assert!(db.check_backup(&bad).is_err(), "from a newer hub");
+
+        newer.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}")).unwrap();
+        db.check_backup(&bad).unwrap();
+    }
+
+    /// Deleted rows leave free pages behind; only a rebuild gives them back to
+    /// the filesystem, and in WAL mode only after the checkpoint.
+    #[test]
+    fn vacuum_gives_the_deleted_pages_back_to_the_filesystem() {
+        let scratch = Scratch::new();
+        let db = Db::open(&scratch.0).unwrap();
+        let id = node(&db, 1);
+        let now = Utc::now().timestamp();
+        let sample = serde_json::json!({"cpu": 1.0, "mem_used": 1, "swap_used": 1, "disk_used": 1,
+            "net_rx": 1, "net_tx": 1, "tcp": 1, "udp": 1, "procs": 1});
+        for i in 0..20_000 {
+            db.insert_metric(id, now - i, &sample).unwrap();
+        }
+        let _ = db.conn().query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        let fat = on_disk(&scratch.0);
+        db.prune(0).unwrap();
+
+        let freed = db.vacuum().unwrap();
+        assert!(freed > 0, "a vacuum after deleting 20 000 rows has to return space");
+        assert!(on_disk(&scratch.0) < fat);
+        assert_eq!(db.stats().unwrap()["rows"]["metric"], 0);
+        assert_eq!(db.nodes().unwrap().len(), 1, "vacuum keeps the rows that are left");
     }
 
     fn node(db: &Db, reset_day: u32) -> i64 {

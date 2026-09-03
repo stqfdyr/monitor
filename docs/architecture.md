@@ -148,7 +148,21 @@ OpenRC 没有对应开关，要降权得自己建用户再指过去。agent 并�
 **登录**：`POST /api/auth/login`、`POST /api/auth/logout`、`GET /api/auth/github`、`GET /api/auth/github/callback`
 
 **面板**（全部要 `Admin` 提取器）：
-`POST /api/nodes`、`PUT /api/nodes/order`、`PUT|DELETE /api/nodes/{id}`、`POST /api/nodes/{id}/token`、`PUT /api/nodes/{id}/traffic`、`GET|POST /api/ping-tasks`、`DELETE /api/ping-tasks/{id}`、`GET|PUT /api/settings`、`GET /api/themes`
+`POST /api/nodes`、`PUT /api/nodes/order`、`PUT|DELETE /api/nodes/{id}`、`POST /api/nodes/{id}/token`、`PUT /api/nodes/{id}/traffic`、`GET|POST /api/ping-tasks`、`DELETE /api/ping-tasks/{id}`、`GET|PUT /api/settings`、`GET /api/themes`、`GET /api/db`、`GET /api/db/backup`、`POST /api/db/restore`、`POST /api/db/vacuum`
+
+**数据库那四个各是一次整文件操作**，都在 `tokio::task::spawn_blocking` 里跑，因为它们持有 agent
+上报用的那条连接：
+
+| 路径 | 做什么 | SQLite 侧 |
+|---|---|---|
+| `GET /api/db` | 文件大小、WAL 大小、可回收字节、各表行数 | `page_size` × `freelist_count` 与 `COUNT(*)` |
+| `GET /api/db/backup` | 下载整库副本 | `VACUUM INTO`，副本落在库文件旁边，打开后立刻 unlink，随响应消失 |
+| `POST /api/db/restore` | 用上传的备份覆盖当前库 | 先整份校验，再走在线备份 API 逐页覆盖 |
+| `POST /api/db/vacuum` | 清过期明细并把空页还给磁盘 | `prune` + `VACUUM` + `wal_checkpoint(TRUNCATE)` |
+
+`/api/db/restore` 是**唯一不在 64 KiB 请求体上限里**的路径（备份是几 MB 到几百 MB），它自带
+`api::MAX_RESTORE = 256 MiB`，在 `main.rs` 里以 `merge` 挂在全局那层 limit 之外——两层 limit 嵌套
+取的是小的那个。上传边收边落盘，不进内存。
 
 其余路径按下面顺序处理：
 

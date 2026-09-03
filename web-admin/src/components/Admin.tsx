@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { CalendarClock, Copy, Download, GripVertical, Palette, Pencil, Plus, Radio, Server, Settings, Trash2 } from "lucide-react"
+import { CalendarClock, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -887,24 +887,28 @@ function Themes() {
 
 type Settings = Record<string, string | boolean>
 
-function SettingsTab({ site }: { site: string }) {
+// Two pages write settings -- 设置 and 安全 -- and each loads only what it
+// shows.
+function useSettings() {
   const [s, setS] = useState<Settings | null>(null)
-  const [password, setPassword] = useState("")
-  const set = (k: string, v: string) => setS((old) => ({ ...(old ?? {}), [k]: v }))
-
   useEffect(() => { api<Settings>("/settings").then(setS).catch(() => {}) }, [])
-
-  async function save(patch: Record<string, string>) {
-    try {
-      await api("/settings", { method: "PUT", body: JSON.stringify(patch) })
-      toast.success("已保存")
-    } catch (e) {
-      toast.error((e as Error).message)
-    }
+  return {
+    s,
+    set: (k: string, v: string) => setS((old) => ({ ...(old ?? {}), [k]: v })),
+    save: async (patch: Record<string, string>) => {
+      try {
+        await api("/settings", { method: "PUT", body: JSON.stringify(patch) })
+        toast.success("已保存")
+      } catch (e) {
+        toast.error((e as Error).message)
+      }
+    },
   }
+}
 
+function SettingsTab() {
+  const { s, set, save } = useSettings()
   if (!s) return null
-  const callback = `${site}/api/auth/github/callback`
 
   return (
     <div className="space-y-4">
@@ -953,7 +957,20 @@ function SettingsTab({ site }: { site: string }) {
           </Button>
         </div>
       </Card>
+    </div>
+  )
+}
 
+// The two ways into this panel, on their own page: the GitHub identity it
+// trusts and the password that still works when GitHub does not.
+function Security({ site }: { site: string }) {
+  const { s, set, save } = useSettings()
+  const [password, setPassword] = useState("")
+  if (!s) return null
+  const callback = `${site}/api/auth/github/callback`
+
+  return (
+    <div className="space-y-4">
       <Card className="gap-4 p-5">
         <div>
           <h3 className="text-sm font-medium">GitHub 单点登录</h3>
@@ -1020,12 +1037,171 @@ function SettingsTab({ site }: { site: string }) {
   )
 }
 
+type DbInfo = {
+  path: string
+  size: number
+  wal: number
+  free: number
+  rows: Record<string, number>
+}
+
+// The tables worth naming. `setting`, `traffic` and `ping_node` are one row
+// per node or per key and say nothing about size.
+const DB_ROWS: [string, string][] = [
+  ["node", "节点"],
+  ["metric", "历史明细"],
+  ["ping_record", "延迟记录"],
+  ["ping_task", "探测任务"],
+  ["session", "登录会话"],
+]
+
+function Data() {
+  const [info, setInfo] = useState<DbInfo | null>(null)
+  const [busy, setBusy] = useState("")
+  const [confirm, setConfirm] = useState<"vacuum" | null>(null)
+  const [pending, setPending] = useState<File | null>(null)
+  const picker = useRef<HTMLInputElement>(null)
+
+  const load = () => api<DbInfo>("/db").then(setInfo).catch((e: Error) => toast.error(e.message))
+  useEffect(() => { load() }, [])
+
+  async function vacuum() {
+    setBusy("vacuum")
+    try {
+      const { pruned, freed } = await api<{ pruned: number; freed: number }>("/db/vacuum", { method: "POST" })
+      toast.success(`已清理 ${pruned} 行，回收 ${bytes(freed)}`)
+      load()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setBusy("")
+      setConfirm(null)
+    }
+  }
+
+  async function restore(file: File) {
+    setBusy("restore")
+    try {
+      await api("/db/restore", {
+        method: "POST",
+        body: file,
+        headers: { "content-type": "application/octet-stream" },
+      })
+      toast.success("已恢复，正在重新加载")
+      // Every node, setting and session on the page came from the database
+      // that was just replaced.
+      setTimeout(() => location.reload(), 800)
+    } catch (e) {
+      toast.error((e as Error).message)
+      setBusy("")
+    }
+    setPending(null)
+  }
+
+  if (!info) return null
+  const stat = (label: string, value: string) => (
+    <div key={label}>
+      <div className="text-xs text-muted-foreground">{label}</div>
+      <div className="tnum mt-0.5 text-sm">{value}</div>
+    </div>
+  )
+
+  return (
+    <div className="space-y-4">
+      <Card className="gap-4 p-5">
+        <h3 className="text-sm font-medium">数据库</h3>
+        <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+          {stat("文件大小", bytes(info.size))}
+          {stat("预写日志", bytes(info.wal))}
+          {stat("可回收空间", bytes(info.free))}
+          {DB_ROWS.map(([key, label]) => stat(label, (info.rows[key] ?? 0).toLocaleString()))}
+        </div>
+        <p className="truncate text-xs text-muted-foreground" title={info.path}>
+          <code>{info.path}</code>
+        </p>
+      </Card>
+
+      <Card className="gap-4 p-5">
+        <div>
+          <h3 className="text-sm font-medium">备份</h3>
+          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+            导出的是整个数据库，含节点凭证与登录密码哈希，请当作密钥保管。恢复会用备份文件整体覆盖当前数据，
+            当前节点、设置、历史全部作废，所有设备需要重新登录。
+            <br />
+            请用这里导出的文件恢复：直接复制 <code>monitor.db</code> 会丢掉预写日志里还没落盘的那部分。
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {/* The browser's own download: the file is streamed straight from
+              the response, never held in the page. */}
+          <Button size="sm" asChild>
+            <a href="/api/db/backup" download>
+              <Download /> 导出备份
+            </a>
+          </Button>
+          <Button size="sm" variant="secondary" disabled={!!busy} onClick={() => picker.current?.click()}>
+            <Upload /> 导入备份
+          </Button>
+          <input
+            ref={picker}
+            type="file"
+            accept=".db,application/octet-stream"
+            className="hidden"
+            onChange={(e) => {
+              setPending(e.target.files?.[0] ?? null)
+              e.target.value = ""
+            }}
+          />
+        </div>
+      </Card>
+
+      <Card className="gap-4 p-5">
+        <div>
+          <h3 className="text-sm font-medium">回收空间</h3>
+          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+            按保留天数清掉过期明细，再重建数据库文件把空出来的页还给磁盘（SQLite 的 VACUUM）。
+            重建期间需要与数据库等量的空闲磁盘，过程中面板和上报会短暂变慢。
+          </p>
+        </div>
+        <div>
+          <Button size="sm" variant="secondary" disabled={!!busy} onClick={() => setConfirm("vacuum")}>
+            {busy === "vacuum" ? "回收中…" : "立即回收"}
+          </Button>
+        </div>
+      </Card>
+
+      {confirm === "vacuum" && (
+        <ConfirmDialog
+          title="回收空间？"
+          description="超出保留天数的历史明细会被删除，然后重建数据库文件。累计流量不受影响。"
+          confirmLabel="开始回收"
+          busy={!!busy}
+          onClose={() => setConfirm(null)}
+          onConfirm={vacuum}
+        />
+      )}
+      {pending && (
+        <ConfirmDialog
+          title="用备份覆盖当前数据？"
+          description={`将用 ${pending.name}（${bytes(pending.size)}）整体替换当前数据库。当前的节点、设置和历史全部丢失，且无法撤销。`}
+          confirmLabel="确认恢复"
+          busy={!!busy}
+          onClose={() => setPending(null)}
+          onConfirm={() => restore(pending)}
+        />
+      )}
+    </div>
+  )
+}
+
 // Each area is its own route rather than a tab, so a page can be linked to
 // and a reload lands on the section it was on.
 const ADMIN_SECTIONS = [
   { path: "/admin/nodes", label: "节点", icon: Server },
-  { path: "/admin/ping", label: "延迟监控", icon: Radio },
+  { path: "/admin/ping", label: "延迟", icon: Radio },
+  { path: "/admin/data", label: "数据", icon: Database },
   { path: "/admin/themes", label: "主题", icon: Palette },
+  { path: "/admin/security", label: "安全", icon: Shield },
   { path: "/admin/settings", label: "设置", icon: Settings },
 ] as const
 
@@ -1066,10 +1242,14 @@ export function Admin({
       <div className="min-w-0 flex-1">
         {path === "/admin/ping" ? (
           <Ping nodes={nodes} />
+        ) : path === "/admin/data" ? (
+          <Data />
         ) : path === "/admin/themes" ? (
           <Themes />
+        ) : path === "/admin/security" ? (
+          <Security site={site} />
         ) : path === "/admin/settings" ? (
-          <SettingsTab site={site} />
+          <SettingsTab />
         ) : (
           <Nodes nodes={nodes} refresh={refresh} site={site} />
         )}

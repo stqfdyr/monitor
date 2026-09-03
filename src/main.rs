@@ -310,9 +310,19 @@ async fn main() -> Result<()> {
         .route("/api/ping-tasks/{id}", delete(api::delete_ping_task))
         .route("/api/settings", get(api::settings).put(api::save_settings))
         .route("/api/themes", get(api::themes))
+        .route("/api/db", get(api::db_stats))
+        .route("/api/db/backup", get(api::db_backup))
+        .route("/api/db/vacuum", post(api::db_vacuum))
         .fallback(frontend::serve)
         // A report is a few hundred bytes; anything larger is not one.
         .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
+        // Merged in after that layer rather than under it: a restored backup
+        // is megabytes, and two nested limits are the smaller of the two.
+        // It carries its own ceiling, and it is behind `Admin`.
+        .merge(Router::new().route(
+            "/api/db/restore",
+            post(api::db_restore).layer(tower_http::limit::RequestBodyLimitLayer::new(api::MAX_RESTORE)),
+        ))
         // A day of one node's chart is 236 kB of JSON against 30 kB gzipped,
         // and the theme's bundle is much the same shape. Not on a 101: both
         // sockets upgrade through one, and a body encoder has no business
@@ -425,7 +435,7 @@ fn first_run(app: &App, url: &str) -> Result<()> {
         "\n  Monitor hub is ready.\n\n  \
          Sign in at {url}/admin\n  \
          Emergency password: {password}\n\n  \
-         This is shown once. Change it, and set up GitHub sign-in, under Settings.\n"
+         This is shown once. Change it, and set up GitHub sign-in, under Security.\n"
     );
     Ok(())
 }

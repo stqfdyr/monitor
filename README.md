@@ -11,6 +11,7 @@
 - 总流量跨 VPS 重启、hub 重启、agent 掉线持续累加
 - 在线节点过期后，到期日按付款周期自动顺延
 - 公开状态页可换主题，主题在运行时从磁盘加载
+- 数据库一键导出备份、导入恢复、回收空间
 - GitHub SSO 登录，本地应急密码作为备用入口
 - agent 静态链接单文件，支持 systemd 与 OpenRC
 
@@ -90,7 +91,7 @@ monitor-hub                    # 0.0.0.0:28080，数据库 ./monitor.db
 
 首次启动打印一次性应急密码，用它登录 `/admin`：
 
-1. **设置** 配置 GitHub OAuth（回调 `<面板地址>/api/auth/github/callback`）与允许登录的用户名，
+1. **安全** 配置 GitHub OAuth（回调 `<面板地址>/api/auth/github/callback`）与允许登录的用户名，
    修改应急密码
 2. **节点** 添加节点，点下载按钮生成安装命令，在目标主机执行
 3. 拖动手柄排序；展示与流量设置、续费设置分别编辑
@@ -157,6 +158,9 @@ server {
     location / {
         proxy_pass http://127.0.0.1:28080;
         proxy_http_version 1.1;
+        # nginx 默认只收 1 MB 请求体，导入备份会被反代自己 413 掉。
+        # 只有 /api/db/restore 需要它，其余路径 hub 自己卡在 64 KiB。
+        client_max_body_size 256m;
         proxy_set_header Host              $host;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
@@ -181,9 +185,17 @@ ingress:
   - service: http_status:404
 ```
 
+**在边缘做了路径白名单的话，升级 hub 时记得同步**：新版本加的路由会被上一版的名单挡在外面，
+而且 403 来自边缘，hub 侧一行日志都没有。面板用到的全部路径见
+[docs/architecture.md](docs/architecture.md) 的路由表；这一版新增的是 `/api/db`、`/api/db/backup`、
+`/api/db/restore`、`/api/db/vacuum`。
+
 ### 几条通用注意
 
 - 转发 `Upgrade` / `Connection` 头，关闭缓冲，读写超时远大于 60 秒，否则节点会周期性掉线
+- **请求体上限要大于备份文件**：nginx 默认 `client_max_body_size 1m`，导入备份会被反代自己 413 掉
+  （caddy 默认不限）。hub 侧的硬上限是 256 MiB。套 Cloudflare 的话免费版还有 100 MB 的上传上限，
+  那是这条路的真正天花板
 - 放行 `POST` / `PUT` / `DELETE`
 - 透传 `X-Forwarded-Proto`，否则会话 cookie 拿不到 `Secure`
 - 透传 `X-Forwarded-For`，否则登录限流会按代理地址计数
@@ -211,6 +223,7 @@ ingress:
 - 公开状态页按节点开关，且不输出 IP、主机名与备注
 - OAuth 回调校验 state；session cookie 为 HttpOnly + SameSite=Lax + Secure
 - 匿名可达的接口都有明确上界：历史窗口最宽 7 天，agent 二进制转发最多 4 个并发
+- 导入的备份先整份校验（完整性、表结构、无视图/触发器、schema 版本）才允许覆盖；恢复后所有会话作废
 
 详见 [docs/security.md](docs/security.md)。
 

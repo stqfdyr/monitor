@@ -152,6 +152,14 @@ free -b | awk 'NR==2{printf "free used=%.2fG\n", $3/1073741824}'
 df -B1 --output=size,used / | tail -1
 
 # 5. 累计流量跨 hub 重启不回退（见 traffic.md 的完整步骤）
+
+# 6. 备份能导出，也能原样恢复（C 是 cookie jar）
+curl -s -b $C -o /tmp/b.db $H/api/db/backup && file /tmp/b.db        # SQLite 3.x database
+curl -s -o /dev/null -w "%{http_code}\n" $H/api/db/backup            # 401，四条 /api/db/* 都是
+head -c 200000 /dev/urandom > /tmp/junk
+curl -s -b $C -X POST --data-binary @/tmp/junk $H/api/db/restore     # 400 而不是 413：
+                                                                     # 这条路不在 64 KiB 上限里
+curl -s -b $C -X POST --data-binary @/tmp/b.db $H/api/db/restore     # {"ok":true} + 新 cookie
 ```
 
 ## 截图检查前端

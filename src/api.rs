@@ -4,10 +4,10 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use chrono::Utc;
+use chrono::{Local, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -471,6 +471,170 @@ const READABLE_SETTINGS: &[&str] = &[
     "theme",
     "github_proxy",
 ];
+
+// ---- the database itself ----
+
+/// The ceiling on an uploaded backup, and the reason `/api/db/restore` sits
+/// outside the router's 64 KiB body limit: a real backup is megabytes. It is
+/// still bounded -- the bytes land in a file next to the database before
+/// anything looks at them, and an admin session is not a licence to fill the
+/// disk.
+pub const MAX_RESTORE: usize = 256 * 1024 * 1024;
+
+/// A scratch file beside the database, so the copy lands on the same
+/// filesystem the database itself has room on. The random half keeps two
+/// concurrent calls apart -- `VACUUM INTO` refuses a file that already exists.
+fn scratch_path(app: &App, kind: &str) -> String {
+    format!("{}.{kind}-{}.tmp", app.db.file(), &random_token()[..16])
+}
+
+pub async fn db_stats(_: Admin, State(app): State<Shared>) -> Response {
+    match app.db.stats() {
+        Ok(stats) => Json(stats).into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+/// Hands back a compact copy of the whole database.
+///
+/// The copy is written next to the live file and then unlinked while it is
+/// still open, so it exists only as long as this response does -- a client
+/// that disconnects half way through leaves nothing behind, and nothing on
+/// disk outlives the download.
+pub async fn db_backup(_: Admin, State(app): State<Shared>) -> Response {
+    let path = scratch_path(&app, "backup");
+    // Off the runtime: this one reads the entire database while holding the
+    // connection the agents write through.
+    let copied = {
+        let (app, path) = (app.clone(), path.clone());
+        tokio::task::spawn_blocking(move || app.db.backup_into(&path)).await
+    };
+    if let Err(e) = copied.map_err(|e| anyhow::anyhow!(e)).and_then(|r| r) {
+        let _ = std::fs::remove_file(&path);
+        return fail(e);
+    }
+    let opened = tokio::fs::File::open(&path).await;
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let _ = std::fs::remove_file(&path);
+    match opened {
+        Ok(file) => (
+            [
+                (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
+                (header::CONTENT_LENGTH, size.to_string()),
+                // The whole credential store: no shared cache keeps a copy.
+                (header::CACHE_CONTROL, "no-store".to_owned()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"monitor-{}.db\"", Local::now().format("%Y%m%d-%H%M%S")),
+                ),
+            ],
+            axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file)),
+        )
+            .into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+/// Replaces the live database with an uploaded backup.
+///
+/// The upload is streamed to disk and checked as a whole before a single page
+/// of it is copied: see `Db::check_backup`. Afterwards every session in the
+/// restored file is dropped and the caller is handed a new one -- a backup
+/// carries the session rows it had when it was taken, and restoring one is no
+/// reason to bring logged-out sessions back to life.
+pub async fn db_restore(
+    _: Admin,
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> Response {
+    let path = scratch_path(&app, "restore");
+    let outcome = restore(&app, &path, body).await;
+    // SQLite writes a -wal and a -shm beside any file it opens in WAL mode,
+    // and a plain copy of a running hub's database is exactly that. They go
+    // when the connection closes cleanly; these three lines are what covers
+    // the time it does not.
+    for leftover in [path.clone(), format!("{path}-wal"), format!("{path}-shm")] {
+        let _ = std::fs::remove_file(leftover);
+    }
+    match outcome {
+        Ok(()) => {
+            // Agents authenticate at the handshake, and the tokens they hold
+            // may belong to different nodes now -- or to none. Dropping the
+            // senders ends those loops; each reconnects against the database
+            // that is actually here.
+            app.agents.write().unwrap_or_else(|e| e.into_inner()).clear();
+            invalidate_snapshot(&app);
+            let cookie = match app.db.drop_all_sessions().and_then(|()| issue_session(&app, &headers)) {
+                Ok(cookie) => cookie,
+                Err(e) => return fail(e),
+            };
+            with_cookies(Json(json!({"ok": true})), [cookie])
+        }
+        Err(e) => bad(&format!("{e:#}")),
+    }
+}
+
+async fn restore(app: &Shared, path: &str, body: axum::body::Body) -> Result<(), anyhow::Error> {
+    receive(path, body).await?;
+    // Both halves read the whole file: `PRAGMA integrity_check` on a 256 MiB
+    // upload is not runtime work either, and the copy that follows holds the
+    // connection the agents write through.
+    let (app, source) = (app.clone(), path.to_owned());
+    tokio::task::spawn_blocking(move || {
+        app.db.check_backup(&source)?;
+        app.db.restore_from(&source)
+    })
+    .await?
+}
+
+/// Streams the request body into `path`, which is created owner-only and must
+/// not exist. The byte count is checked here as well as by the route's body
+/// limit: this is the only path on the hub that writes a caller's bytes to
+/// disk, so it does not lean on a layer someone could reorder away.
+async fn receive(path: &str, body: axum::body::Body) -> Result<(), anyhow::Error> {
+    use std::io::Write;
+    use std::pin::Pin;
+
+    let mut file = std::fs::OpenOptions::new();
+    file.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
+    let mut file = file.open(path)?;
+
+    let mut stream = body.into_data_stream();
+    let mut written = 0usize;
+    while let Some(chunk) =
+        std::future::poll_fn(|cx| futures_core::Stream::poll_next(Pin::new(&mut stream), cx)).await
+    {
+        let chunk = chunk?;
+        written += chunk.len();
+        if written > MAX_RESTORE {
+            anyhow::bail!("the upload is larger than {} MiB", MAX_RESTORE / 1024 / 1024);
+        }
+        file.write_all(&chunk)?;
+    }
+    Ok(())
+}
+
+/// Drops history past the retention window and rebuilds the file around what
+/// is left, which is the only way SQLite gives the space back to the
+/// filesystem.
+pub async fn db_vacuum(_: Admin, State(app): State<Shared>) -> Response {
+    let keep = app.db.get("retention_days").and_then(|v| v.parse::<i64>().ok()).unwrap_or(30).clamp(1, 3_650);
+    let app = app.clone();
+    // A rebuild of the whole file, holding the connection the agents write
+    // through: it belongs on a blocking thread.
+    let done = tokio::task::spawn_blocking(move || {
+        let pruned = app.db.prune(keep)?;
+        app.db.vacuum().map(|freed| json!({"pruned": pruned, "freed": freed}))
+    })
+    .await;
+    match done.map_err(|e| anyhow::anyhow!(e)).and_then(|r| r) {
+        Ok(result) => Json(result).into_response(),
+        Err(e) => fail(e),
+    }
+}
 
 pub async fn themes(_: Admin, State(app): State<Shared>) -> Response {
     match crate::frontend::themes(&app) {

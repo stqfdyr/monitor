@@ -10,11 +10,11 @@ repository = "https://github.com/stqfdyr/monitor"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 axum = { version = "0.8", features = ["ws", "macros"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled", "backup"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 argon2 = "0.5"
 rand = "0.9"
@@ -24,6 +24,7 @@ futures-core = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 rust-embed = "8"
 mime_guess = "2"
+tokio-util = { version = "0.7", features = ["io"] }
 tower-http = { version = "0.6", features = ["limit", "compression-gzip"] }
 
 [dev-dependencies]
