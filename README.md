@@ -48,16 +48,18 @@ sudo sh install-hub.sh
 ```
 
 有终端时给一个菜单（安装 / 升级、卸载、状态、日志）；`curl ... | sh` 没有终端可读答案，直接按默认装。
-装完打印面板地址和一次性应急密码，浏览器打开 `http://<服务器 IP>:28080/admin` 即可登录。
+装完打印一次性应急密码，**记下来**——hub 只监听 `127.0.0.1`，得先配好反向代理才能打开面板，
+脚本最后会把 nginx / caddy / CF 隧道三种配法打出来。密码事后也能找回：
+`journalctl -u monitor-hub | grep Emergency`。
 
 脚本做的事：核对 release 的 `sha256sums.txt` 之后才把二进制放进 `/usr/local/bin`，写一个
 `DynamicUser=yes` 的 systemd 单元，数据固定在 `/var/lib/monitor`。**重跑一次就是升级**——校验通过才
-替换，起不来自动回滚到上一版。
+替换，起不来自动回滚到上一版，没写的参数沿用上次的。
 
 | 参数 | 说明 |
 |---|---|
-| `--port <n>` | 监听端口，默认 `28080` |
-| `--site <url>` | 反向代理后的对外地址，直接用 ip:port 时不填 |
+| `--port <n>` | **本机**监听端口，默认 `28080` |
+| `--site <url>` | 一般不用填，见「反向代理」 |
 | `--uninstall` | 卸载，数据保留在 `/var/lib/monitor` |
 | `--purge` | 卸载并删除数据库 |
 
@@ -123,7 +125,10 @@ docker run -d --name monitor -p 28080:28080 \
 
 ## 反向代理
 
-**套上反代，安装命令会自己变，不用改 hub 的任何参数。** 面板用浏览器地址栏的地址拼命令，所以你改用
+**`install-hub.sh` 装出来的 hub 只监听 `127.0.0.1`，公网访问不到**——凭证不会在链路上明文传输，
+也没有端口需要防火墙。把域名指过来是反向代理的活，装完脚本会打印 nginx / caddy / CF 隧道三种配法。
+
+**配好之后不用改 hub 的任何参数，安装命令会自己变。** 面板用浏览器地址栏的地址拼命令，所以你改用
 `https://hub.example.com` 进后台，命令立刻变成 `--server https://hub.example.com` 并去掉
 `--insecure`；会话 cookie 的 `Secure` 跟着请求的 `X-Forwarded-Proto` 走。hub 也不用重启。
 
@@ -133,7 +138,9 @@ docker run -d --name monitor -p 28080:28080 \
 - 放行 `POST` / `PUT` / `DELETE`
 - 透传 `X-Forwarded-Proto`，否则会话 cookie 拿不到 `Secure`
 - 透传 `X-Forwarded-For`，否则登录限流会按代理地址计数
-- 改成 `--listen 127.0.0.1:28080`，否则那个明文端口仍然对外可达，绕过反代就能明文访问
+
+手工部署（不走 `install-hub.sh`）时记得自己加 `--listen 127.0.0.1:28080`，否则明文端口对外可达，
+绕过反代就能明文访问。
 
 ### 什么时候才需要 `--site`
 
