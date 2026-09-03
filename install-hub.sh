@@ -254,8 +254,8 @@ UNIT
 	if [ -z "$SITE" ]; then
 		printf '  %s还差一步：配个反向代理%s\n' "$B" "$N"
 		printf '     面板只监听本机，公网访问不到——这是故意的，凭证不会在链路上裸奔。\n'
-		printf '     用下面任意一个把域名指过来，然后用 https 的域名打开面板即可，\n'
-		printf '     hub 不用重启，安装命令会自动跟着变成 https。\n\n'
+		printf '     用 nginx / caddy / cf tunnel 等配置完反向代理后，用域名访问面板，\n'
+		printf '     我相信这难不倒你。\n\n'
 		# shellcheck disable=SC2016  # $host and friends are nginx's, printed verbatim
 		printf '     %snginx%s   proxy_pass http://127.0.0.1:%s;  另外三行别漏：\n%s\n\n' \
 			"$B" "$N" "$PORT" '             proxy_set_header Host $host;
