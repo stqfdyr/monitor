@@ -244,8 +244,13 @@ UNIT
 	field "日志" "journalctl -u $SERVICE -f"
 	printf '\n'
 	if [ -z "$SITE" ]; then
-		warn "明文 HTTP：会话与节点凭证在链路上明文传输。放到 TLS 反向代理"
-		printf '     后面，再用 --site https://... 重跑一次即可收紧。\n'
+		# Deliberately does not mention --site: the panel builds install
+		# commands from the browser's own address, so a TLS proxy is the whole
+		# fix. --site is for the case this warning cannot see, where the panel
+		# is reached somewhere the agents cannot follow.
+		warn "明文 HTTP：会话与节点凭证在链路上明文传输。"
+		printf '     前面套一层 TLS 反向代理就收紧了——面板和安装命令会自动\n'
+		printf '     跟着变成 https，不用重跑本脚本，也不用改任何参数。\n'
 	fi
 	warn "有防火墙的话记得放行 $PORT/tcp"
 }

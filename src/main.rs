@@ -277,7 +277,9 @@ async fn main() -> Result<()> {
     if exposed_over_plain_http(&url) {
         warn!(
             "this hub answers plain HTTP at {url}; sessions and agent tokens travel in the clear. \
-             Put it behind TLS and pass --site https://..."
+             Put it behind a TLS reverse proxy -- the panel builds install commands from the \
+             browser's own address, so nothing here has to change -- then --listen 127.0.0.1:PORT \
+             so this port is no longer reachable in the clear"
         );
     }
 
@@ -388,8 +390,10 @@ fn outbound_ip() -> Option<IpAddr> {
 /// Plain HTTP to loopback is local development; to anything else it means the
 /// session cookie is readable by every hop in between.
 ///
-/// A hub behind a TLS-terminating proxy or tunnel is not this case: there
-/// `--site` is the https:// address even though the listener speaks plain HTTP.
+/// A hub behind a TLS-terminating proxy or tunnel is not this case, by either
+/// route: `--site` is then the https:// address even though the listener speaks
+/// plain HTTP, and without one the listener is on loopback where nobody else
+/// can reach it.
 fn exposed_over_plain_http(site: &str) -> bool {
     let Some(rest) = site.strip_prefix("http://") else {
         return false;

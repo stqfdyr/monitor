@@ -103,7 +103,7 @@ GitHub 代理（如 `https://ghfast.top`），hub 拉 release 时会用它，节
 
 hub 只有明文 HTTP 时，命令里会多一个 `--insecure`——agent 和 `install.sh` 默认拒绝明文连远程 hub，
 因为凭证会明文传输，装 agent 下载的二进制也走同一条未验证的通道。面板会把这件事标出来。上了 TLS
-之后（`--site https://...`）命令自动不再带它。
+之后命令自动不再带它。
 
 ## Docker
 
@@ -123,12 +123,25 @@ docker run -d --name monitor -p 28080:28080 \
 
 ## 反向代理
 
-置于反向代理之后时，用 `--listen 127.0.0.1:28080` 限制监听，并注意：
+**套上反代，安装命令会自己变，不用改 hub 的任何参数。** 面板用浏览器地址栏的地址拼命令，所以你改用
+`https://hub.example.com` 进后台，命令立刻变成 `--server https://hub.example.com` 并去掉
+`--insecure`；会话 cookie 的 `Secure` 跟着请求的 `X-Forwarded-Proto` 走。hub 也不用重启。
+
+反代的配置这几条要注意：
 
 - 转发 `/api/agent/ws` 与 `/api/ws` 的 `Upgrade` / `Connection` 头，关闭缓冲，读写超时远大于 60 秒
 - 放行 `POST` / `PUT` / `DELETE`
+- 透传 `X-Forwarded-Proto`，否则会话 cookie 拿不到 `Secure`
 - 透传 `X-Forwarded-For`，否则登录限流会按代理地址计数
-- **填 `--site`**：反代后面板常常是通过回环端口访问的，不填会让安装命令指向 `127.0.0.1`
+- 改成 `--listen 127.0.0.1:28080`，否则那个明文端口仍然对外可达，绕过反代就能明文访问
+
+### 什么时候才需要 `--site`
+
+只有这两种情况，常规反代都不属于：
+
+- **你进后台的地址不是节点该用的地址**。比如监听回环之后又通过 SSH 隧道进面板，浏览器地址栏是
+  `127.0.0.1`，节点却得连公网域名——这时命令是错的，得用 `--site` 钉死。
+- **反代不发 `X-Forwarded-Proto`**。cookie 拿不到 `Secure`，用 `--site https://...` 强制。
 
 ## 主题
 
