@@ -163,7 +163,16 @@ install_hub() {
 		die "端口 $PORT 已被其它程序占用，换一个：--port <n>"
 	fi
 
-	args="--listen 0.0.0.0:$PORT --db $DATA/monitor.db"
+	# The same rule as the hub's own default, spelled out here because the
+	# port is configurable and so --listen has to be: one v6 socket serves
+	# both families where the kernel allows it, and a v6-only node has no
+	# route to a v4 address at all.
+	if [ "$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null)" = "0" ]; then
+		bind="[::]"
+	else
+		bind="0.0.0.0"
+	fi
+	args="--listen $bind:$PORT --db $DATA/monitor.db"
 	[ -z "$SITE" ] || args="$args --site $SITE"
 	cat >"$UNIT" <<UNIT
 [Unit]

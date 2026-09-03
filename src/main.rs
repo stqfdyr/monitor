@@ -196,13 +196,33 @@ async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Re
 
 struct Args {
     listen: SocketAddr,
+    /// True when `--listen` was left out, which is the only case where a
+    /// refused v6 wildcard may quietly fall back to v4: an operator who names
+    /// an address means it.
+    listen_defaulted: bool,
     database: String,
     site: String,
     themes: PathBuf,
 }
 
+/// The address to listen on when nobody said. A v6 wildcard also accepts IPv4
+/// through v4-mapped addresses, so one socket serves both -- but only where
+/// the kernel allows it: `bindv6only=1` would make it v6-only and drop every
+/// IPv4 node, and a kernel booted with `ipv6.disable=1` has no
+/// `/proc/sys/net/ipv6` at all and cannot bind the address in the first place.
+///
+/// Worth the proc read because getting it wrong is silent at both ends: a
+/// v6-only node has no route to an IPv4 address, so it just never connects,
+/// and nothing on either side says why.
+fn default_listen() -> &'static str {
+    match std::fs::read_to_string("/proc/sys/net/ipv6/bindv6only") {
+        Ok(flag) if flag.trim() == "0" => "[::]:28080",
+        _ => "0.0.0.0:28080",
+    }
+}
+
 fn parse_args() -> Result<Args> {
-    let mut listen = "0.0.0.0:28080".to_owned();
+    let mut listen = None;
     let mut database = "monitor.db".to_owned();
     let mut site = String::new();
     let mut themes = None;
@@ -210,14 +230,16 @@ fn parse_args() -> Result<Args> {
     while let Some(arg) = it.next() {
         let mut value = || it.next().unwrap_or_default();
         match arg.as_str() {
-            "--listen" => listen = value(),
+            "--listen" => listen = Some(value()),
             "--db" => database = value(),
             "--site" => site = value(),
             "--themes" => themes = Some(PathBuf::from(value())),
             "-h" | "--help" => {
                 println!(
                     "monitor-hub {}\n\n\
-                     Usage: monitor-hub [--listen 0.0.0.0:28080] [--db monitor.db] [--themes themes] [--site https://hub.example.com]\n\n\
+                     Usage: monitor-hub [--listen [::]:28080] [--db monitor.db] [--themes themes] [--site https://hub.example.com]\n\n\
+                     --listen defaults to [::]:28080, one socket serving IPv6 and IPv4\n\
+                     both; where the kernel has no dual-stack sockets it is 0.0.0.0:28080.\n\
                      --themes defaults to a themes/ directory beside the database.\n\
                      --site is only needed behind a reverse proxy, where the address the\n\
                      panel is reached on is not the one agents should use. Left out, the\n\
@@ -230,11 +252,12 @@ fn parse_args() -> Result<Args> {
             other => anyhow::bail!("unknown argument: {other}"),
         }
     }
-    let listen: SocketAddr = listen.parse()?;
+    let listen_defaulted = listen.is_none();
+    let listen: SocketAddr = listen.unwrap_or_else(|| default_listen().to_owned()).parse()?;
     let themes = themes.unwrap_or_else(|| {
         std::path::Path::new(&database).parent().unwrap_or_else(|| std::path::Path::new(".")).join("themes")
     });
-    Ok(Args { listen, database, site: site.trim_end_matches('/').to_owned(), themes })
+    Ok(Args { listen, listen_defaulted, database, site: site.trim_end_matches('/').to_owned(), themes })
 }
 
 #[tokio::main]
@@ -302,8 +325,18 @@ async fn main() -> Result<()> {
         ))
         .with_state(app);
 
-    let listener = tokio::net::TcpListener::bind(args.listen).await?;
-    info!("listening on {} ({url})", args.listen);
+    let listener = match tokio::net::TcpListener::bind(args.listen).await {
+        Ok(listener) => listener,
+        // A box that refuses the dual-stack wildcard still has to come up, and
+        // on such a box IPv4 is all there is to serve.
+        Err(e) if args.listen_defaulted && args.listen.is_ipv6() => {
+            let v4 = SocketAddr::from(([0, 0, 0, 0], args.listen.port()));
+            warn!("could not bind {} ({e}); falling back to {v4}", args.listen);
+            tokio::net::TcpListener::bind(v4).await?
+        }
+        Err(e) => return Err(e.into()),
+    };
+    info!("listening on {} ({url})", listener.local_addr()?);
     axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown())
         .await?;
@@ -473,6 +506,16 @@ mod tests {
             headers.insert("x-forwarded-proto", scheme.parse().unwrap());
         }
         headers
+    }
+
+    /// Whichever wildcard this kernel supports, it has to parse and carry the
+    /// default port: a typo here would surface only as a refused bind at
+    /// startup, on someone else's machine.
+    #[test]
+    fn the_default_listener_is_a_wildcard_on_the_default_port() {
+        let addr: SocketAddr = default_listen().parse().expect("the default must parse");
+        assert!(addr.ip().is_unspecified(), "{addr}");
+        assert_eq!(addr.port(), 28_080);
     }
 
     #[test]
