@@ -102,6 +102,31 @@ socket 通过 v4-mapped 地址同时收两族，所以双栈机器什么都不�
 **否决**：默认端口留 8080（撞 nginx 和各种面板的概率太高，komari 用 25774 是同一个理由）；后端从
 `Host` 头推导对外地址（多一个服务端信任点，而浏览器本来就知道自己的 origin，不必让服务端告诉它）。
 
+### hub 只有 IPv4 时不改架构 **[用户]**
+
+问过一轮「纯 v4 的 hub 让 v6-only 节点没意义，转发架构是不是要重设计」。不改，因为**转发不是那道
+坎**：agent 的价值全在那条常驻 WebSocket 上，节点连不上 hub 就等于没接入，二进制从哪下载都一样。
+
+而在这个前提下，转发恰好是**唯一**能让 v6-only 节点装上的路。实测（2026-09，纯 v6 无 NAT64 的
+alice）：
+
+| 路径 | 结果 |
+|---|---|
+| alice → `github.com/.../releases/...` | `000`——github.com 只有 A 记录，无路由 |
+| alice → `<hub>/agent/x86_64` | `200`，1 815 264 字节，走 `2606:4700:3037::ac43:9335` |
+
+`objects.githubusercontent.com`、`release-assets.githubusercontent.com`、`codeload.github.com`
+同样没有 AAAA（只有 `raw.githubusercontent.com` 有）。所以「改成节点直连 GitHub」不是修复，是把
+现在能用的这批机器也一起弄坏。komari 两处都直连 GitHub，退路是一串加速镜像和 `--install-ghproxy`，
+即把问题推给用户。
+
+真正的约束是路由，不是架构：**节点必须能到达 hub**。给 v4-only 的 hub 加一个 v6 入口有三条路，都
+不需要改代码——机器申请一个 v6 地址（多数 VPS 免费给 /64）、套 Cloudflare 之类的双栈 CDN、或用
+Cloudflare Tunnel（出站建隧道，源站纯 v4 也能有双栈边缘，本项目自己在用的就是这条）。
+
+**否决**：节点侧内置 NAT64/DNS64 兜底（`64:ff9b::` 得有人提供，agent 变不出来）、hub 之间做中继
+（为一个路由问题引入一整套拓扑）。
+
 ### 明文 hub 用 `--insecure` 显式放行 **[用户]**
 
 agent 和 `install.sh` 都拒绝明文连远程 hub：token 会明文传输，而且装 agent 时下载的二进制走同一条
