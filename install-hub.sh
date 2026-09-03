@@ -24,7 +24,9 @@ DATA="/var/lib/monitor"
 # and --purge would delete a database this script never created.
 MARKER="# managed-by: install-hub.sh"
 PORT="28080"
+PORT_SET=""
 SITE=""
+SITE_SET=""
 YES=""
 PURGE=""
 ACTION=""
@@ -85,15 +87,6 @@ check_port() {
 # The hub cannot know its own public address behind NAT, so ask the internet.
 # A private address is still a better thing to print than nothing, and an
 # IPv6-only box gets its literal bracketed so the result is a usable URL.
-public_addr() {
-	addr="$(curl -4s --max-time 5 https://api.ipify.org 2>/dev/null || true)"
-	if [ -n "$addr" ]; then printf '%s' "$addr"; return; fi
-	addr="$(curl -6s --max-time 5 https://api6.ipify.org 2>/dev/null || true)"
-	if [ -n "$addr" ]; then printf '[%s]' "$addr"; return; fi
-	addr="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
-	printf '%s' "${addr:-127.0.0.1}"
-}
-
 foreign_unit() {
 	[ -f "$UNIT" ] || return 1
 	! grep -qF "$MARKER" "$UNIT"
@@ -118,6 +111,21 @@ install_hub() {
 	asset="monitor-hub-$arch-unknown-linux-musl"
 	base="https://github.com/$REPO/releases/latest/download"
 	ok "架构" "$arch"
+
+	# An upgrade rewrites the unit, so anything not given on the command line
+	# has to come back out of the old one. Without this, re-running to upgrade
+	# silently resets the port and drops --site, and the reverse proxy in front
+	# is then pointing at nothing.
+	if [ -z "$PORT_SET" ] || [ -z "$SITE_SET" ]; then
+		old_exec="$(sed -n 's/^ExecStart=.*--listen //p' "$UNIT" 2>/dev/null)"
+		[ -n "$PORT_SET" ] || case "$old_exec" in
+		*:[0-9]*) PORT="${old_exec%% *}"; PORT="${PORT##*:}" ;;
+		esac
+		[ -n "$SITE_SET" ] || case "$old_exec" in
+		*--site\ *) SITE="${old_exec##*--site }"; SITE="${SITE%% *}" ;;
+		esac
+		check_port "$PORT"
+	fi
 
 	# A first run is what prints the one-time password, and only a missing
 	# database makes one. Checked before anything is installed.
@@ -166,16 +174,11 @@ install_hub() {
 		die "端口 $PORT 已被其它程序占用，换一个：--port <n>"
 	fi
 
-	# The same rule as the hub's own default, spelled out here because the
-	# port is configurable and so --listen has to be: one v6 socket serves
-	# both families where the kernel allows it, and a v6-only node has no
-	# route to a v4 address at all.
-	if [ "$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null)" = "0" ]; then
-		bind="[::]"
-	else
-		bind="0.0.0.0"
-	fi
-	args="--listen $bind:$PORT --db $DATA/monitor.db"
+	# Loopback only: the panel and the agent tokens never travel a network in
+	# the clear, and there is no port to firewall. Reaching it is the reverse
+	# proxy's job, and 127.0.0.1 rather than [::1] because that is what every
+	# proxy's default upstream is -- the hub binds one address, not both.
+	args="--listen 127.0.0.1:$PORT --db $DATA/monitor.db"
 	[ -z "$SITE" ] || args="$args --site $SITE"
 	cat >"$UNIT" <<UNIT
 [Unit]
@@ -228,7 +231,7 @@ UNIT
 	printf '\n  %s%s%s\n' "$B" "$done_title" "$N"
 	rule
 	printf '\n'
-	field "面板" "${SITE:-http://$(public_addr):$PORT}/admin"
+	field "面板" "${SITE:-http://127.0.0.1:$PORT}/admin"
 	if [ -n "$first" ]; then
 		pw="$(journalctl -u "$SERVICE" --since '-2 min' --no-pager 2>/dev/null |
 			sed -n 's/.*Emergency password: //p' | tail -1)"
@@ -243,16 +246,27 @@ UNIT
 	field "服务" "systemctl status $SERVICE"
 	field "日志" "journalctl -u $SERVICE -f"
 	printf '\n'
+
+	# The hub is on loopback, so this is not optional advice -- it is the
+	# remaining half of the install. Deliberately does not mention --site: the
+	# panel builds install commands from the browser's own address, so once the
+	# domain works, everything downstream is already right.
 	if [ -z "$SITE" ]; then
-		# Deliberately does not mention --site: the panel builds install
-		# commands from the browser's own address, so a TLS proxy is the whole
-		# fix. --site is for the case this warning cannot see, where the panel
-		# is reached somewhere the agents cannot follow.
-		warn "明文 HTTP：会话与节点凭证在链路上明文传输。"
-		printf '     前面套一层 TLS 反向代理就收紧了——面板和安装命令会自动\n'
-		printf '     跟着变成 https，不用重跑本脚本，也不用改任何参数。\n'
+		printf '  %s还差一步：配个反向代理%s\n' "$B" "$N"
+		printf '     面板只监听本机，公网访问不到——这是故意的，凭证不会在链路上裸奔。\n'
+		printf '     用下面任意一个把域名指过来，然后用 https 的域名打开面板即可，\n'
+		printf '     hub 不用重启，安装命令会自动跟着变成 https。\n\n'
+		# shellcheck disable=SC2016  # $host and friends are nginx's, printed verbatim
+		printf '     %snginx%s   proxy_pass http://127.0.0.1:%s;  另外三行别漏：\n%s\n\n' \
+			"$B" "$N" "$PORT" '             proxy_set_header Host $host;
+             proxy_set_header X-Forwarded-Proto $scheme;
+             proxy_set_header Upgrade $http_upgrade;  Connection 同理（WebSocket）'
+		printf '     %scaddy%s   一行：hub.example.com { reverse_proxy 127.0.0.1:%s }\n' "$B" "$N" "$PORT"
+		printf '             证书、X-Forwarded-Proto、WebSocket 它都自动处理\n\n'
+		printf '     %sCF 隧道%s cloudflared tunnel route，服务填 http://127.0.0.1:%s\n' "$B" "$N" "$PORT"
+		printf '             不用开任何入站端口，纯 IPv4 的机器也能拿到双栈入口\n\n'
+		printf '     %s完整配置和注意事项见 README 的「反向代理」一节。%s\n' "$D" "$N"
 	fi
-	warn "有防火墙的话记得放行 $PORT/tcp"
 }
 
 # ---- uninstall ----
@@ -337,13 +351,19 @@ monitor hub 安装器
   sudo sh install-hub.sh --uninstall    卸载，保留数据
   sudo sh install-hub.sh --purge        卸载并删除数据库
 
-  --port <n>     监听端口，默认 $PORT
-  --site <url>   反向代理后的对外地址，如 https://hub.example.com。
-                 直接用 ip:port 访问时不用填
+  --port <n>     本机监听端口，默认 $PORT
+  --site <url>   一般不用填。面板拼安装命令用的是浏览器地址栏，配好反代
+                 用域名访问就自动对了。只有两种情况要填：你进面板的地址
+                 不是节点能用的地址（比如走 SSH 隧道），或反代不发
+                 X-Forwarded-Proto
   --yes, -y      跳过确认
   --help, -h     显示这段
 
-重跑一次就是升级：校验通过后才替换二进制，起不来会自动回滚到上一版。
+hub 只监听 127.0.0.1，公网访问不到，需要自己配 nginx / caddy / CF 隧道把
+域名指过来。装完会打印具体怎么配。
+
+重跑一次就是升级：校验通过后才替换二进制，起不来会自动回滚到上一版；
+没写的参数沿用上次的，所以升级不会把端口和 --site 冲掉。
 数据固定在 $DATA，卸载默认保留。
 
 已经有一个手工部署的 monitor-hub 时，这个脚本会拒绝动它——它写的服务单元带
@@ -353,8 +373,8 @@ TXT
 
 while [ $# -gt 0 ]; do
 	case "$1" in
-	--port) PORT="${2-}"; shift 2 ;;
-	--site) SITE="${2-}"; shift 2 ;;
+	--port) PORT="${2-}"; PORT_SET=1; shift 2 ;;
+	--site) SITE="${2-}"; SITE_SET=1; shift 2 ;;
 	--uninstall) ACTION=uninstall; shift ;;
 	--purge) ACTION=uninstall; PURGE=1; shift ;;
 	--yes | -y) YES=1; shift ;;
@@ -369,7 +389,7 @@ case "$SITE" in "" | http://* | https://*) ;; *) die "--site 要以 http:// 或 
 command -v curl >/dev/null 2>&1 || die "需要 curl"
 command -v sha256sum >/dev/null 2>&1 || die "需要 sha256sum（装 coreutils）"
 command -v systemctl >/dev/null 2>&1 ||
-	die "这个安装器只装 systemd 服务。手动运行：$BIN --listen 0.0.0.0:$PORT --db $DATA/monitor.db"
+	die "这个安装器只装 systemd 服务。手动运行：$BIN --listen 127.0.0.1:$PORT --db $DATA/monitor.db"
 
 case "$ACTION" in
 uninstall) banner; uninstall_hub ;;
