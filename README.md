@@ -126,15 +126,64 @@ docker run -d --name monitor -p 28080:28080 \
 ## 反向代理
 
 **`install-hub.sh` 装出来的 hub 只监听 `127.0.0.1`，公网访问不到**——凭证不会在链路上明文传输，
-也没有端口需要防火墙。把域名指过来是反向代理的活，装完脚本会打印 nginx / caddy / CF 隧道三种配法。
+也没有端口需要防火墙。把域名指过来是反向代理的活。
 
 **配好之后不用改 hub 的任何参数，安装命令会自己变。** 面板用浏览器地址栏的地址拼命令，所以你改用
 `https://hub.example.com` 进后台，命令立刻变成 `--server https://hub.example.com` 并去掉
 `--insecure`；会话 cookie 的 `Secure` 跟着请求的 `X-Forwarded-Proto` 走。hub 也不用重启。
 
-反代的配置这几条要注意：
+### caddy
 
-- 转发 `/api/agent/ws` 与 `/api/ws` 的 `Upgrade` / `Connection` 头，关闭缓冲，读写超时远大于 60 秒
+证书、`X-Forwarded-Proto`、WebSocket 都自动处理，一行就够：
+
+```caddyfile
+hub.example.com {
+    reverse_proxy 127.0.0.1:28080
+}
+```
+
+### nginx
+
+```nginx
+map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name hub.example.com;
+    ssl_certificate     /etc/letsencrypt/live/hub.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/hub.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:28080;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        # WebSocket：/api/agent/ws 与 /api/ws 是长连接
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_buffering off;
+        proxy_read_timeout  1h;
+        proxy_send_timeout  1h;
+    }
+}
+```
+
+### Cloudflare 隧道
+
+不用开任何入站端口，纯 IPv4 的机器也能拿到双栈入口（`cloudflared` 的隧道是出站建立的）：
+
+```yaml
+ingress:
+  - hostname: hub.example.com
+    service: http://127.0.0.1:28080
+  - service: http_status:404
+```
+
+### 几条通用注意
+
+- 转发 `Upgrade` / `Connection` 头，关闭缓冲，读写超时远大于 60 秒，否则节点会周期性掉线
 - 放行 `POST` / `PUT` / `DELETE`
 - 透传 `X-Forwarded-Proto`，否则会话 cookie 拿不到 `Secure`
 - 透传 `X-Forwarded-For`，否则登录限流会按代理地址计数

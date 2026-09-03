@@ -256,15 +256,6 @@ UNIT
 		printf '     面板只监听本机，公网访问不到——这是故意的，凭证不会在链路上裸奔。\n'
 		printf '     用 nginx / caddy / cf tunnel 等配置完反向代理后，用域名访问面板，\n'
 		printf '     我相信这难不倒你。\n\n'
-		# shellcheck disable=SC2016  # $host and friends are nginx's, printed verbatim
-		printf '     %snginx%s   proxy_pass http://127.0.0.1:%s;  另外三行别漏：\n%s\n\n' \
-			"$B" "$N" "$PORT" '             proxy_set_header Host $host;
-             proxy_set_header X-Forwarded-Proto $scheme;
-             proxy_set_header Upgrade $http_upgrade;  Connection 同理（WebSocket）'
-		printf '     %scaddy%s   一行：hub.example.com { reverse_proxy 127.0.0.1:%s }\n' "$B" "$N" "$PORT"
-		printf '             证书、X-Forwarded-Proto、WebSocket 它都自动处理\n\n'
-		printf '     %sCF 隧道%s cloudflared tunnel route，服务填 http://127.0.0.1:%s\n' "$B" "$N" "$PORT"
-		printf '             不用开任何入站端口，纯 IPv4 的机器也能拿到双栈入口\n\n'
 		printf '     %s完整配置和注意事项见 README 的「反向代理」一节。%s\n' "$D" "$N"
 	fi
 }
