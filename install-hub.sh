@@ -117,7 +117,7 @@ install_hub() {
 	# silently resets the port and drops --site, and the reverse proxy in front
 	# is then pointing at nothing.
 	if [ -z "$PORT_SET" ] || [ -z "$SITE_SET" ]; then
-		old_exec="$(sed -n 's/^ExecStart=.*--listen //p' "$UNIT" 2>/dev/null)"
+		old_exec="$(sed -n 's/^ExecStart=.*--listen //p' "$UNIT" 2>/dev/null || true)"
 		[ -n "$PORT_SET" ] || case "$old_exec" in
 		*:[0-9]*) PORT="${old_exec%% *}"; PORT="${PORT##*:}" ;;
 		esac
