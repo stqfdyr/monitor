@@ -124,12 +124,15 @@ install_hub() {
 	first=""
 	[ -f "$DATA/monitor.db" ] || [ -f /var/lib/private/monitor/monitor.db ] || first=1
 
-	# The tag comes out of the redirect the download itself follows, so there
-	# is no API call to be rate-limited and no JSON to parse. It doubles as the
-	# check that this architecture was published at all.
-	tag="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$base/$asset" 2>/dev/null |
+	# The tag comes out of GitHub's own redirect for "latest", so there is no
+	# API call to be rate-limited and no JSON to parse. Only the FIRST hop
+	# carries it -- the chain now ends on release-assets.githubusercontent.com,
+	# whose URL has no tag anywhere in it -- so this must not follow redirects.
+	# A missing asset still redirects, so it is the download below that catches
+	# an architecture that was never published.
+	tag="$(curl -fsSI -o /dev/null -w '%{redirect_url}' "$base/$asset" 2>/dev/null |
 		sed -n 's#.*/download/\([^/]*\)/.*#\1#p')" || true
-	[ -n "$tag" ] || die "查不到最新发布版；GitHub 不可达，或这个架构没有发布产物"
+	[ -n "$tag" ] || die "查不到最新发布版；GitHub 不可达，或还没有任何发布"
 	ok "版本" "$tag"
 
 	tmp="$(mktemp -d)"
