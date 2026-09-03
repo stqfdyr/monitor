@@ -6,7 +6,7 @@
 
 ## 特性
 
-- 单二进制，零配置启动，全部设置存在 SQLite 里
+- 单二进制，零配置启动，`http://<IP>:28080` 直接用，全部设置存在 SQLite 里
 - 内存与磁盘口径对齐 `free(1)` / `df(1)`
 - 总流量跨 VPS 重启、hub 重启、agent 掉线持续累加
 - 在线节点过期后，到期日按付款周期自动顺延
@@ -40,23 +40,52 @@ cargo build --release
 后台与默认主题在编译期嵌入二进制。默认主题不需要 clone：`cargo build` 按 `web-theme.pin`
 里的 `<tag> <sha256>` 下载主题仓库发布的 `theme.tar.gz`，校验后解到 `target/theme/`。
 
-## 运行
+## 安装
 
 ```bash
-monitor-hub --site https://monitor.example.com
+curl -fsSL https://raw.githubusercontent.com/stqfdyr/monitor/main/install-hub.sh -o install-hub.sh
+sudo sh install-hub.sh
+```
+
+有终端时给一个菜单（安装 / 升级、卸载、状态、日志）；`curl ... | sh` 没有终端可读答案，直接按默认装。
+装完打印面板地址和一次性应急密码，浏览器打开 `http://<服务器 IP>:28080/admin` 即可登录。
+
+脚本做的事：核对 release 的 `sha256sums.txt` 之后才把二进制放进 `/usr/local/bin`，写一个
+`DynamicUser=yes` 的 systemd 单元，数据固定在 `/var/lib/monitor`。**重跑一次就是升级**——校验通过才
+替换，起不来自动回滚到上一版。
+
+| 参数 | 说明 |
+|---|---|
+| `--port <n>` | 监听端口，默认 `28080` |
+| `--site <url>` | 反向代理后的对外地址，直接用 ip:port 时不填 |
+| `--uninstall` | 卸载，数据保留在 `/var/lib/monitor` |
+| `--purge` | 卸载并删除数据库 |
+
+## 运行
+
+不用脚本的话，二进制自己就能跑：
+
+```bash
+monitor-hub                    # 0.0.0.0:28080，数据库 ./monitor.db
 ```
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--listen` | `0.0.0.0:8080` | 监听地址 |
+| `--listen` | `0.0.0.0:28080` | 监听地址 |
 | `--db` | `monitor.db` | SQLite 路径 |
-| `--site` | 由 `--listen` 推导 | 对外地址，决定安装命令与 cookie 的 `Secure` 标志 |
+| `--site` | 空 | 对外地址，只有反向代理场景需要，见下 |
 | `--themes` | 数据库同级 `themes/` | 外部主题目录 |
+
+不带 `--site` 时，hub 不假设自己的地址：面板用浏览器地址栏里的地址拼安装命令，cookie 的 `Secure`
+标志看请求的 `X-Forwarded-Proto`。**裸 ip:port 部署是明文 HTTP**，会话与节点凭证在链路上都是明文，
+生产环境请放到 TLS 反向代理后面。
+
+## 接入节点
 
 首次启动打印一次性应急密码，用它登录 `/admin`：
 
-1. **设置** 配置 GitHub OAuth（回调 `<site>/api/auth/github/callback`）与允许登录的用户名，修改
-   应急密码
+1. **设置** 配置 GitHub OAuth（回调 `<面板地址>/api/auth/github/callback`）与允许登录的用户名，
+   修改应急密码
 2. **节点** 添加节点，点下载按钮生成安装命令，在目标主机执行
 3. 拖动手柄排序；展示与流量设置、续费设置分别编辑
 
@@ -65,17 +94,37 @@ curl -fsSL https://monitor.example.com/install.sh | sh -s -- \
   --server https://monitor.example.com --token <token>
 ```
 
-agent 二进制由 hub 转发，节点无需直连 GitHub。hub 自身无法访问 GitHub 时，可给安装命令加
-`--github-proxy https://ghfast.top`，由节点直连镜像下载。
+agent 二进制由 hub 转发，节点无需直连 GitHub。hub 自身访问不了 GitHub 时，在**设置 → 站点**里填一个
+GitHub 代理（如 `https://ghfast.top`），hub 拉 release 时会用它，节点侧不用改任何东西。
+
+hub 只有明文 HTTP 时，命令里会多一个 `--insecure`——agent 和 `install.sh` 默认拒绝明文连远程 hub，
+因为凭证会明文传输，装 agent 下载的二进制也走同一条未验证的通道。面板会把这件事标出来。上了 TLS
+之后（`--site https://...`）命令自动不再带它。
+
+## Docker
+
+```bash
+docker run -d --name monitor -p 28080:28080 \
+  -v monitor-data:/data -e TZ=Asia/Shanghai \
+  ghcr.io/stqfdyr/monitor
+```
+
+`FROM scratch` 里放同一个 musl 二进制加一份 zoneinfo，约 10 MB，以 uid 65534 运行，数据库和主题
+目录都在 `/data`。首次启动的应急密码在 `docker logs monitor` 里。
+
+**`TZ` 必须设成 hub 所在的时区。** 日流量和账单周期按本地日期切换，不设按 UTC 算——到点不归零，
+也不会有任何报错。
+
+挂主机目录代替 named volume 时，先 `chown 65534:65534`。
 
 ## 反向代理
 
-置于反向代理之后时，用 `--listen 127.0.0.1:8080` 限制监听，并注意：
+置于反向代理之后时，用 `--listen 127.0.0.1:28080` 限制监听，并注意：
 
 - 转发 `/api/agent/ws` 与 `/api/ws` 的 `Upgrade` / `Connection` 头，关闭缓冲，读写超时远大于 60 秒
 - 放行 `POST` / `PUT` / `DELETE`
 - 透传 `X-Forwarded-For`，否则登录限流会按代理地址计数
-- `--site` 填写对外地址，与 `--listen` 无关
+- **填 `--site`**：反代后面板常常是通过回环端口访问的，不填会让安装命令指向 `127.0.0.1`
 
 ## 主题
 

@@ -11,7 +11,7 @@ mod db;
 mod frontend;
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -43,7 +43,11 @@ pub struct App {
     pub snapshot: Mutex<[(i64, axum::extract::ws::Utf8Bytes); 2]>,
     pub throttle: auth::Throttle,
     pub http: reqwest::Client,
-    /// Public base URL, used for install commands and to decide cookie flags.
+    /// Public base URL when `--site` was given, empty otherwise -- the
+    /// default, where the hub is reached at whatever ip:port the browser used
+    /// and the panel falls back to its own origin. Behind a reverse proxy it
+    /// has to be set: a loopback listener would put 127.0.0.1 in the install
+    /// commands the panel builds.
     pub site: String,
     /// Parent directory containing one folder per installed public theme.
     pub themes: PathBuf,
@@ -67,18 +71,37 @@ impl App {
 
     #[cfg(test)]
     pub fn for_test(db: Db) -> Self {
-        Self::new(db, "http://localhost:8080".into(), PathBuf::from("themes"))
+        Self::new(db, String::new(), PathBuf::from("themes"))
     }
 
     pub fn public_page(&self) -> bool {
         self.db.get("public_page").as_deref() != Some("off")
     }
 
-    /// Secure cookies everywhere except a plain-HTTP local hub, where the
-    /// browser would otherwise refuse to store the session at all.
-    pub fn secure_cookies(&self) -> bool {
-        !self.site.starts_with("http://")
+    /// Whether a session cookie may be marked Secure. With `--site` that is
+    /// its scheme; without one the hub does not know the address it was
+    /// reached on, so the request has to say: a TLS-terminating proxy sets
+    /// `X-Forwarded-Proto`, and a hub answering plain HTTP directly has no
+    /// such header. Marking it Secure over plain HTTP would make the browser
+    /// drop the session rather than keep it.
+    ///
+    /// The header is client-settable and nothing beyond this flag trusts it.
+    /// A forged `https` costs the sender its own session; a forged `http`
+    /// drops Secure from a cookie the sender already holds. Neither reaches
+    /// another browser's session.
+    pub fn secure_cookies(&self, headers: &HeaderMap) -> bool {
+        if !self.site.is_empty() {
+            return !self.site.starts_with("http://");
+        }
+        forwarded_proto(headers) == Some("https")
     }
+}
+
+/// The scheme the browser used, as reported by a reverse proxy. Chained
+/// proxies append to the header, so the browser's own hop is the first value.
+fn forwarded_proto(headers: &HeaderMap) -> Option<&str> {
+    let chain = headers.get("x-forwarded-proto")?.to_str().ok()?;
+    Some(chain.split(',').next()?.trim())
 }
 
 /// Where the agent binaries are published. Not a setting: anyone pointing this
@@ -87,8 +110,25 @@ const AGENT_REPO: &str = "stqfdyr/agent";
 
 /// The one-liner pasted onto a new VPS.
 async fn install_script() -> Response {
-    let script = include_str!("../install.sh").replace("@@REPO@@", AGENT_REPO);
-    ([(header::CONTENT_TYPE, "text/x-shellscript")], script).into_response()
+    ([(header::CONTENT_TYPE, "text/x-shellscript")], include_str!("../install.sh")).into_response()
+}
+
+/// Where the hub fetches an agent release, with the panel's GitHub proxy in
+/// front of it when there is one. The proxy belongs to the hub rather than to
+/// each install command: a hub that cannot reach github.com cannot relay to
+/// *any* node, so the answer is the same for all of them.
+///
+/// This URL is fetched on an anonymous request, so the operator setting it is
+/// pointing that path somewhere new. It stays inside the bounds `agent_binary`
+/// already holds: four at a time, a 120-second timeout, and a streamed body.
+fn release_url(app: &App, arch: &str) -> String {
+    let direct = format!(
+        "https://github.com/{AGENT_REPO}/releases/latest/download/monitor-agent-{arch}-unknown-linux-musl"
+    );
+    match app.db.get("github_proxy").filter(|v| !v.trim().is_empty()) {
+        Some(proxy) => format!("{}/{direct}", proxy.trim().trim_end_matches('/')),
+        None => direct,
+    }
 }
 
 /// How many release downloads the hub relays at once.
@@ -133,9 +173,7 @@ async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Re
     let Ok(permit) = RELAY_GATE.try_acquire() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "too many downloads in flight, try again").into_response();
     };
-    let url = format!(
-        "https://github.com/{AGENT_REPO}/releases/latest/download/monitor-agent-{arch}-unknown-linux-musl"
-    );
+    let url = release_url(&app, &arch);
     // The default client timeout is tuned for API calls, not a 1.8 MB download.
     let fetched = app.http.get(&url).timeout(std::time::Duration::from_secs(120)).send().await;
     match fetched {
@@ -164,7 +202,7 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args> {
-    let mut listen = "0.0.0.0:8080".to_owned();
+    let mut listen = "0.0.0.0:28080".to_owned();
     let mut database = "monitor.db".to_owned();
     let mut site = String::new();
     let mut themes = None;
@@ -179,11 +217,12 @@ fn parse_args() -> Result<Args> {
             "-h" | "--help" => {
                 println!(
                     "monitor-hub {}\n\n\
-                     Usage: monitor-hub [--listen 0.0.0.0:8080] [--db monitor.db] [--themes themes] [--site https://hub.example.com]\n\n\
+                     Usage: monitor-hub [--listen 0.0.0.0:28080] [--db monitor.db] [--themes themes] [--site https://hub.example.com]\n\n\
                      --themes defaults to a themes/ directory beside the database.\n\
-                     --site is the public URL agents and browsers reach this hub on. It is\n\
-                     baked into install commands and decides whether session cookies are\n\
-                     marked Secure, so set it once you are behind TLS.",
+                     --site is only needed behind a reverse proxy, where the address the\n\
+                     panel is reached on is not the one agents should use. Left out, the\n\
+                     hub answers on whatever ip:port it is asked, and the panel builds\n\
+                     install commands from the address in the browser's bar.",
                     env!("CARGO_PKG_VERSION")
                 );
                 std::process::exit(0);
@@ -192,9 +231,6 @@ fn parse_args() -> Result<Args> {
         }
     }
     let listen: SocketAddr = listen.parse()?;
-    if site.is_empty() {
-        site = format!("http://{listen}");
-    }
     let themes = themes.unwrap_or_else(|| {
         std::path::Path::new(&database).parent().unwrap_or_else(|| std::path::Path::new(".")).join("themes")
     });
@@ -213,9 +249,13 @@ async fn main() -> Result<()> {
     let args = parse_args()?;
     std::fs::create_dir_all(&args.themes)?;
     let app = Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes));
-    first_run(&app)?;
-    if exposed_over_plain_http(&args.site) {
-        warn!("--site is plain HTTP on a remote host; sessions and agent tokens will travel in the clear");
+    let url = advertised_url(&args.site, args.listen);
+    first_run(&app, &url)?;
+    if exposed_over_plain_http(&url) {
+        warn!(
+            "this hub answers plain HTTP at {url}; sessions and agent tokens travel in the clear. \
+             Put it behind TLS and pass --site https://..."
+        );
     }
 
     tokio::spawn(housekeeping(app.clone()));
@@ -263,7 +303,7 @@ async fn main() -> Result<()> {
         .with_state(app);
 
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
-    info!("listening on {} (public URL {})", args.listen, args.site);
+    info!("listening on {} ({url})", args.listen);
     axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown())
         .await?;
@@ -284,9 +324,36 @@ async fn shutdown() {
     info!("shutting down");
 }
 
-/// True when `--site` would send cookies and tokens in the clear. Plain HTTP to
-/// loopback is local development; to anything else it means the session cookie
-/// is readable by every hop in between.
+/// The address to print at startup: `--site` when it was given, otherwise the
+/// listen address with a wildcard resolved to a real one, because
+/// `http://0.0.0.0:28080` is not something a browser can open.
+fn advertised_url(site: &str, listen: SocketAddr) -> String {
+    if !site.is_empty() {
+        return site.to_owned();
+    }
+    let ip =
+        if listen.ip().is_unspecified() { outbound_ip().unwrap_or_else(|| listen.ip()) } else { listen.ip() };
+    format!("http://{}", SocketAddr::new(ip, listen.port()))
+}
+
+/// This box's own address on the route off it. Asking the kernel to route a
+/// datagram it never sends is the cheapest way to pick one interface out of
+/// several, and it answers with no network at all. Behind NAT it gives the
+/// private address: the hub cannot know its public one, which is why
+/// install-hub.sh prints the address it looked up instead.
+fn outbound_ip() -> Option<IpAddr> {
+    [("0.0.0.0:0", "1.1.1.1:80"), ("[::]:0", "[2606:4700:4700::1111]:80")].into_iter().find_map(
+        |(bind, route_to)| {
+            let socket = std::net::UdpSocket::bind(bind).ok()?;
+            socket.connect(route_to).ok()?;
+            socket.local_addr().ok().map(|addr| addr.ip())
+        },
+    )
+}
+
+/// True when the hub's own address sends cookies and tokens in the clear.
+/// Plain HTTP to loopback is local development; to anything else it means the
+/// session cookie is readable by every hop in between.
 ///
 /// A hub behind a TLS-terminating proxy or tunnel is not this case: there
 /// `--site` is the https:// address even though the listener speaks plain HTTP.
@@ -311,7 +378,7 @@ fn host_is_loopback(authority: &str) -> bool {
 
 /// Prints a one-time admin password when the database is first created.
 /// Without it a fresh hub has no way in until GitHub is configured.
-fn first_run(app: &App) -> Result<()> {
+fn first_run(app: &App, url: &str) -> Result<()> {
     if app.db.get("admin_password_hash").is_some() {
         return Ok(());
     }
@@ -319,10 +386,9 @@ fn first_run(app: &App) -> Result<()> {
     app.db.set("admin_password_hash", &auth::hash_password(&password)?)?;
     println!(
         "\n  Monitor hub is ready.\n\n  \
-         Sign in at {}/admin\n  \
+         Sign in at {url}/admin\n  \
          Emergency password: {password}\n\n  \
-         This is shown once. Change it, and set up GitHub sign-in, under Settings.\n",
-        app.site
+         This is shown once. Change it, and set up GitHub sign-in, under Settings.\n"
     );
     Ok(())
 }
@@ -399,6 +465,16 @@ mod tests {
         App::new(Db::open(":memory:").unwrap(), site.into(), PathBuf::from("themes"))
     }
 
+    /// A request as a reverse proxy would forward it, or as it arrives with
+    /// none in front.
+    fn proto(forwarded: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(scheme) = forwarded {
+            headers.insert("x-forwarded-proto", scheme.parse().unwrap());
+        }
+        headers
+    }
+
     #[test]
     fn an_expired_node_that_is_still_up_rolls_forward_whole_cycles() {
         let d = |s: &str| s.parse::<NaiveDate>().unwrap();
@@ -446,25 +522,59 @@ mod tests {
         assert_eq!(spa("/node/7").await.status(), StatusCode::OK);
     }
 
-    /// Both things `--site` decides: whether the session cookie may be marked
-    /// Secure, and whether the hub warns that it answers in the clear. Plain
-    /// HTTP on loopback is where the two answers part ways.
+    /// What decides the Secure flag: `--site` when it is set, and the proxy
+    /// in front when it is not -- the default ip:port deployment, where the
+    /// hub does not know its own address.
     #[test]
-    fn the_site_scheme_decides_the_cookie_flag_and_the_plain_http_warning() {
+    fn the_cookie_flag_follows_site_when_it_is_set_and_the_proxy_when_it_is_not() {
         // Local development: no Secure flag, or the browser refuses to keep
-        // the cookie at all, and no warning either.
-        for local in ["http://127.0.0.1:8080", "http://localhost:8080", "http://[::1]:8080"] {
-            assert!(!app(local).secure_cookies(), "{local}");
+        // the cookie at all.
+        for local in ["http://127.0.0.1:28080", "http://localhost:28080", "http://[::1]:28080"] {
+            assert!(!app(local).secure_cookies(&proto(None)), "{local}");
             assert!(!exposed_over_plain_http(local), "{local} is not exposed");
         }
-        // Behind TLS, including a tunnel that forwards to a loopback listener.
-        assert!(app("https://hub.example.com").secure_cookies());
+        // A given --site outranks anything the request claims, in both
+        // directions: it is the operator's word against a client-settable
+        // header.
+        assert!(app("https://hub.example.com").secure_cookies(&proto(Some("http"))));
+        assert!(!app("http://hub.example.com").secure_cookies(&proto(Some("https"))));
         assert!(!exposed_over_plain_http("https://m.example.com"));
+
+        // No --site: the proxy's header is the only word on the scheme.
+        let bare = app("");
+        assert!(!bare.secure_cookies(&proto(None)), "plain HTTP, answered directly");
+        assert!(bare.secure_cookies(&proto(Some("https"))));
+        // Chained proxies append, so the browser's own hop is the first value.
+        assert!(bare.secure_cookies(&proto(Some("https, http"))));
+        assert!(!bare.secure_cookies(&proto(Some("http, https"))));
+    }
+
+    /// A hub in the clear has to say so, and a wildcard listener is not an
+    /// address anyone can open -- both are about the URL the hub advertises,
+    /// which is `--site` only when there is one.
+    #[test]
+    fn the_advertised_url_resolves_a_wildcard_listener_and_defers_to_site() {
+        let listen = |s: &str| s.parse::<SocketAddr>().unwrap();
+        assert_eq!(
+            advertised_url("https://hub.example.com", listen("127.0.0.1:28080")),
+            "https://hub.example.com"
+        );
+        assert_eq!(advertised_url("", listen("127.0.0.1:9911")), "http://127.0.0.1:9911");
+        assert_eq!(advertised_url("", listen("[::1]:9911")), "http://[::1]:9911");
         // Genuinely in the clear: warn, and still no Secure, which is why the
         // warning is worth printing.
-        for remote in ["http://203.0.113.10:8080", "http://hub.example.com"] {
-            assert!(!app(remote).secure_cookies(), "{remote}");
+        for remote in ["http://203.0.113.10:28080", "http://hub.example.com"] {
+            assert!(!app(remote).secure_cookies(&proto(None)), "{remote}");
             assert!(exposed_over_plain_http(remote), "{remote} is exposed");
+        }
+
+        let resolved = advertised_url("", listen("0.0.0.0:28080"));
+        assert!(resolved.starts_with("http://") && resolved.ends_with(":28080"), "{resolved}");
+        // A box with no route off it keeps the wildcard; there is nothing else
+        // to print. Anywhere else it must not be what gets printed.
+        if outbound_ip().is_some() {
+            assert!(!resolved.contains("0.0.0.0"), "{resolved}");
+            assert!(exposed_over_plain_http(&resolved), "{resolved} is exposed");
         }
     }
 
@@ -507,13 +617,32 @@ mod tests {
         drop(queued);
     }
 
+    /// The proxy is a hub setting rather than an install-command argument, so
+    /// this is the one place that builds the URL. A trailing slash on the
+    /// setting must not turn into a double slash the proxy will not match.
+    #[test]
+    fn a_github_proxy_prefixes_the_release_url_and_an_empty_one_does_not() {
+        let app = app("");
+        let direct = release_url(&app, "x86_64");
+        assert!(direct.starts_with("https://github.com/stqfdyr/agent/releases/"), "{direct}");
+
+        for set in ["https://ghfast.top", "https://ghfast.top/", "  https://ghfast.top/  "] {
+            app.db.set("github_proxy", set).unwrap();
+            assert_eq!(release_url(&app, "x86_64"), format!("https://ghfast.top/{direct}"), "{set:?}");
+        }
+        // Cleared in the panel, which stores an empty string rather than
+        // dropping the row.
+        app.db.set("github_proxy", "").unwrap();
+        assert_eq!(release_url(&app, "x86_64"), direct);
+    }
+
     #[test]
     fn first_run_sets_a_password_once_and_leaves_it_alone_after() {
         let app = app("http://x");
-        first_run(&app).unwrap();
+        first_run(&app, "http://x").unwrap();
         let hash = app.db.get("admin_password_hash").unwrap();
         assert!(hash.starts_with("$argon2"));
-        first_run(&app).unwrap();
+        first_run(&app, "http://x").unwrap();
         assert_eq!(app.db.get("admin_password_hash").unwrap(), hash, "must not rotate on restart");
     }
 }

@@ -136,10 +136,12 @@ fn set_cookie(name: &str, value: &str, max_age: i64, secure: bool) -> String {
     cookie
 }
 
-pub fn issue_session(app: &App) -> Result<String> {
+/// The request's headers decide the Secure flag when the hub has no `--site`;
+/// see `App::secure_cookies`.
+pub fn issue_session(app: &App, headers: &HeaderMap) -> Result<String> {
     let token = random_token();
     app.db.create_session(&sha256(&token), Utc::now().timestamp() + SESSION_DAYS * 86_400)?;
-    Ok(set_cookie(COOKIE, &token, SESSION_DAYS * 86_400, app.secure_cookies()))
+    Ok(set_cookie(COOKIE, &token, SESSION_DAYS * 86_400, app.secure_cookies(headers)))
 }
 
 #[derive(Deserialize)]
@@ -169,7 +171,7 @@ pub async fn login(
         return (StatusCode::UNAUTHORIZED, "invalid password").into_response();
     }
     app.throttle.clear(ip);
-    match issue_session(&app) {
+    match issue_session(&app, &headers) {
         Ok(cookie) => with_cookies(Json(serde_json::json!({"ok": true})), [cookie]),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -179,12 +181,15 @@ pub async fn logout(State(app): State<crate::Shared>, headers: HeaderMap) -> Res
     if let Some(token) = cookie_value(&headers, COOKIE) {
         let _ = app.db.drop_session(&sha256(&token));
     }
-    with_cookies(Json(serde_json::json!({"ok": true})), [set_cookie(COOKIE, "", 0, app.secure_cookies())])
+    with_cookies(
+        Json(serde_json::json!({"ok": true})),
+        [set_cookie(COOKIE, "", 0, app.secure_cookies(&headers))],
+    )
 }
 
 /// Step one of the OAuth dance: hand the browser a state nonce and send it to
 /// GitHub. The nonce comes back in step two and must match.
-pub async fn github_start(State(app): State<crate::Shared>) -> Response {
+pub async fn github_start(State(app): State<crate::Shared>, headers: HeaderMap) -> Response {
     let Some(client_id) = app.db.get("github_client_id").filter(|v| !v.is_empty()) else {
         return (StatusCode::PRECONDITION_FAILED, "GitHub sign-in is not configured").into_response();
     };
@@ -192,7 +197,7 @@ pub async fn github_start(State(app): State<crate::Shared>) -> Response {
     let url = format!(
         "https://github.com/login/oauth/authorize?client_id={client_id}&scope=read:user&state={state}"
     );
-    with_cookies(Redirect::to(&url), [set_cookie(STATE_COOKIE, &state, 600, app.secure_cookies())])
+    with_cookies(Redirect::to(&url), [set_cookie(STATE_COOKIE, &state, 600, app.secure_cookies(&headers))])
 }
 
 /// Every field is optional. With required fields axum rejects a malformed
@@ -218,38 +223,42 @@ pub async fn github_callback(
     // GitHub reports a refusal in the query string rather than in the body.
     if let Some(error) = &query.error {
         let reason = query.error_description.as_deref().unwrap_or(error);
-        return sign_in_failed(&app, &format!("GitHub returned {error}: {reason}"));
+        return sign_in_failed(&app, &headers, &format!("GitHub returned {error}: {reason}"));
     }
     // Reject a callback the browser did not initiate.
     let state = query.state.as_deref().unwrap_or_default();
     if state.is_empty() || cookie_value(&headers, STATE_COOKIE).as_deref() != Some(state) {
-        return sign_in_failed(&app, "state mismatch or missing; start again from the sign-in page");
+        return sign_in_failed(
+            &app,
+            &headers,
+            "state mismatch or missing; start again from the sign-in page",
+        );
     }
     let Some(code) = query.code.as_deref().filter(|c| !c.is_empty()) else {
-        return sign_in_failed(&app, "GitHub sent no authorization code");
+        return sign_in_failed(&app, &headers, "GitHub sent no authorization code");
     };
     if let Err(e) = github_login(&app, code).await {
-        return sign_in_failed(&app, &e.to_string());
+        return sign_in_failed(&app, &headers, &e.to_string());
     }
-    let session = match issue_session(&app) {
+    let session = match issue_session(&app, &headers) {
         Ok(cookie) => cookie,
-        Err(e) => return sign_in_failed(&app, &e.to_string()),
+        Err(e) => return sign_in_failed(&app, &headers, &e.to_string()),
     };
-    with_cookies(Redirect::to("/admin"), [clear_state(&app), session])
+    with_cookies(Redirect::to("/admin"), [clear_state(&app, &headers), session])
 }
 
 /// Sends the browser back to the sign-in page with the reason, rather than
 /// leaving a bare 401 at a callback URL there is no way out of.
-fn sign_in_failed(app: &App, reason: &str) -> Response {
+fn sign_in_failed(app: &App, headers: &HeaderMap, reason: &str) -> Response {
     // A rejected sign-in must leave a server-side trace: the browser only sees
     // the redirect.
     warn!("GitHub sign-in rejected: {reason}");
     let target = format!("/admin?login_error={}", urlencode(reason));
-    with_cookies(Redirect::to(&target), [clear_state(app), String::new()])
+    with_cookies(Redirect::to(&target), [clear_state(app, headers), String::new()])
 }
 
-fn clear_state(app: &App) -> String {
-    set_cookie(STATE_COOKIE, "", 0, app.secure_cookies())
+fn clear_state(app: &App, headers: &HeaderMap) -> String {
+    set_cookie(STATE_COOKIE, "", 0, app.secure_cookies(headers))
 }
 
 /// Attaches several `Set-Cookie` headers to one response. An array of header

@@ -32,7 +32,7 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, ...) -> Response
 ### session
 
 - 256 位随机 token，**数据库里只存 sha256**
-- cookie：`HttpOnly`、`SameSite=Lax`、`Path=/`，`--site` 不是 `http://` 时加 `Secure`
+- cookie：`HttpOnly`、`SameSite=Lax`、`Path=/`；`--site` 不是 `http://` 时加 `Secure`，没有 `--site` 时看请求的 `X-Forwarded-Proto`
 - 14 天过期，每小时清一次过期记录
 - 改密码时 `drop_all_sessions()`，所有登录立即失效
 
@@ -143,6 +143,20 @@ IPv4/IPv6。去掉它不会报错，只会让上报的地址一直是空字符�
 **curl 对没有 scheme 的 URL 默认走 `http://`**。于是同一条安装命令里 token 走 TLS，那个二进制走
 明文——规则里更糟的那半反而没护住。
 
+### `--insecure` 是这道闸唯一的开关
+
+裸 ip:port 部署的 hub 只有明文 HTTP，所以两边都认一个 `--insecure`。它不是「忽略警告」，而是三件
+事一起改，缺一件都会留下坑：
+
+1. 放行明文到远程 hub
+2. **裸主机名不再升级成 TLS**——否则这个 flag 会去 dial 一个永远握不上手的 `wss://`
+3. `install.sh` 往 stderr 打风险说明，并把 `--insecure` 写进 agent 的 `ExecStart`
+
+显式的 `https://` 地址加了 `--insecure` 也仍然走 TLS：这个 flag 允许明文，不强制明文。
+
+面板那边由 `needsInsecure()` 判断（`http://` 且非回环），自动把它拼进安装命令并红字标出。**判断口径
+三处必须一致**：`ws_url()`、`install.sh` 的 `case`、`needsInsecure()`，回环都是豁免的那一类。
+
 ## 公开状态页
 
 两层开关：全局 `public_page` 设置，以及每个节点的 `node.public`。
@@ -171,8 +185,14 @@ if full {
 ### `/agent/{arch}`
 
 公开路由，把 GitHub Release 的 agent 二进制转发给装不了的节点。`arch` 只认 `x86_64` 和 `aarch64`
-两个字面量，其余一律 404——URL 里的仓库是编译进来的常量，没有任何一段来自请求或数据库，不存在拿
-它当跳板打内网的可能。转发的是公开的 release 文件，不需要鉴权，但**并发数有闸门**，见下面「其它」。
+两个字面量，其余一律 404。转发的是公开的 release 文件，不需要鉴权，但**并发数有闸门**，见下面
+「其它」。
+
+**下载地址里有一段来自数据库**：面板设置的 `github_proxy` 会拼在最前面（`main::release_url`）。
+仓库名仍是编译进来的常量，`arch` 仍是白名单，唯一能变的就是这个前缀，而且只有管理员写得了它。
+说清楚代价：**管理员可以把这条匿名路径指向任意地址，响应会原样转发给匿名调用方。** 这是设置它的
+人自己选的出站目标，和 `github_client_secret` 一样落在管理员的信任范围内；保存时只校验 scheme 是
+`http://` 或 `https://`。单次请求的上界没变：4 并发、120 秒超时、流式转发。
 
 ### 加新字段时的规矩
 

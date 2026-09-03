@@ -205,7 +205,7 @@ WHERE node_id=?1 AND ts>=?2 GROUP BY task_id, ts/?3 ORDER BY ts
 
 ```bash
 # 1. 起两个服务（komari 用官方 release 二进制）
-./monitor-hub --listen 127.0.0.1:9911 --db ./hub.db --themes ./themes --site http://127.0.0.1:9911
+./monitor-hub --listen 127.0.0.1:9911 --db ./hub.db --themes ./themes
 ./komari server -l 127.0.0.1:25999 -d ./data/komari.db
 
 # 2. 两边各建 200 个节点，拿到 token

@@ -107,6 +107,7 @@ agent 收到后会**保留没变化的任务**（同 id + 同 target + 同 inter
 | `github_client_id` / `github_client_secret` | 空 | OAuth App |
 | `github_allowed_users` | 空 | 逗号分隔的用户名白名单。**空 = 任何人都登不进来**（不是任何人都能进） |
 | `theme` | `default` | 公开页主题短名；空、无效或已删除时使用内置默认主题 |
+| `github_proxy` | 空 | 拼在 agent release 下载地址前的代理，仅 hub 自己拉不到 GitHub 时需要 |
 
 ## 请求路径
 
@@ -115,12 +116,12 @@ agent 收到后会**保留没变化的任务**（同 id + 同 target + 同 inter
 **agent**：`GET /api/agent/ws`（Bearer token）、`GET /install.sh`（公开，不含密钥）、
 `GET /agent/{arch}`（公开，把 release 二进制从 GitHub 转发给节点）
 
-安装命令默认传 `--interval 1`，也可在 1..3600 内调整；另有 `--github-proxy URL`。
+安装命令默认传 `--interval 1`，也可在 1..3600 内调整；hub 只有明文 HTTP 时还会带上 `--insecure`。
 
-二进制默认走 `<hub>/agent/<arch>`，由 hub 从 GitHub Release 取回再转发——能连上 hub 就能装，
+二进制总是走 `<hub>/agent/<arch>`，由 hub 从 GitHub Release 取回再转发——能连上 hub 就能装，
 IPv6-only 或者出不去的机器不用再找加速站。并发转发数由 `main::RELAY_GATE` 限到 4。
-`--github-proxy` 是 hub 自己拉不到 release 时的退路，它让节点直连 GitHub 代理，只拼到下载地址前，
-不代理 agent 与 hub 的 WebSocket。
+hub 自己拉不到 release 时，在面板设置里填 `github_proxy`，它只拼在下载地址前面
+（`main::release_url`），不影响 agent 与 hub 的 WebSocket，节点侧什么都不用改。
 
 `install.sh` 认 systemd 和 OpenRC：前者写 unit（`DynamicUser` + `ProtectSystem` 等加固），
 后者写 `/etc/init.d/monitor-agent`，用 `supervise-daemon` 拿到等价的自动重启。两边 token 都只在

@@ -3,41 +3,54 @@
 #   curl -fsSL https://hub.example.com/install.sh | sh -s -- --server URL --token TOKEN [options]
 set -eu
 
-REPO="@@REPO@@"
 SERVER=""
 TOKEN=""
 INTERVAL=1
-GITHUB_PROXY=""
+INSECURE=""
 
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--server) SERVER="$2"; shift 2 ;;
 	--token) TOKEN="$2"; shift 2 ;;
 	--interval) INTERVAL="$2"; shift 2 ;;
-	--github-proxy) GITHUB_PROXY="$2"; shift 2 ;;
+	--insecure) INSECURE=1; shift ;;
 	*) echo "unknown option: $1" >&2; exit 2 ;;
 	esac
 done
 
 [ -n "$SERVER" ] && [ -n "$TOKEN" ] || {
-	echo "usage: install.sh --server URL --token TOKEN [--interval SECONDS] [--github-proxy URL]" >&2
+	echo "usage: install.sh --server URL --token TOKEN [--interval SECONDS] [--insecure]" >&2
 	exit 2
 }
 case "$INTERVAL" in "" | *[!0-9]*) echo "interval must be an integer from 1 to 3600" >&2; exit 2 ;; esac
 [ "$INTERVAL" -ge 1 ] && [ "$INTERVAL" -le 3600 ] || { echo "interval must be from 1 to 3600" >&2; exit 2; }
-case "$GITHUB_PROXY" in "" | http://* | https://*) ;; *) echo "GitHub proxy must start with http:// or https://" >&2; exit 2 ;; esac
 # A bare host means TLS, which is the same upgrade the agent's ws_url() does
-# with one. Without this the two halves disagree: the agent would dial wss://,
-# while curl below defaults a scheme-less URL to http:// and fetches the binary
-# that is about to run as root over plaintext -- the worse half of the pair.
-case "$SERVER" in *://*) ;; *) SERVER="https://$SERVER" ;; esac
+# with one -- and the same reversal under --insecure, where the hub has no TLS
+# to upgrade to. Without this the two halves disagree: the agent would dial
+# wss://, while curl below defaults a scheme-less URL to http:// and fetches
+# the binary that is about to run as root over plaintext -- the worse half.
+if [ -n "$INSECURE" ]; then SCHEME=http; else SCHEME=https; fi
+case "$SERVER" in *://*) ;; *) SERVER="$SCHEME://$SERVER" ;; esac
 # The agent already refuses plaintext ws:// to a remote hub, because the token
 # would travel in the clear. The same address fetches the binary that is about
 # to run as root here, so it gets the same rule: over plain HTTP anyone on the
 # path can answer with a binary of their own.
+#
+# --insecure is the operator overriding both halves for a hub reached at
+# ip:port with no TLS in front. It says so out loud rather than silently: this
+# is the one step of the install that cannot be undone by fixing it later,
+# because a MITM'd binary is already running as root by then.
 case "$SERVER" in
 http://127.* | http://localhost | http://localhost:* | "http://[::1]" | "http://[::1]:"*) ;;
-http://*) echo "refusing plaintext http:// to a remote hub; use https://" >&2; exit 2 ;;
+http://*)
+	[ -n "$INSECURE" ] || {
+		echo "refusing plaintext http:// to a remote hub; use https://, or --insecure if it has no TLS" >&2
+		exit 2
+	}
+	echo "warning: --insecure over plain HTTP to $SERVER" >&2
+	echo "         the token and every report travel in the clear, and the binary" >&2
+	echo "         installed below is fetched over the same unverified channel" >&2
+	;;
 esac
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
 if command -v systemctl >/dev/null; then
@@ -55,14 +68,11 @@ aarch64 | arm64) ARCH=aarch64 ;;
 *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
 esac
 
-# The hub relays the binary by default, so an IPv6-only or blocked node only
-# needs to reach the hub it already talks to. A proxy overrides that and goes
-# to GitHub directly, for when the hub itself cannot fetch releases.
-if [ -n "$GITHUB_PROXY" ]; then
-	URL="${GITHUB_PROXY%/}/https://github.com/$REPO/releases/latest/download/monitor-agent-$ARCH-unknown-linux-musl"
-else
-	URL="${SERVER%/}/agent/$ARCH"
-fi
+# The hub relays the binary, so a node only has to reach the hub it already
+# talks to -- an IPv6-only or blocked machine never resolves github.com at all.
+# A hub that cannot fetch releases itself points at a GitHub proxy in its own
+# settings, which is why no proxy is asked for here.
+URL="${SERVER%/}/agent/$ARCH"
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
 
@@ -96,7 +106,7 @@ if [ "$INIT" = openrc ]; then
 #!/sbin/openrc-run
 description="monitor agent"
 command="/usr/local/bin/monitor-agent"
-command_args="--interval $INTERVAL"
+command_args="--interval $INTERVAL${INSECURE:+ --insecure}"
 supervisor="supervise-daemon"
 respawn_delay=5
 output_log="/var/log/monitor-agent.log"
@@ -129,7 +139,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/monitor/agent.env
-ExecStart=/usr/local/bin/monitor-agent --interval $INTERVAL
+ExecStart=/usr/local/bin/monitor-agent --interval $INTERVAL${INSECURE:+ --insecure}
 Restart=always
 RestartSec=5
 DynamicUser=yes

@@ -355,16 +355,26 @@ function BillingForm({ node, onClose, onSaved }: {
   )
 }
 
-function shellArg(value: string) {
-  return `'${value.replaceAll("'", `'"'"'`)}'`
+// True when the hub has no TLS to offer, which is a hub reached at ip:port.
+// install.sh and the agent both refuse plaintext to a remote hub unless the
+// command says --insecure, so without this the command they are handed fails
+// on the node. Loopback is exempt in all three places.
+function needsInsecure(site: string) {
+  try {
+    const { protocol, hostname } = new URL(site)
+    if (protocol !== "http:") return false
+    return hostname !== "localhost" && hostname !== "[::1]" && !hostname.startsWith("127.")
+  } catch {
+    return false
+  }
 }
 
 // Built here rather than fetched: the node list already carries the token, so
 // looking at an install command is a read, not an act. Reissuing one to show
 // it knocks the running agent offline.
-function installCommand(site: string, token: string, seconds: number, proxy: string) {
+function installCommand(site: string, token: string, seconds: number) {
   const args = [`--server ${site}`, `--token ${token}`, `--interval ${seconds}`]
-  if (proxy) args.push(`--github-proxy ${shellArg(proxy.includes("://") ? proxy : `https://${proxy}`)}`)
+  if (needsInsecure(site)) args.push("--insecure")
   return `curl -fsSL ${site}/install.sh | sh -s -- ${args.join(" ")}`
 }
 
@@ -376,12 +386,11 @@ function InstallDialog({ node, site, onClose, onRotated }: {
 }) {
   const [token, setToken] = useState(node.token ?? "")
   const [interval, setInterval] = useState("1")
-  const [githubProxy, setGithubProxy] = useState("")
   const [rotating, setRotating] = useState(false)
   const [confirmRotate, setConfirmRotate] = useState(false)
 
   const seconds = Math.min(3600, Math.max(1, Math.round(Number(interval) || 1)))
-  const command = token ? installCommand(site, token, seconds, githubProxy.trim()) : ""
+  const command = token ? installCommand(site, token, seconds) : ""
 
   async function rotate() {
     setRotating(true)
@@ -405,14 +414,9 @@ function InstallDialog({ node, site, onClose, onRotated }: {
           <DialogTitle>{node.name}</DialogTitle>
         </DialogHeader>
         <div className="space-y-5">
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="上报间隔（秒）" hint="1–3600，默认 1 秒">
-              <Input type="number" min={1} max={3600} value={interval} onChange={(e) => setInterval(e.target.value)} />
-            </Field>
-            <Field label="GitHub 代理" hint="仅代理 GitHub Release">
-              <Input value={githubProxy} onChange={(e) => setGithubProxy(e.target.value)} placeholder="https://ghfast.top" />
-            </Field>
-          </div>
+          <Field label="上报间隔（秒）" hint="1–3600，默认 1 秒">
+            <Input type="number" min={1} max={3600} value={interval} onChange={(e) => setInterval(e.target.value)} />
+          </Field>
           <div className="space-y-2">
             <Label className="text-sm font-medium">安装命令</Label>
             <pre className="h-28 overflow-auto whitespace-pre-wrap break-all rounded-lg border bg-muted/40 p-3 text-xs leading-relaxed select-all">
@@ -420,6 +424,13 @@ function InstallDialog({ node, site, onClose, onRotated }: {
                   until one is reissued. */}
               {command || "旧版本创建的凭证不可读取，换发后显示"}
             </pre>
+            {needsInsecure(site) && (
+              <p className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                这个 hub 只有明文 HTTP，命令里的 <code>--insecure</code> 是必需的：凭证与上报数据全程明文，
+                安装时下载的二进制也走同一条未验证的通道。放到 TLS 反向代理后面，再用 <code>--site</code>{" "}
+                指向 https 地址，命令会自动去掉它。
+              </p>
+            )}
           </div>
           <div className="flex items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
             <span>
@@ -911,6 +922,13 @@ function SettingsTab({ site }: { site: string }) {
               placeholder="30"
             />
           </Field>
+          <Field label="GitHub 代理" hint="留空直连。仅在 hub 自己拉不到 GitHub Release 时填">
+            <Input
+              value={String(s.github_proxy ?? "")}
+              onChange={(e) => set("github_proxy", e.target.value)}
+              placeholder="https://ghfast.top"
+            />
+          </Field>
         </div>
         <label className="flex cursor-pointer items-center gap-2 text-sm">
           <Switch
@@ -926,6 +944,7 @@ function SettingsTab({ site }: { site: string }) {
               save({
                 site_name: String(s.site_name ?? ""),
                 retention_days: String(s.retention_days ?? "30"),
+                github_proxy: String(s.github_proxy ?? ""),
                 public_page: s.public_page === "off" ? "off" : "on",
               })
             }

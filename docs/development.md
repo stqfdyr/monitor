@@ -51,7 +51,7 @@ cargo fmt --all
 | `src/agent_ws.rs` | RPC 分发、每分钟落盘、探测结果归属、会话拆除竞态、header 鉴权 |
 | `src/api.rs` | 公开视图过滤、快照缓存与两个受众、读权限、密钥不回读 |
 | `src/frontend.rs` | 主题路径穿越与越界符号链接、主题短名的两道守卫 |
-| `src/main.rs` | `--site` 推出的 cookie 标志与明文告警、静态路由、账单滚动、首次运行 |
+| `src/main.rs` | cookie 标志（`--site` 或 `X-Forwarded-Proto`）与明文告警、对外地址推导、静态路由、账单滚动、首次运行 |
 
 写测试的原则：**一段非平凡逻辑留一个能跑的检查就够**，不要每个函数一个测试。优先测边界和不变量，
 不测 getter。
@@ -92,7 +92,7 @@ git checkout -- src/db.rs
 
 ```bash
 # hub
-cargo run -- --listen 127.0.0.1:9911 --db /tmp/dev.db --themes /tmp/themes --site http://127.0.0.1:9911
+cargo run -- --listen 127.0.0.1:9911 --db /tmp/dev.db --themes /tmp/themes
 # 记下打印出来的一次性密码
 
 # 后台热更新（API 代理到 9911）
@@ -173,8 +173,8 @@ CHROME=$(find / -path '*/chrome-linux64/chrome' -type f 2>/dev/null | head -1)
 推一个 `v*` tag 触发 `.github/workflows/release.yml`：构建内置后台、按 `web-theme.pin` 取回并校验
 默认主题，再构建 hub 的 musl 静态二进制。agent 和主题由各自仓库独立发布。
 
-`install.sh` 默认走 hub 的 `/agent/{arch}` 拿二进制；只有 `--github-proxy` 会绕过 hub 直连 GitHub，
-拼的是 `src/main.rs` 里的 `AGENT_REPO` 常量。
+`install.sh` 只走 hub 的 `/agent/{arch}` 拿二进制。hub 那一端拼的是 `src/main.rs` 的 `AGENT_REPO`
+常量，前面可以再加上面板设置的 `github_proxy`（`main::release_url`）。
 
 ## 几个容易踩的坑
 

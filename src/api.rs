@@ -296,9 +296,11 @@ pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
         "github": app.db.get("github_client_id").is_some_and(|v| !v.is_empty()),
         "site_name": app.db.get("site_name").unwrap_or_else(|| "Monitor".into()),
         "public_page": app.public_page(),
-        // The hub's own public URL, which is what belongs in an install command
-        // and in the OAuth callback — not whichever address this browser used
-        // to reach the panel, which may well be a loopback port behind a proxy.
+        // The hub's own public URL when it was given one, which is what
+        // belongs in an install command and in the OAuth callback — not
+        // whichever address this browser used, which behind a proxy may be a
+        // loopback port. Empty by default, and then the browser's address is
+        // the only one anyone knows: the panel falls back to its own origin.
         "site": app.site,
     }))
 }
@@ -460,8 +462,15 @@ pub async fn delete_ping_task(_: Admin, State(app): State<Shared>, Path(id): Pat
 
 /// Settings the panel may read. Secrets are deliberately absent: the client
 /// can set the GitHub secret but never read it back.
-const READABLE_SETTINGS: &[&str] =
-    &["site_name", "public_page", "github_client_id", "github_allowed_users", "retention_days", "theme"];
+const READABLE_SETTINGS: &[&str] = &[
+    "site_name",
+    "public_page",
+    "github_client_id",
+    "github_allowed_users",
+    "retention_days",
+    "theme",
+    "github_proxy",
+];
 
 pub async fn themes(_: Admin, State(app): State<Shared>) -> Response {
     match crate::frontend::themes(&app) {
@@ -482,7 +491,12 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
     Json(Value::Object(out))
 }
 
-pub async fn save_settings(_: Admin, State(app): State<Shared>, Json(body): Json<Value>) -> Response {
+pub async fn save_settings(
+    _: Admin,
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
     let Some(map) = body.as_object() else { return bad("expected an object") };
     // Set when the password changed, so the caller can be handed a fresh
     // session instead of being logged out by their own password change.
@@ -496,6 +510,14 @@ pub async fn save_settings(_: Admin, State(app): State<Shared>, Json(body): Json
             "retention_days" if !value.parse::<i64>().is_ok_and(|d| (1..=3_650).contains(&d)) => {
                 return bad("retention days must be a number from 1 to 3650")
             }
+            // The hub fetches this URL itself, so it has to be one: a scheme
+            // it cannot speak turns every agent download into a 502 that says
+            // nothing about the setting that caused it.
+            "github_proxy"
+                if !(value.is_empty() || value.starts_with("http://") || value.starts_with("https://")) =>
+            {
+                return bad("GitHub proxy must start with http:// or https://")
+            }
             k if READABLE_SETTINGS.contains(&k) || k == "github_client_secret" => value,
             // Changing the password logs every existing session out.
             "admin_password" => {
@@ -507,7 +529,7 @@ pub async fn save_settings(_: Admin, State(app): State<Shared>, Json(body): Json
                 match hash_password(value).and_then(|h| {
                     app.db.set("admin_password_hash", &h)?;
                     app.db.drop_all_sessions()?;
-                    issue_session(&app)
+                    issue_session(&app, &headers)
                 }) {
                     Ok(cookie) => {
                         reissued = cookie;
@@ -912,7 +934,7 @@ mod tests {
         app.db.create_session(&sha256(&stale), Utc::now().timestamp() + 3_600).unwrap();
 
         let body = Json(json!({"admin_password": "a-long-enough-password"}));
-        let response = save_settings(Admin, axum::extract::State(app.clone()), body).await;
+        let response = save_settings(Admin, axum::extract::State(app.clone()), HeaderMap::new(), body).await;
 
         assert!(!app.db.session_valid(&sha256(&stale)), "sessions must not outlive the old password");
 
@@ -935,7 +957,7 @@ mod tests {
         app.db.create_session(&sha256(&live), Utc::now().timestamp() + 3_600).unwrap();
 
         let body = Json(json!({"admin_password": "short"}));
-        let response = save_settings(Admin, axum::extract::State(app.clone()), body).await;
+        let response = save_settings(Admin, axum::extract::State(app.clone()), HeaderMap::new(), body).await;
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(app.db.get("admin_password_hash").is_none(), "the password must not have changed");
@@ -948,8 +970,14 @@ mod tests {
     #[tokio::test]
     async fn a_retention_window_that_would_never_apply_is_refused() {
         let app = std::sync::Arc::new(app());
-        let put =
-            |v: &str| save_settings(Admin, State(app.clone()), Json(json!({"retention_days": v.to_owned()})));
+        let put = |v: &str| {
+            save_settings(
+                Admin,
+                State(app.clone()),
+                HeaderMap::new(),
+                Json(json!({"retention_days": v.to_owned()})),
+            )
+        };
         for junk in ["", "abc", "0", "-1", "9999"] {
             assert_eq!(put(junk).await.status(), StatusCode::BAD_REQUEST, "{junk:?}");
         }

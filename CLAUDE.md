@@ -37,7 +37,7 @@ cargo test
 cargo fmt --all              # CI 卡这个，改完必跑
 cargo clippy --all-targets
 cd web-admin && npm run build
-cargo run -- --listen 127.0.0.1:9911 --db /tmp/dev.db --themes /tmp/themes --site http://127.0.0.1:9911
+cargo run -- --listen 127.0.0.1:9911 --db /tmp/dev.db --themes /tmp/themes
 ```
 
 **别用 `pkill -f` 停进程**——会匹配到跑命令的 shell 自己。用 `ss -lptn "sport = :9911"` 拿 PID 再 kill。

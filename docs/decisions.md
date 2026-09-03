@@ -60,7 +60,77 @@ agent 不写任何文件、不记忆任何跨重启的状态。它只上报「�
 
 首次启动生成一次性应急密码打印到 stdout——否则全新的 hub 在 GitHub 配好之前完全进不去。
 
-**`--site` 有两个作用**，改动时注意：安装命令里的地址，以及 session cookie 要不要带 `Secure`（`http://` 开头就不带，否则本地 HTTP 部署浏览器会拒绝存 cookie）。
+**`--site` 是可选的**，缺省不推导任何地址——见下一节。
+
+### 默认就是 ip + port，`--site` 只为反代而留 **[用户]**
+
+不带参数启动就监听 `0.0.0.0:28080`，浏览器直接开 `http://<IP>:28080` 即可，不需要域名、证书，也不
+需要填任何地址。仿 komari 的部署体验。
+
+改造前 `--site` 缺省会被推导成 `http://0.0.0.0:8080`——一个谁都打不开的地址，还会被写进安装命令。
+现在缺省是**空**，三处要地址的地方各有各的答案：
+
+| 要地址的地方 | 有 `--site` | 没有 `--site` |
+|---|---|---|
+| 安装命令、OAuth 回调 | 用它 | 面板回落 `location.origin`，即浏览器地址栏里的地址 |
+| cookie 的 `Secure` | 看它的 scheme | 看请求的 `X-Forwarded-Proto`，多级代理取第一跳 |
+| 启动打印的地址、明文告警 | 用它 | 监听地址，`0.0.0.0` 换成本机出网 IP |
+
+`X-Forwarded-Proto` 是客户端可伪造的头，**只有这个标志信它**：伪造 `https` 的代价是自己的浏览器存
+不下 session，伪造 `http` 是把 `Secure` 从自己已有的 cookie 上摘掉，两头都碰不到别人的会话。
+
+`main::outbound_ip()` 问内核「去 1.1.1.1 该走哪个本机地址」，不发包、断网也能答。NAT 后面拿到的是
+内网地址——hub 不可能知道自己的公网地址，所以一键脚本用查到的公网地址覆盖它。
+
+**反代场景 `--site` 仍然必填**：面板常常是通过回环端口访问的，不填会拼出指向 `127.0.0.1` 的安装命令。
+
+**否决**：默认端口留 8080（撞 nginx 和各种面板的概率太高，komari 用 25774 是同一个理由）；后端从
+`Host` 头推导对外地址（多一个服务端信任点，而浏览器本来就知道自己的 origin，不必让服务端告诉它）。
+
+### 明文 hub 用 `--insecure` 显式放行 **[用户]**
+
+agent 和 `install.sh` 都拒绝明文连远程 hub：token 会明文传输，而且装 agent 时下载的二进制走同一条
+未经验证的通道，那个二进制马上要以 root 跑起来。裸 ip:port 部署恰好就是明文，所以这道闸得留个开关。
+
+做成显式开关，而不是直接放开：
+
+- `install.sh --insecure` 跳过拒绝，往 stderr 打三行风险说明，并把 `--insecure` 写进 agent 的 `ExecStart`
+- agent 的 `--insecure` 除了放行，还让**裸主机名不再升级成 TLS**——否则这个 flag 会去 dial 一个永远
+  握不上手的 `wss://`
+- 面板检测到 hub 是明文远程（`needsInsecure()`）就自动把 `--insecure` 拼进命令，并在弹窗里红字说明
+
+komari 对此零检查：`-e http://1.2.3.4:25774` 直接就用，明文传 token 没有任何提示。
+
+**否决**：默认放开（安全降级必须可见）、自签证书或内置 ACME（项目明确不做）。
+
+### hub 一键脚本 `install-hub.sh` **[用户]**
+
+有终端时给菜单（安装 / 升级、卸载、状态、日志），`curl | sh` 没有终端可读答案就按默认装——komari
+那份脚本在管道里菜单会乱。
+
+和 komari 的 `install-komari.sh` 逐项对比：
+
+| | komari | 这里 |
+|---|---|---|
+| 下载校验 | 无 | 核对 release 的 `sha256sums.txt` 才落盘 |
+| 服务身份 | `User=root` | `DynamicUser=yes` + `StateDirectory=` |
+| 单元加固 | 无 | `ProtectSystem=strict` 那一套，与 agent 一致 |
+| curl 超时 | 无 | 全部带 `--max-time` |
+| 缺依赖 | `apt update` 全量升级 | 只报错，不动别人的系统 |
+| 已有部署 | 直接覆盖 | 单元带 `# managed-by:` 标记，认不出就拒绝动 |
+| 公网地址 | `hostname -I`，NAT 下是内网地址 | 先查公网地址，失败才回落 `hostname -I` |
+| TUI | 依赖 whiptail / dialog | 纯 ANSI，非 tty 自动去色 |
+| 版本查询 | 解析 GitHub API 的 JSON | 读下载重定向里的 tag，不受 API 限流 |
+
+`managed-by` 那条是实测踩出来的：开发机上正跑着一个手工部署的 hub（`--listen 127.0.0.1:25775`、
+`--site https://...`），脚本原本会把它的单元换成 `0.0.0.0:28080` 且无 TLS，`--purge` 还会删掉它的库。
+
+数据固定在 `/var/lib/monitor`，不提供 `--data`：`StateDirectory=` 已经把创建和归属都办了。
+`DynamicUser=` 下真实目录是 `/var/lib/private/monitor`，`/var/lib/monitor` 是 systemd 留的符号链接，
+所以 `--purge` 要删两个路径。
+
+**否决**：菜单里问 `--site`（大多数人不需要，问了反而像必填）、`--data` 自定义数据目录、发布通道选择
+（只有 tag release，没有 snapshot）、装指定版本（要装旧版的人会自己 curl）。
 
 ### 后台与默认主题嵌进二进制 **[默认]**
 
@@ -535,8 +605,16 @@ install.sh 分支、多一路 agent 参数，只为一个没人填的框。hub�
 IPv6-only 的 Alpine 机器：github.com 没有 AAAA 记录，试过的三个加速站里只有一个能用（还要 10 秒），
 而它访问 hub 只要 0.6 秒。节点本来就得连上 hub 才有意义，就让 hub 顺手把二进制递过去。
 
-`--github-proxy` 保留，作为 hub 自己拉不到 release 时的退路。并发转发数由 `main::RELAY_GATE`
-限到 4——这条路匿名可达，一次请求转出 1.8 MB。
+并发转发数由 `main::RELAY_GATE` 限到 4——这条路匿名可达，一次请求转出 1.8 MB。
+
+**GitHub 代理是 hub 的设置，不是安装命令的参数** **[用户]**：退路本身要留（hub 拉不到 release 时，
+`/agent/<arch>` 整条路都是 502，所有节点都装不上），但它原来是面板安装弹窗里的一个输入框，per-install
+且不持久化——hub 连不上 GitHub 对**所有**节点都成立，却要每加一个节点重填一遍同样的地址。搬进
+「设置 → 站点」填一次，由 `main::release_url` 在 hub 侧拼上，节点侧回到「只连 hub」这一个前提。
+
+一并删掉的：`install.sh` 的 `--github-proxy` 参数与那一路 URL 分支、面板的输入框和 `shellArg()`、
+`install.sh` 里的 `@@REPO@@` 占位（连同 `install_script()` 的替换——脚本不再需要知道仓库名）。
+代价：手上存着旧安装命令的人会撞到 `unknown option: --github-proxy`，重新生成即可。
 
 **否决**：hub 侧缓存二进制（安装是低频操作）、把二进制打进 hub（每次发 agent 都要重发 hub）。
 
