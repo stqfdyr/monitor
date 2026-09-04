@@ -923,13 +923,15 @@ function Themes() {
       <div className="grid items-start gap-3 sm:grid-cols-2">
         {themes.map((theme) => (
           <Card key={theme.short} className="gap-4 p-5">
-            {/* 主题包里可选的 preview.png。没有就是 404，图自己藏起来，
-                所以后端不用告诉前端有没有这张图。 */}
+            {/* 主题包里可选的 preview.png，所以后端不用告诉前端有没有这张图：
+                没有就是 404，图一直不显示。必须从 hidden 开始——带边框的
+                aspect-video 空盒子会在响应回来之前就画出来，闪一下再消失。 */}
             <img
               src={`/api/themes/${theme.short}/preview`}
               alt=""
+              hidden
+              onLoad={(e) => { e.currentTarget.hidden = false }}
               className="aspect-video w-full rounded-md border object-cover object-top"
-              onError={(e) => { e.currentTarget.remove() }}
             />
             <div className="flex items-start gap-3">
               <div className="min-w-0 flex-1">
