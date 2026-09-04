@@ -88,9 +88,25 @@ check_port() {
 	[ "$1" -ge 1 ] && [ "$1" -le 65535 ] || die "端口必须是 1-65535 的整数：$1"
 }
 
-# The hub cannot know its own public address behind NAT, so ask the internet.
-# A private address is still a better thing to print than nothing, and an
-# IPv6-only box gets its literal bracketed so the result is a usable URL.
+# The `--listen ...` tail of the installed unit's ExecStart, empty when nothing
+# is installed. An upgrade rewrites the unit, so anything not given on the
+# command line has to come back out of the old one, or re-running to upgrade
+# silently resets the port and drops --site.
+old_exec() { sed -n 's/^ExecStart=.*--listen //p' "$UNIT" 2>/dev/null || true; }
+
+# The port that unit listens on, empty when there is none. Read three times:
+# the carry-over, the default the menu offers -- pressing Enter there has to
+# leave a running deployment where it is -- and the port check, where our own
+# socket must not read as a conflict.
+old_port() {
+	listen="$(old_exec)"
+	case "$listen" in
+	*:[0-9]*) listen="${listen%% *}"; printf '%s' "${listen##*:}" ;;
+	esac
+}
+
+# True when a unit is there that this script did not write: its listen address
+# and --site are someone else's, and the defaults here would replace them.
 foreign_unit() {
 	[ -f "$UNIT" ] || return 1
 	! grep -qF "$MARKER" "$UNIT"
@@ -116,19 +132,27 @@ install_hub() {
 	base="https://github.com/$REPO/releases/latest/download"
 	ok "架构" "$arch"
 
-	# An upgrade rewrites the unit, so anything not given on the command line
-	# has to come back out of the old one. Without this, re-running to upgrade
-	# silently resets the port and drops --site, and the reverse proxy in front
-	# is then pointing at nothing.
-	if [ -z "$PORT_SET" ] || [ -z "$SITE_SET" ]; then
-		old_exec="$(sed -n 's/^ExecStart=.*--listen //p' "$UNIT" 2>/dev/null || true)"
-		[ -n "$PORT_SET" ] || case "$old_exec" in
-		*:[0-9]*) PORT="${old_exec%% *}"; PORT="${PORT##*:}" ;;
+	# Whatever the command line did not say comes back out of the old unit;
+	# see old_exec.
+	if [ -z "$PORT_SET" ]; then
+		carried="$(old_port)"
+		[ -z "$carried" ] || PORT="$carried"
+	fi
+	if [ -z "$SITE_SET" ]; then
+		carried="$(old_exec)"
+		case "$carried" in
+		*--site\ *) SITE="${carried##*--site }"; SITE="${SITE%% *}" ;;
 		esac
-		[ -n "$SITE_SET" ] || case "$old_exec" in
-		*--site\ *) SITE="${old_exec##*--site }"; SITE="${SITE%% *}" ;;
-		esac
-		check_port "$PORT"
+	fi
+	check_port "$PORT"
+
+	# Before anything is stopped, replaced or downloaded: a port conflict has
+	# to leave the running hub exactly where it was. The port this unit
+	# already listens on is our own socket and never a conflict -- and on a
+	# first install there is no unit, so old_port is empty and it is checked.
+	if [ "$PORT" != "$(old_port)" ] && command -v ss >/dev/null 2>&1 &&
+		ss -ltnH "sport = :$PORT" 2>/dev/null | grep -q .; then
+		die "端口 $PORT 已被其它程序占用，换一个：--port <n>"
 	fi
 
 	id -u "$USER_NAME" >/dev/null 2>&1 ||
@@ -175,16 +199,20 @@ install_hub() {
 	backup=""
 	if [ -f "$BIN" ]; then
 		backup="$BIN.old"
-		cp -f "$BIN" "$backup"
+		# Never over one that is already there. A run that died between the
+		# install below and the health check left $BIN holding a binary that
+		# never proved it starts; copying that over the good backup would make
+		# the rollback restore the same broken thing and say it rolled back.
+		[ -f "$backup" ] || cp -f "$BIN" "$backup"
 	fi
-	# Stopped first so the copy does not have to land underneath a live
-	# process, and so the port check below is not tripped by the hub itself.
+	# Stopped first so the copy does not have to land underneath a live process.
 	systemctl stop "$SERVICE" 2>/dev/null || true
 	install -m 0755 "$tmp/$asset" "$BIN"
-
-	if command -v ss >/dev/null 2>&1 && ss -ltnH "sport = :$PORT" 2>/dev/null | grep -q .; then
-		die "端口 $PORT 已被其它程序占用，换一个：--port <n>"
-	fi
+	# Done with the download. Cleared here as well as on EXIT because the menu
+	# calls this more than once per run, and each call replaces the trap --
+	# the previous directory, binary and all, would never be collected.
+	rm -rf "$tmp"
+	trap - EXIT
 
 	# Loopback only: the panel and the agent tokens never travel a network in
 	# the clear, and there is no port to firewall. Reaching it is the reverse
@@ -223,7 +251,11 @@ UNIT
 
 	systemctl daemon-reload
 	systemctl enable "$SERVICE" >/dev/null 2>&1 || true
-	systemctl restart "$SERVICE"
+	# Not left to set -e: a binary that cannot even exec fails the job itself,
+	# and that is precisely the case the rollback below exists for. Unguarded,
+	# the script would die here with a raw systemd error and leave the hub down
+	# on the binary that just failed.
+	systemctl restart "$SERVICE" || true
 	# is-active answers before a unit that exits immediately has exited, and
 	# the first run also has an argon2 hash to compute. Settle, then ask.
 	sleep 3
@@ -324,8 +356,15 @@ menu() {
 		printf '\n'
 		case "$choice" in
 		1)
-			PORT="$(ask "监听端口" "$PORT")"
+			# The default offered is what the unit already listens on, so
+			# Enter leaves a running deployment where it is. PORT_SET marks
+			# the answer as given: without it the carry-over in install_hub
+			# reads the port back out of that same unit and the answer here
+			# is silently thrown away.
+			carried="$(old_port)"
+			PORT="$(ask "监听端口" "${carried:-$PORT}")"
 			check_port "$PORT"
+			PORT_SET=1
 			printf '\n'
 			install_hub
 			press
@@ -370,8 +409,10 @@ TXT
 
 while [ $# -gt 0 ]; do
 	case "$1" in
-	--port) PORT="${2-}"; PORT_SET=1; shift 2 ;;
-	--site) SITE="${2-}"; SITE_SET=1; shift 2 ;;
+	# The guard, not `${2-}`: `shift 2` with nothing to shift is fatal in dash,
+	# and what comes out is the shell's diagnostic rather than this line.
+	--port) [ $# -ge 2 ] || die "--port 后面要跟端口号"; PORT="$2"; PORT_SET=1; shift 2 ;;
+	--site) [ $# -ge 2 ] || die "--site 后面要跟地址"; SITE="$2"; SITE_SET=1; shift 2 ;;
 	--uninstall) ACTION=uninstall; shift ;;
 	--purge) ACTION=uninstall; PURGE=1; shift ;;
 	--yes | -y) YES=1; shift ;;

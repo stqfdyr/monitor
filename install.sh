@@ -16,6 +16,12 @@ INTERVAL=1
 INSECURE=""
 
 while [ $# -gt 0 ]; do
+	# A flag with nothing after it: `$2` under set -u aborts with the shell's
+	# own message instead of the usage below, and `shift 2` cannot shift.
+	case "$1" in
+	--server | --token | --register | --interval)
+		[ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; } ;;
+	esac
 	case "$1" in
 	--server) SERVER="$2"; shift 2 ;;
 	--token) TOKEN="$2"; shift 2 ;;
@@ -48,16 +54,33 @@ case "$SERVER" in *://*) ;; *) SERVER="$SCHEME://$SERVER" ;; esac
 # ip:port with no TLS in front. It says so out loud rather than silently: this
 # is the one step of the install that cannot be undone by fixing it later,
 # because a MITM'd binary is already running as root by then.
+#
+# The test is on the host alone, with the scheme, the port and any path taken
+# off, and it is an address match rather than a prefix: `127.evil.com` is a
+# registered name whose owner resolves it wherever they like, and reading it as
+# loopback would hand this exact plaintext channel to whoever owns it.
+HOST="${SERVER#*://}"
+HOST="${HOST%%/*}"
+case "$HOST" in
+"["*) HOST="${HOST#\[}"; HOST="${HOST%%]*}" ;;
+*) HOST="${HOST%%:*}" ;;
+esac
+case "$HOST" in
+127.*[!0-9.]*) LOCAL="" ;; # a name that merely starts 127.
+127.* | localhost | ::1) LOCAL=1 ;;
+*) LOCAL="" ;;
+esac
 case "$SERVER" in
-http://127.* | http://localhost | http://localhost:* | "http://[::1]" | "http://[::1]:"*) ;;
 http://*)
-	[ -n "$INSECURE" ] || {
-		echo "refusing plaintext http:// to a remote hub; use https://, or --insecure if it has no TLS" >&2
-		exit 2
-	}
-	echo "warning: --insecure over plain HTTP to $SERVER" >&2
-	echo "         the token and every report travel in the clear, and the binary" >&2
-	echo "         installed below is fetched over the same unverified channel" >&2
+	if [ -z "$LOCAL" ]; then
+		[ -n "$INSECURE" ] || {
+			echo "refusing plaintext http:// to a remote hub; use https://, or --insecure if it has no TLS" >&2
+			exit 2
+		}
+		echo "warning: --insecure over plain HTTP to $SERVER" >&2
+		echo "         the token and every report travel in the clear, and the binary" >&2
+		echo "         installed below is fetched over the same unverified channel" >&2
+	fi
 	;;
 esac
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
@@ -83,9 +106,16 @@ if [ -z "$TOKEN" ]; then
 	# Re-running the same command must not add a second node. This machine's
 	# token is already here, and it outlives the window that issued it, so the
 	# env file is the answer before the hub is asked.
-	TOKEN=$(sed -n 's/^MONITOR_TOKEN=//p' "$ENV_FILE" 2>/dev/null || true)
-	if [ -n "$TOKEN" ]; then
-		echo "this machine is already registered; keeping its token"
+	#
+	# Only for the same hub, though: a token hub A issued means nothing to hub
+	# B, and keeping it would leave the agent authenticating forever against a
+	# node that was never created -- with this installer reporting success.
+	CACHED=$(sed -n 's/^MONITOR_SERVER=//p' "$ENV_FILE" 2>/dev/null || true)
+	if [ "${CACHED%/}" = "${SERVER%/}" ]; then
+		TOKEN=$(sed -n 's/^MONITOR_TOKEN=//p' "$ENV_FILE" 2>/dev/null || true)
+		if [ -n "$TOKEN" ]; then
+			echo "this machine is already registered; keeping its token"
+		fi
 	fi
 fi
 if [ -z "$TOKEN" ]; then
@@ -130,11 +160,15 @@ install -m 0755 "$TMP" "$BIN"
 # The token lives in a root-only environment file rather than the unit, so it
 # stays out of `systemctl cat` and the world-readable journal. 0600 root is
 # what keeps it private -- $ROOT itself is readable, the binaries are in it.
-umask 077
-cat >"$ENV_FILE" <<ENV
+# In a subshell: the unit file written further down is read by anyone
+# debugging with `systemctl cat`, and a 0600 unit is a puzzle with no payoff.
+(
+	umask 077
+	cat >"$ENV_FILE" <<ENV
 MONITOR_SERVER=$SERVER
 MONITOR_TOKEN=$TOKEN
 ENV
+)
 
 if [ "$INIT" = openrc ]; then
 	cat >/etc/init.d/monitor-agent <<RC

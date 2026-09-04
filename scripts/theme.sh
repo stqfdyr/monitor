@@ -15,7 +15,12 @@
 set -eu
 
 cd "$(dirname "$0")/.."
-read -r TAG SHA <web-theme.pin
+# read answers 1 at EOF, which is also what a pin file with no trailing newline
+# gives -- the fields are set either way. Unguarded, set -e would exit here with
+# nothing printed and build.rs would point at the empty output it got.
+read -r TAG SHA <web-theme.pin || true
+[ -n "${TAG:-}" ] && [ -n "${SHA:-}" ] ||
+  { echo "web-theme.pin must hold '<tag> <sha256>'" >&2; exit 1; }
 DEST=target/theme
 URL="https://github.com/stqfdyr/monitor-theme-default/releases/download/$TAG/theme.tar.gz"
 
