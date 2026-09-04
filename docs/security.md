@@ -155,8 +155,10 @@ IPv4/IPv6。去掉它不会报错，只会让上报的地址一直是空字符�
 
 显式的 `https://` 地址加了 `--insecure` 也仍然走 TLS：这个 flag 允许明文，不强制明文。
 
-面板那边由 `needsInsecure()` 判断（`http://` 且非回环），自动把它拼进安装命令并红字标出。**判断口径
-三处必须一致**：`ws_url()`、`install.sh` 的 `case`、`needsInsecure()`，回环都是豁免的那一类。
+上述开关仅保留给手工运行脚本和 agent。面板只从 HTTPS 域名生成安装命令，不自动添加 `--insecure`。
+IP（包括回环）或明文入口不允许添加节点、开启批量窗口和注册新节点。前端检查当前 origin，hub 的三个
+创建入口共用 `provisioning_allowed()`：检查 Host、HTTPS 标志及请求携带的 Origin；`--site` 不能将 IP
+入口变成域名入口。hub 应保持仅回环监听，受信反代透传 Host 并设置 X-Forwarded-Proto，不能让公网绕过反代。
 
 ## 数据库的导出与导入
 
@@ -279,6 +281,10 @@ if !full {
 第三条铁律禁止的三个字段。白名单下这些键根本进不了 JSON。
 
 改 agent 上报字段时：新字段默认**不**公开，确认无害再加进 `PUBLIC_METRICS`。
+
+字段名白名单不替代类型检查：`report()` 拒收非对象、畸形 load 和类型错误的数值字段，保留上一份有效
+指标；缺字段仍兼容旧 agent。默认主题在渲染入口再检查完整指标，缺失或畸形时显示不可用，不让一个
+节点的坏数据使整个页面白屏。内核流量计数器仍按「缺失读数不移动基线」单独处理。
 
 测试：`the_public_view_hides_private_nodes_and_sensitive_fields`。单节点的历史查询走 `readable()`，
 同样检查登录状态 + 节点公开标志 + 全局开关，测试

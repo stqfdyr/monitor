@@ -6,9 +6,9 @@ import { Admin } from "@/components/Admin"
 import { Login } from "@/components/Login"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
-import { api, useNodes } from "@/lib/api"
+import { api, provisioningSite, useNodes } from "@/lib/api"
 
-type Me = { authed: boolean; github: boolean; site_name: string; public_page: boolean; site: string }
+type Me = { authed: boolean; github: boolean; site_name: string; public_page: boolean; site: string; can_provision: boolean }
 
 // `/admin` on its own is not a page; normalise it to the first section so a
 // bookmark and the OAuth redirect both land somewhere real.
@@ -53,14 +53,21 @@ export default function App() {
   const [path, go] = usePath()
   const [dark, toggleTheme] = useTheme()
   const [me, setMe] = useState<Me | null>(null)
+  const [meError, setMeError] = useState("")
   const { nodes, error, refresh } = useNodes()
 
-  const loadMe = useCallback(() => api<Me>("/me").then(setMe).catch(() => {}), [])
+  const loadMe = useCallback(() => {
+    return api<Me>("/me").then((next) => { setMe(next); setMeError("") }).catch((e: Error) => setMeError(e.message))
+  }, [])
   useEffect(() => {
     loadMe()
   }, [loadMe])
 
-  if (!me) return <div className="grid min-h-svh place-items-center text-sm text-muted-foreground">加载中…</div>
+  if (!me || meError) return (
+    <div className="grid min-h-svh place-items-center p-6 text-sm text-muted-foreground">
+      {meError ? <div className="space-y-3 text-center"><p role="alert">加载失败：{meError}</p><Button onClick={loadMe}>重试</Button></div> : "加载中…"}
+    </div>
+  )
 
   if (!me.authed) {
     return (
@@ -118,6 +125,7 @@ export default function App() {
             // is often reached over a loopback port behind a proxy, and the
             // install command and OAuth callback both need the real one.
             site={me.site || location.origin}
+            canProvision={me.can_provision && !!provisioningSite(location.origin) && !!provisioningSite(me.site || location.origin)}
           />
         )}
       </main>

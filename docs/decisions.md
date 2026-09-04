@@ -76,8 +76,8 @@ agent 不写任何文件、不记忆任何跨重启的状态。它只上报「�
 | cookie 的 `Secure` | 看它的 scheme | 看请求的 `X-Forwarded-Proto`，多级代理取第一跳 |
 | 启动打印的地址、明文告警 | 用它 | 监听地址，`0.0.0.0` 换成本机出网 IP |
 
-`X-Forwarded-Proto` 是客户端可伪造的头，**只有这个标志信它**：伪造 `https` 的代价是自己的浏览器存
-不下 session，伪造 `http` 是把 `Secure` 从自己已有的 cookie 上摘掉，两头都碰不到别人的会话。
+`X-Forwarded-Proto` 必须由受信反代设置。除 cookie 标志外，2026-09-05 起创建和注册节点的入口也检查
+它与 Host；公网不能直接连 hub 并自行声明转发头。
 
 `main::outbound_ip()` 问内核「去 1.1.1.1 该走哪个本机地址」，不发包、断网也能答。NAT 后面拿到的是
 内网地址——hub 不可能知道自己的公网地址，所以一键脚本用查到的公网地址覆盖它。
@@ -151,6 +151,9 @@ Cloudflare Tunnel（出站建隧道，源站纯 v4 也能有双栈边缘，本�
 
 ### 明文 hub 用 `--insecure` 显式放行 **[用户]**
 
+**2026-09-05 收紧面板入口：** 以下手工脚本与 agent 开关仍保留；面板改为只允许从 HTTPS 域名添加和
+安装节点，IP 入口不能开启批量窗口，注册接口也执行同样的检查。`--site` 不豁免当前 IP 入口。
+
 agent 和 `install.sh` 都拒绝明文连远程 hub：token 会明文传输，而且装 agent 时下载的二进制走同一条
 未经验证的通道，那个二进制马上要以 root 跑起来。裸 ip:port 部署恰好就是明文，所以这道闸得留个开关。
 
@@ -159,7 +162,7 @@ agent 和 `install.sh` 都拒绝明文连远程 hub：token 会明文传输，�
 - `install.sh --insecure` 跳过拒绝，往 stderr 打三行风险说明，并把 `--insecure` 写进 agent 的 `ExecStart`
 - agent 的 `--insecure` 除了放行，还让**裸主机名不再升级成 TLS**——否则这个 flag 会去 dial 一个永远
   握不上手的 `wss://`
-- 面板检测到 hub 是明文远程（`needsInsecure()`）就自动把 `--insecure` 拼进命令，并在弹窗里红字说明
+- 面板不再自动拼接 `--insecure`，需要手工放行时由操作者自己运行脚本
 
 komari 对此零检查：`-e http://1.2.3.4:25774` 直接就用，明文传 token 没有任何提示。
 

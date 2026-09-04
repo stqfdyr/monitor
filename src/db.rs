@@ -309,6 +309,35 @@ pub struct Node {
 fn yes() -> bool {
     true
 }
+
+/// Omitted settings stay unchanged. An explicit null clears the expiry date.
+#[derive(Deserialize, Default)]
+pub struct NodePatch {
+    pub name: Option<String>,
+    pub sort: Option<i64>,
+    pub public: Option<bool>,
+    pub price: Option<f64>,
+    pub currency: Option<String>,
+    pub billing_cycle: Option<String>,
+    #[serde(default, deserialize_with = "expiry_patch")]
+    pub expires_at: Option<Option<String>>,
+    pub remark: Option<String>,
+    pub traffic_limit: Option<i64>,
+    pub traffic_mode: Option<String>,
+    pub traffic_reset_day: Option<u32>,
+}
+
+fn expiry_patch<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(d).map(Some)
+}
+
+#[derive(Deserialize, Default)]
+pub struct TrafficPatch {
+    pub total_rx: Option<i64>,
+    pub total_tx: Option<i64>,
+    pub month_rx: Option<i64>,
+    pub month_tx: Option<i64>,
+}
 fn usd() -> String {
     "USD".into()
 }
@@ -507,11 +536,15 @@ impl Db {
         Ok(())
     }
 
-    pub fn update_node(&self, id: i64, n: &Node) -> Result<()> {
+    pub fn update_node(&self, id: i64, n: &NodePatch) -> Result<()> {
         self.conn().execute(
-            "UPDATE node SET name=?2, sort=?3, public=?4, price=?5, currency=?6, billing_cycle=?7,
-                             expires_at=?8, remark=?9, traffic_limit=?10, traffic_mode=?11,
-                             traffic_reset_day=?12
+            "UPDATE node SET name=COALESCE(?2,name), sort=COALESCE(?3,sort), public=COALESCE(?4,public),
+                             price=COALESCE(?5,price), currency=COALESCE(?6,currency),
+                             billing_cycle=COALESCE(?7,billing_cycle),
+                             expires_at=CASE WHEN ?8 THEN ?9 ELSE expires_at END,
+                             remark=COALESCE(?10,remark), traffic_limit=COALESCE(?11,traffic_limit),
+                             traffic_mode=COALESCE(?12,traffic_mode),
+                             traffic_reset_day=COALESCE(?13,traffic_reset_day)
              WHERE id=?1",
             params![
                 id,
@@ -521,7 +554,8 @@ impl Db {
                 n.price,
                 n.currency,
                 n.billing_cycle,
-                n.expires_at,
+                n.expires_at.is_some(),
+                n.expires_at.as_ref().and_then(|v| v.as_deref()),
                 n.remark,
                 n.traffic_limit,
                 n.traffic_mode,
@@ -787,22 +821,17 @@ impl Db {
     /// they belong to whichever one the row still held: `all_traffic` would
     /// read them back as zero, and the node's next report would restart the
     /// counter and throw the correction away.
-    pub fn set_traffic(
-        &self,
-        node_id: i64,
-        total_rx: i64,
-        total_tx: i64,
-        month_rx: i64,
-        month_tx: i64,
-    ) -> Result<()> {
+    pub fn set_traffic(&self, node_id: i64, p: &TrafficPatch) -> Result<()> {
         let conn = self.conn();
         let reset_day: u32 =
             conn.query_row("SELECT traffic_reset_day FROM node WHERE id=?1", [node_id], |r| r.get(0))?;
         let period = period_start(Local::now().date_naive(), reset_day).to_string();
         conn.execute(
-            "UPDATE traffic SET total_rx=?2, total_tx=?3, month_rx=?4, month_tx=?5, month_start=?6
+            "UPDATE traffic SET total_rx=COALESCE(?2,total_rx), total_tx=COALESCE(?3,total_tx),
+                 month_rx=COALESCE(?4,CASE WHEN month_start=?6 THEN month_rx ELSE 0 END),
+                 month_tx=COALESCE(?5,CASE WHEN month_start=?6 THEN month_tx ELSE 0 END), month_start=?6
              WHERE node_id=?1",
-            params![node_id, total_rx, total_tx, month_rx, month_tx, period],
+            params![node_id, p.total_rx, p.total_tx, p.month_rx, p.month_tx, period],
         )?;
         Ok(())
     }
@@ -1725,13 +1754,60 @@ mod tests {
         // A node quiet since before its reset day still holds the old period.
         db.conn().execute("UPDATE traffic SET month_start='1999-01-01' WHERE node_id=?1", [id]).unwrap();
 
-        db.set_traffic(id, 4_000, 2_000, 300, 100).unwrap();
+        db.set_traffic(
+            id,
+            &TrafficPatch {
+                total_rx: Some(4_000),
+                total_tx: Some(2_000),
+                month_rx: Some(300),
+                month_tx: Some(100),
+            },
+        )
+        .unwrap();
         let t = db.all_traffic().remove(&id).unwrap();
         assert_eq!((t.month_rx, t.month_tx), (300, 100), "the correction reads back as this period's");
 
         let t = db.accumulate(id, "boot-a", Some((500, 50))).unwrap();
         assert_eq!((t.month_rx, t.month_tx), (800, 150), "and the next report adds to it");
         assert_eq!((t.total_rx, t.total_tx), (4_500, 2_050));
+    }
+
+    #[test]
+    fn partial_edits_keep_other_settings_and_live_counters() {
+        let db = db();
+        let id = node(&db, 1);
+        let patch = |v| serde_json::from_value::<NodePatch>(v).unwrap();
+        db.update_node(
+            id,
+            &patch(serde_json::json!({"public":false,"remark":"private","expires_at":"2030-01-01"})),
+        )
+        .unwrap();
+        db.update_node(id, &patch(serde_json::json!({"price":20}))).unwrap();
+        let n = db.node(id).unwrap().unwrap();
+        assert!(!n.public);
+        assert_eq!(n.remark, "private");
+        assert_eq!(n.expires_at.as_deref(), Some("2030-01-01"));
+        db.update_node(id, &patch(serde_json::json!({"price":0,"expires_at":null}))).unwrap();
+        let n = db.node(id).unwrap().unwrap();
+        assert_eq!(n.price, 0.0);
+        assert_eq!(n.expires_at, None);
+
+        db.accumulate(id, "boot", Some((0, 0))).unwrap();
+        db.accumulate(id, "boot", Some((120_000, 10_000))).unwrap();
+        db.set_traffic(id, &TrafficPatch { month_tx: Some(3_000), ..Default::default() }).unwrap();
+        let t = db.all_traffic().remove(&id).unwrap();
+        assert_eq!((t.total_rx, t.total_tx, t.month_rx, t.month_tx), (120_000, 10_000, 120_000, 3_000));
+
+        db.update_node(id, &patch(serde_json::json!({"traffic_reset_day":2}))).unwrap();
+        db.set_traffic(id, &TrafficPatch { month_rx: Some(7_000), ..Default::default() }).unwrap();
+        let t = db.all_traffic().remove(&id).unwrap();
+        assert_eq!((t.month_rx, t.month_tx), (7_000, 0));
+        // Correcting only a lifetime total cannot revive last month's bytes.
+        db.conn()
+            .execute("UPDATE traffic SET month_start='1999-01-01',month_tx=999 WHERE node_id=?1", [id])
+            .unwrap();
+        db.set_traffic(id, &TrafficPatch { total_rx: Some(130_000), ..Default::default() }).unwrap();
+        assert_eq!(db.all_traffic()[&id].month_tx, 0);
     }
 
     #[test]

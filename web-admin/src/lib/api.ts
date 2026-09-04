@@ -65,6 +65,23 @@ export type Node = {
 
 export type PingTask = { id: number; name: string; target: string; interval: number; nodes: number[] }
 
+/** Form snapshots must never overwrite fields the user did not edit. */
+export function changes<T extends object>(initial: T, values: Partial<T>): Partial<T> {
+  return Object.fromEntries(Object.entries(values).filter(([key, value]) => value !== initial[key as keyof T])) as Partial<T>
+}
+
+/** Installation commands require a TLS origin with a domain, never an IP. */
+export function provisioningSite(site: string): string {
+  try {
+    const u = new URL(site)
+    return u.protocol === "https:" && !u.hostname.startsWith("[") && !/^\d+\.\d+\.\d+\.\d+$/.test(u.hostname)
+      && u.hostname !== "localhost" && !u.hostname.endsWith(".localhost") && !u.username && !u.password
+      && u.pathname === "/" && !u.search && !u.hash ? u.origin : ""
+  } catch {
+    return ""
+  }
+}
+
 export class ApiError extends Error {
   status: number
   constructor(status: number, message: string) {

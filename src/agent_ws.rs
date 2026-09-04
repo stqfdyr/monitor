@@ -335,6 +335,34 @@ fn check_contract(node_id: i64, metrics: &serde_json::Value) {
 }
 
 fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()> {
+    // Missing fields remain compatible with older agents; malformed values do
+    // not become a live frame that can crash a browser. Counter validation is
+    // separate: a missing/null kernel reading must not change its baseline.
+    let number = |v: &serde_json::Value| v.as_f64().is_some_and(|n| n.is_finite() && n >= 0.0);
+    anyhow::ensure!(metrics.is_object(), "report must be an object");
+    for key in [
+        "uptime",
+        "cpu",
+        "mem_total",
+        "mem_used",
+        "swap_total",
+        "swap_used",
+        "disk_total",
+        "disk_used",
+        "net_rx",
+        "net_tx",
+        "tcp",
+        "udp",
+        "procs",
+    ] {
+        anyhow::ensure!(metrics.get(key).is_none_or(number), "invalid report field {key}");
+    }
+    if let Some(load) = metrics.get("load") {
+        anyhow::ensure!(
+            load.as_array().is_some_and(|v| v.len() == 3 && v.iter().all(number)),
+            "invalid load"
+        );
+    }
     let now = Utc::now().timestamp();
     // A placeholder rather than the empty string, which `accumulate` reads as
     // "this node has no baseline yet". An agent that sends no boot_id -- an
@@ -463,6 +491,20 @@ mod tests {
                        "mem_used": 100, "net_rx_total": rx, "net_tx_total": tx}
         })
         .to_string()
+    }
+
+    #[test]
+    fn malformed_reports_leave_the_last_good_frame_and_counters_untouched() {
+        let app = app();
+        let (id, _held) = connect(&app);
+        dispatch(&app, id, "ip", &report_json("boot", 1_000, 500)).unwrap();
+        let good = app.agents.read().unwrap()[&id].metrics.clone();
+        for bad in [json!({"load":null}), json!({"load":[1,"bad",3]}), json!({"cpu":"bad"}), json!([])] {
+            assert!(report(&app, id, bad).is_err());
+            assert_eq!(app.agents.read().unwrap()[&id].metrics, good);
+        }
+        dispatch(&app, id, "ip", &report_json("boot", 2_000, 600)).unwrap();
+        assert_eq!(app.db.all_traffic()[&id].total_rx, 1_000);
     }
 
     /// A burst of reports inside one minute: each moves the live view and the

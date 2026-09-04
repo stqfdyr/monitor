@@ -94,7 +94,7 @@ monitor-hub                    # 0.0.0.0:28080，数据库 ./monitor.db
 
 不带 `--site` 时，hub 不假设自己的地址：面板用浏览器地址栏里的地址拼安装命令，cookie 的 `Secure`
 标志看请求的 `X-Forwarded-Proto`。**裸 ip:port 部署是明文 HTTP**，会话与节点凭证在链路上都是明文，
-生产环境请放到 TLS 反向代理后面。
+生产环境请放到 TLS 反向代理后面。IP 或明文入口不提供添加、批量注册和安装命令；请从 HTTPS 域名进入。
 
 默认监听 `[::]:28080`，Linux 上一个 v6 socket 通过 v4-mapped 地址同时收两族，所以双栈机器不用配
 任何东西；内核禁用了 IPv6 或 `bindv6only=1` 时自动退回 `0.0.0.0:28080`。**这件事只影响谁连得上**：
@@ -154,8 +154,8 @@ docker run -d --name monitor -p 28080:28080 \
 也没有端口需要防火墙。把域名指过来是反向代理的活。
 
 **配好之后不用改 hub 的任何参数，安装命令会自己变。** 面板用浏览器地址栏的地址拼命令，所以你改用
-`https://hub.example.com` 进后台，命令立刻变成 `--server https://hub.example.com` 并去掉
-`--insecure`；会话 cookie 的 `Secure` 跟着请求的 `X-Forwarded-Proto` 走。hub 也不用重启。
+`https://hub.example.com` 进后台，就能添加节点并获得 `--server https://hub.example.com` 的安装命令。
+面板不再生成 `--insecure` 命令；会话 cookie 的 `Secure` 跟着请求的 `X-Forwarded-Proto` 走。
 
 ### caddy
 
@@ -232,8 +232,8 @@ ingress:
 
 只有这两种情况，常规反代都不属于：
 
-- **你进后台的地址不是节点该用的地址**。比如监听回环之后又通过 SSH 隧道进面板，浏览器地址栏是
-  `127.0.0.1`，节点却得连公网域名——这时命令是错的，得用 `--site` 钉死。
+- **面板域名和节点连接的域名不同**。用 `--site` 指定节点可达的 HTTPS 域名。
+  IP 或 SSH 转发入口仍不能添加节点，`--site` 不绕过这个限制。
 - **反代不发 `X-Forwarded-Proto`**。cookie 拿不到 `Secure`，用 `--site https://...` 强制。
 
 ## 主题

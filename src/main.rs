@@ -90,10 +90,9 @@ impl App {
     /// such header. Marking it Secure over plain HTTP would make the browser
     /// drop the session rather than keep it.
     ///
-    /// The header is client-settable and nothing beyond this flag trusts it.
-    /// A forged `https` costs the sender its own session; a forged `http`
-    /// drops Secure from a cookie the sender already holds. Neither reaches
-    /// another browser's session.
+    /// The header is supplied by the trusted reverse proxy. Provisioning also
+    /// checks it and the request's Host/Origin; the listener must remain
+    /// inaccessible to the public so callers cannot bypass that proxy.
     pub fn secure_cookies(&self, headers: &HeaderMap) -> bool {
         if !self.site.is_empty() {
             return !self.site.starts_with("http://");

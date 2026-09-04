@@ -35,7 +35,7 @@ jobs:
           cache-dependency-path: web-admin/package-lock.json
 
       # rust-embed needs the panel's dist/ to exist before cargo touches it.
-      - run: npm ci && npm run lint && npm run build
+      - run: npm ci && npm run lint && npm test && npm run build
         working-directory: web-admin
 
       - uses: dtolnay/rust-toolchain@stable

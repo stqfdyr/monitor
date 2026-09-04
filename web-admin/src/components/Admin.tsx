@@ -12,12 +12,11 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { api, upload, type Node, type PingTask } from "@/lib/api"
+import { api, changes, provisioningSite, upload, type Node, type PingTask } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, monthUsage, uptime } from "@/lib/format"
 
 const GIB = 1024 ** 3
-// Counters the panel can correct by hand, after a node moves to new hardware
-// and the hub books the new machine's lifetime traffic in one go.
+// Counters the panel can correct after migration or an accounting error.
 const TRAFFIC_FIELDS = [
   ["total_rx", "累计下行"],
   ["total_tx", "累计上行"],
@@ -171,25 +170,32 @@ function NodeForm({ node, onClose, onSaved }: {
 
   async function save() {
     if (!form.name.trim()) return toast.error("请填写节点名称")
+    const patch = changes(node, {
+      name: form.name.trim(),
+      public: form.public,
+      remark: form.remark,
+      traffic_mode: form.traffic_mode,
+      traffic_limit: Math.round(Number(limitGib) * GIB),
+      traffic_reset_day: Math.min(31, Math.max(1, Math.round(Number(form.traffic_reset_day) || 1))),
+    })
+    const correction = Object.fromEntries(
+      Object.entries(changes(pristine.current, traffic)).map(([key, value]) => [key, Math.round(Number(value) * GIB)]),
+    )
+    if ([patch.traffic_limit, ...Object.values(correction)].some((v) => v !== undefined && (!Number.isSafeInteger(v) || v < 0))) {
+      return toast.error("流量必须是有效的非负数，且不能超出精确计数范围")
+    }
     setSaving(true)
     try {
-      if (TRAFFIC_FIELDS.some(([k]) => traffic[k] !== pristine.current[k])) {
+      // The correction belongs to the new reset period, so save its day first.
+      if (Object.keys(patch).length) {
+        await api(`/nodes/${node.id}`, { method: "PUT", body: JSON.stringify(patch) })
+      }
+      if (Object.keys(correction).length) {
         await api(`/nodes/${node.id}/traffic`, {
           method: "PUT",
-          body: JSON.stringify(
-            Object.fromEntries(TRAFFIC_FIELDS.map(([k]) => [k, Math.round((Number(traffic[k]) || 0) * GIB)])),
-          ),
+          body: JSON.stringify(correction),
         })
       }
-      await api(`/nodes/${node.id}`, {
-        method: "PUT",
-        body: JSON.stringify({
-          ...form,
-          name: form.name.trim(),
-          traffic_limit: Math.round((Number(limitGib) || 0) * GIB),
-          traffic_reset_day: Math.min(31, Math.max(1, Number(form.traffic_reset_day) || 1)),
-        }),
-      })
       toast.success("节点设置已保存")
       onClose()
       onSaved()
@@ -236,7 +242,7 @@ function NodeForm({ node, onClose, onSaved }: {
           <details className="rounded-lg border bg-muted/30 px-3 py-2.5">
             <summary className="cursor-pointer text-sm font-medium">流量校正</summary>
             <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-              换机或重装后，新机器的历史计数会被记成一次增量。按 GB 填入正确值。
+              按 GB 填入需要校正的值，未修改的计数器继续正常累计。
             </p>
             <div className="mt-3 grid gap-4 sm:grid-cols-2">
               {TRAFFIC_FIELDS.map(([key, label]) => (
@@ -285,11 +291,12 @@ function BillingForm({ node, onClose, onSaved }: {
     try {
       await api(`/nodes/${node.id}`, {
         method: "PUT",
-        body: JSON.stringify({
-          ...form,
+        body: JSON.stringify(changes(node, {
           price: Math.max(0, Number(price) || 0),
+          currency: form.currency,
+          billing_cycle: form.billing_cycle,
           expires_at: form.expires_at || null,
-        }),
+        })),
       })
       toast.success("续费设置已保存")
       onClose()
@@ -355,26 +362,13 @@ function BillingForm({ node, onClose, onSaved }: {
   )
 }
 
-// True when the hub has no TLS to offer, which is a hub reached at ip:port.
-// install.sh and the agent both refuse plaintext to a remote hub unless the
-// command says --insecure, so without this the command they are handed fails
-// on the node. Loopback is exempt in all three places.
-function needsInsecure(site: string) {
-  try {
-    const { protocol, hostname } = new URL(site)
-    if (protocol !== "http:") return false
-    return hostname !== "localhost" && hostname !== "[::1]" && !hostname.startsWith("127.")
-  } catch {
-    return false
-  }
-}
-
 // Built here rather than fetched: the node list already carries the token, so
 // looking at an install command is a read, not an act. Reissuing one to show
 // it knocks the running agent offline.
 function installCommand(site: string, token: string, seconds: number) {
+  site = provisioningSite(site)
+  if (!site) return ""
   const args = [`--server ${site}`, `--token ${token}`, `--interval ${seconds}`]
-  if (needsInsecure(site)) args.push("--insecure")
   return `curl -fsSL ${site}/install.sh | sh -s -- ${args.join(" ")}`
 }
 
@@ -383,8 +377,9 @@ function installCommand(site: string, token: string, seconds: number) {
 // so unlike an install command, this text is nobody's credential and can go
 // straight into a loop.
 function registerCommand(site: string, key: string) {
+  site = provisioningSite(site)
+  if (!site) return ""
   const args = [`--server ${site}`, `--register ${key}`]
-  if (needsInsecure(site)) args.push("--insecure")
   return `curl -fsSL ${site}/install.sh | sh -s -- ${args.join(" ")}`
 }
 
@@ -454,12 +449,6 @@ function RegisterDialog({ site, reg, onClose }: {
               <pre className="h-24 overflow-auto whitespace-pre-wrap break-all rounded-lg border bg-muted/40 p-3 text-xs leading-relaxed select-all">
                 {command}
               </pre>
-              {needsInsecure(site) && (
-                <p className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">
-                  这个 hub 只有明文 HTTP，命令里的 <code>--insecure</code> 是必需的：注册密钥、凭证与
-                  上报数据全程明文，安装时下载的二进制也走同一条未验证的通道。
-                </p>
-              )}
               <div className="flex items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
                 <span>
                   <span className="block font-medium">窗口 {clock} 后自动关闭</span>
@@ -531,13 +520,6 @@ function InstallDialog({ node, site, onClose, onRotated }: {
                   until one is reissued. */}
               {command || "旧版本创建的凭证不可读取，换发后显示"}
             </pre>
-            {needsInsecure(site) && (
-              <p className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">
-                这个 hub 只有明文 HTTP，命令里的 <code>--insecure</code> 是必需的：凭证与上报数据全程明文，
-                安装时下载的二进制也走同一条未验证的通道。放到 TLS 反向代理后面，再用 <code>--site</code>{" "}
-                指向 https 地址，命令会自动去掉它。
-              </p>
-            )}
           </div>
           <div className="flex items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
             <span>
@@ -572,7 +554,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   )
 }
 
-function Nodes({ nodes, refresh, site }: { nodes: Node[]; refresh: () => void; site: string }) {
+function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh: () => void; site: string; canProvision: boolean }) {
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<Node | null>(null)
   const [billing, setBilling] = useState<Node | null>(null)
@@ -636,13 +618,14 @@ function Nodes({ nodes, refresh, site }: { nodes: Node[]; refresh: () => void; s
 
   return (
     <div className="space-y-4">
+      {!canProvision && <p className="text-sm text-muted-foreground">请通过 HTTPS 域名访问面板后添加或安装节点。</p>}
       <div className="flex justify-end gap-2">
         {/* An open window is visible from the list itself, so nobody has to
             remember they left one open. */}
-        <Button variant="outline" onClick={() => setRegistering(true)}>
+        <Button variant="outline" disabled={!canProvision} onClick={() => setRegistering(true)}>
           <Server /> 批量添加{reg.left > 0 && ` · ${Math.ceil(reg.left / 60)} 分`}
         </Button>
-        <Button onClick={() => setCreating(true)}>
+        <Button disabled={!canProvision} onClick={() => setCreating(true)}>
           <Plus /> 添加节点
         </Button>
       </div>
@@ -738,7 +721,7 @@ function Nodes({ nodes, refresh, site }: { nodes: Node[]; refresh: () => void; s
                 </TableCell>
                 <TableCell className="text-sm">{n.expires_at || FOREVER}</TableCell>
                 <TableCell className="text-right whitespace-nowrap">
-                  <Button variant="ghost" size="icon" onClick={() => setInstalling(n)} title="安装 Agent" aria-label="安装 Agent">
+                  <Button variant="ghost" size="icon" disabled={!canProvision} onClick={() => setInstalling(n)} title="安装 Agent" aria-label="安装 Agent">
                     <Download />
                   </Button>
                   <Button variant="ghost" size="icon" onClick={() => setEditing(n)} title="编辑节点" aria-label="编辑节点">
@@ -1551,12 +1534,14 @@ export function Admin({
   nodes,
   refresh,
   site,
+  canProvision,
 }: {
   path: string
   go: (to: string) => void
   nodes: Node[]
   refresh: () => void
   site: string
+  canProvision: boolean
 }) {
   return (
     <div className="flex flex-col gap-6 md:flex-row">
@@ -1591,7 +1576,7 @@ export function Admin({
         ) : path === "/admin/settings" ? (
           <SettingsTab />
         ) : (
-          <Nodes nodes={nodes} refresh={refresh} site={site} />
+          <Nodes nodes={nodes} refresh={refresh} site={site} canProvision={canProvision} />
         )}
       </div>
     </div>

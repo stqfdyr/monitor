@@ -15,7 +15,7 @@ use crate::agent_ws::Agent;
 use crate::auth::{
     authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
 };
-use crate::db::{Node, PingTask, Traffic};
+use crate::db::{Node, NodePatch, PingTask, Traffic, TrafficPatch};
 use crate::{agent_ws, App, Shared};
 
 /// Present only on requests carrying a valid session. Handlers that take it
@@ -321,12 +321,43 @@ async fn stream_live(app: Shared, mut socket: WebSocket, full: bool) {
 
 // ---- panel write paths ----
 
+const PROVISIONING_DENIED: &str = "请通过 HTTPS 域名访问面板后添加或安装节点";
+
+fn https_domain(site: &str) -> Option<reqwest::Url> {
+    let url = reqwest::Url::parse(site).ok()?;
+    (url.scheme() == "https"
+        && url.domain().is_some_and(|d| d != "localhost" && !d.ends_with(".localhost"))
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none())
+    .then_some(url)
+}
+
+/// Host and the proxy's scheme describe this request; --site must not turn
+/// an IP entry point into a domain entry point. The listener stays behind the
+/// trusted reverse proxy, which must preserve Host and set X-Forwarded-Proto.
+fn provisioning_allowed(app: &App, headers: &HeaderMap) -> bool {
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else { return false };
+    let https = crate::forwarded_proto(headers)
+        .map_or_else(|| app.site.starts_with("https://"), |scheme| scheme == "https");
+    if !https || (!app.site.is_empty() && https_domain(&app.site).is_none()) {
+        return false;
+    }
+    let Some(url) = https_domain(&format!("https://{host}")) else { return false };
+    headers
+        .get(header::ORIGIN)
+        .is_none_or(|origin| origin.to_str().ok() == Some(url.origin().ascii_serialization().as_str()))
+}
+
 pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
     Json(json!({
         "authed": authed(&app, &headers),
         "github": app.db.get("github_client_id").is_some_and(|v| !v.is_empty()),
         "site_name": app.db.get("site_name").unwrap_or_else(|| "Monitor".into()),
         "public_page": app.public_page(),
+        "can_provision": provisioning_allowed(&app, &headers),
         // The hub's own public URL when it was given one, which is what
         // belongs in an install command and in the OAuth callback — not
         // whichever address this browser used, which behind a proxy may be a
@@ -339,8 +370,12 @@ pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
 pub async fn create_node(
     _: Admin,
     State(app): State<Shared>,
+    headers: HeaderMap,
     body: Result<Json<Node>, JsonRejection>,
 ) -> Response {
+    if !provisioning_allowed(&app, &headers) {
+        return (StatusCode::FORBIDDEN, PROVISIONING_DENIED).into_response();
+    }
     let Ok(Json(mut node)) = body else { return bad("invalid node") };
     if node.name.trim().is_empty() {
         return bad("name is required");
@@ -392,6 +427,9 @@ pub async fn agent_register(
     // JSON parser to depend on in a POSIX `sh`.
     name: String,
 ) -> Response {
+    if !provisioning_allowed(&app, &headers) {
+        return (StatusCode::FORBIDDEN, PROVISIONING_DENIED).into_response();
+    }
     let ip = client_ip(&headers, peer.ip());
     // Counted apart from the sign-in page: a batch install started with a
     // stale key is a fumbled deploy, not an attack on the panel, and sharing
@@ -447,7 +485,10 @@ pub async fn agent_register(
 
 /// Opens a registration window with a fresh key. Whatever key was there stops
 /// working the moment this returns.
-pub async fn open_register(_: Admin, State(app): State<Shared>) -> Response {
+pub async fn open_register(_: Admin, State(app): State<Shared>, headers: HeaderMap) -> Response {
+    if !provisioning_allowed(&app, &headers) {
+        return (StatusCode::FORBIDDEN, PROVISIONING_DENIED).into_response();
+    }
     let key = random_token();
     let until = (Utc::now().timestamp() + REGISTER_WINDOW).to_string();
     match app.db.set("register_key", &key).and_then(|()| app.db.set("register_until", &until)) {
@@ -468,13 +509,21 @@ pub async fn update_node(
     _: Admin,
     State(app): State<Shared>,
     Path(id): Path<i64>,
-    body: Result<Json<Node>, JsonRejection>,
+    body: Result<Json<NodePatch>, JsonRejection>,
 ) -> Response {
     let Ok(Json(mut node)) = body else { return bad("invalid node") };
-    if node.name.trim().is_empty() {
-        return bad("name is required");
+    if let Some(name) = &mut node.name {
+        *name = name.trim().to_owned();
+        if name.is_empty() {
+            return bad("name is required");
+        }
     }
-    node.name = node.name.trim().to_owned();
+    if node.traffic_reset_day.is_some_and(|d| !(1..=31).contains(&d)) {
+        return bad("reset day must be from 1 to 31");
+    }
+    if node.price.is_some_and(|v| !v.is_finite() || v < 0.0) || node.traffic_limit.is_some_and(|v| v < 0) {
+        return bad("price and traffic limit must be non-negative");
+    }
     match app.db.update_node(id, &node) {
         Ok(()) => {
             invalidate_snapshot(&app);
@@ -539,21 +588,16 @@ pub async fn reset_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     }
 }
 
-#[derive(Deserialize)]
-pub struct TrafficPatch {
-    total_rx: i64,
-    total_tx: i64,
-    month_rx: i64,
-    month_tx: i64,
-}
-
 pub async fn patch_traffic(
     _: Admin,
     State(app): State<Shared>,
     Path(id): Path<i64>,
     Json(p): Json<TrafficPatch>,
 ) -> Response {
-    match app.db.set_traffic(id, p.total_rx, p.total_tx, p.month_rx, p.month_tx) {
+    if [p.total_rx, p.total_tx, p.month_rx, p.month_tx].into_iter().flatten().any(|v| v < 0) {
+        return bad("traffic must be non-negative");
+    }
+    match app.db.set_traffic(id, &p) {
         Ok(()) => {
             invalidate_snapshot(&app);
             Json(json!({"ok": true})).into_response()
@@ -1192,8 +1236,71 @@ mod tests {
     use crate::auth::sha256;
     use crate::db::Db;
 
+    fn domain_headers() -> HeaderMap {
+        HeaderMap::from_iter([
+            (header::HOST, "monitor.example.com".parse().unwrap()),
+            (header::HeaderName::from_static("x-forwarded-proto"), "https".parse().unwrap()),
+        ])
+    }
+
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
+    }
+
+    #[tokio::test]
+    async fn provisioning_requires_the_current_https_domain_entry() {
+        let no_site = app();
+        let mut state = app();
+        state.site = "https://monitor.example.com".into();
+        let app = std::sync::Arc::new(state);
+        let good = domain_headers();
+        assert!(provisioning_allowed(&app, &good));
+        let mut plain = good.clone();
+        plain.insert("x-forwarded-proto", "http".parse().unwrap());
+        assert!(
+            !provisioning_allowed(&app, &plain),
+            "--site cannot override an explicitly plaintext request"
+        );
+        for host in ["127.0.0.1:9911", "[::1]:9911", "198.51.100.1", "2130706433", "localhost"] {
+            let mut headers = good.clone();
+            headers.insert(header::HOST, host.parse().unwrap());
+            let node = serde_json::from_value(json!({"name":"blocked"})).unwrap();
+            assert_eq!(
+                create_node(Admin, State(app.clone()), headers.clone(), Ok(Json(node))).await.status(),
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                open_register(Admin, State(app.clone()), headers.clone()).await.status(),
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                agent_register(
+                    State(app.clone()),
+                    ConnectInfo("127.0.0.1:1".parse().unwrap()),
+                    headers,
+                    "blocked".into()
+                )
+                .await
+                .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        let mut headers = good.clone();
+        headers.insert(header::ORIGIN, "http://127.0.0.1:9911".parse().unwrap());
+        assert!(!provisioning_allowed(&app, &headers));
+        assert!(app.db.nodes().unwrap().is_empty());
+        assert!(app.db.get("register_key").is_none());
+        headers = good;
+        headers.remove("x-forwarded-proto");
+        assert!(!provisioning_allowed(&no_site, &headers));
+        for site in [
+            "http://monitor.example.com",
+            "https://198.51.100.1",
+            "https://user@monitor.example.com",
+            "https://monitor.example.com/path",
+        ] {
+            assert!(https_domain(site).is_none());
+        }
     }
 
     /// The update button follows a manifest's `url` to build a download
@@ -1561,7 +1668,7 @@ mod tests {
         assert_eq!(added.billing_cycle, "monthly");
         assert_eq!(added.traffic_reset_day, 1);
 
-        let created = create_node(Admin, State(app.clone()), Ok(Json(added))).await;
+        let created = create_node(Admin, State(app.clone()), domain_headers(), Ok(Json(added))).await;
         assert_eq!(created.status(), StatusCode::OK);
         // Frames are cached for nearly two seconds, so without dropping the
         // cache the node just added blinks back out of the list.
@@ -1569,7 +1676,7 @@ mod tests {
 
         // A name of nothing but spaces is refused, and leaves no node behind.
         let blank = Json(serde_json::from_value::<Node>(json!({"name": "   "})).unwrap());
-        let refused = create_node(Admin, State(app.clone()), Ok(blank)).await;
+        let refused = create_node(Admin, State(app.clone()), domain_headers(), Ok(blank)).await;
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
         assert_eq!(app.db.nodes().unwrap().len(), 2);
     }
@@ -1580,7 +1687,7 @@ mod tests {
     async fn registration_only_works_inside_a_window_the_panel_opened() {
         let app = std::sync::Arc::new(app());
         let register = |key: Option<&str>, name: &str| {
-            let mut headers = HeaderMap::new();
+            let mut headers = domain_headers();
             if let Some(key) = key {
                 headers.insert("authorization", format!("Bearer {key}").parse().unwrap());
             }
@@ -1596,7 +1703,7 @@ mod tests {
         assert_eq!(register(Some("guess"), "a").await.status(), StatusCode::FORBIDDEN);
         assert!(app.db.nodes().unwrap().is_empty());
 
-        assert_eq!(open_register(Admin, State(app.clone())).await.status(), StatusCode::OK);
+        assert_eq!(open_register(Admin, State(app.clone()), domain_headers()).await.status(), StatusCode::OK);
         let key = app.db.get("register_key").unwrap();
         assert_eq!(register(Some("guess"), "a").await.status(), StatusCode::FORBIDDEN);
         assert_eq!(register(None, "a").await.status(), StatusCode::FORBIDDEN);
@@ -1621,7 +1728,7 @@ mod tests {
         assert_eq!(register(Some(&key), "b").await.status(), StatusCode::FORBIDDEN);
 
         // Reopened, then shut by hand: the key from the open window stops working.
-        open_register(Admin, State(app.clone())).await;
+        open_register(Admin, State(app.clone()), domain_headers()).await;
         let key = app.db.get("register_key").unwrap();
         assert_eq!(close_register(Admin, State(app.clone())).await.status(), StatusCode::NO_CONTENT);
         assert_eq!(register(Some(&key), "c").await.status(), StatusCode::FORBIDDEN);
@@ -1632,12 +1739,12 @@ mod tests {
     #[tokio::test]
     async fn one_window_stops_registering_at_the_limit() {
         let app = std::sync::Arc::new(app());
-        open_register(Admin, State(app.clone())).await;
+        open_register(Admin, State(app.clone()), domain_headers()).await;
         let key = app.db.get("register_key").unwrap();
         for i in 0..REGISTER_LIMIT {
             node(&app, &format!("n{i}"), true);
         }
-        let mut headers = HeaderMap::new();
+        let mut headers = domain_headers();
         headers.insert("authorization", format!("Bearer {key}").parse().unwrap());
         let refused = agent_register(
             State(app.clone()),
@@ -1702,7 +1809,7 @@ mod tests {
         let app = std::sync::Arc::new(app());
         app.db.set("register_key", "the-key").unwrap();
         app.db.set("register_until", &(Utc::now().timestamp() + 60).to_string()).unwrap();
-        let mut headers = HeaderMap::new();
+        let mut headers = domain_headers();
         headers.insert("authorization", "Bearer wrong".parse().unwrap());
         let peer: std::net::SocketAddr = "198.51.100.7:9000".parse().unwrap();
 
