@@ -1504,7 +1504,10 @@ mod tests {
         let now = Utc::now().timestamp();
         let sample = serde_json::json!({"cpu": 1.0, "mem_used": 1, "swap_used": 1, "disk_used": 1,
             "net_rx": 1, "net_tx": 1, "tcp": 1, "udp": 1, "procs": 1});
-        for i in 0..20_000 {
+        // Every row strictly before `now`: `prune(0)` cuts at its own
+        // `Utc::now()`, and `ts < cutoff` would spare a row stamped in the same
+        // second the pruning lands in.
+        for i in 1..=20_000 {
             db.insert_metric(id, now - i, &sample).unwrap();
         }
         let _ = db.conn().query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
