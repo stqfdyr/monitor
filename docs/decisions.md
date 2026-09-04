@@ -187,9 +187,11 @@ komari 对此零检查：`-e http://1.2.3.4:25774` 直接就用，明文传 toke
 `managed-by` 那条是实测踩出来的：开发机上正跑着一个手工部署的 hub（`--listen 127.0.0.1:25775`、
 `--site https://...`），脚本原本会把它的单元换成 `0.0.0.0:28080` 且无 TLS，`--purge` 还会删掉它的库。
 
-数据固定在 `/var/lib/monitor`，不提供 `--data`：`StateDirectory=` 已经把创建和归属都办了。
-`DynamicUser=` 下真实目录是 `/var/lib/private/monitor`，`/var/lib/monitor` 是 systemd 留的符号链接，
-所以 `--purge` 要删两个路径。
+全部落在 `/opt/monitor` 下（二进制在顶层，数据库和 `themes/` 在 `data/`），不提供 `--data`：
+备份和搬机器只认一个路径，也和容器里挂 `/data` 是同一套划分——komari 的 `/opt/komari` 同理。
+代价是不能再用 `StateDirectory=`+`DynamicUser=`（它每次启动自己挑 uid，固定目录会被回收的 uid
+锁死），所以脚本建一个 `monitor` 系统用户，单元里 `User=monitor` + `ReadWritePaths=/opt/monitor/data`
+——服务连自己的二进制都写不了。
 
 **否决**：菜单里问 `--site`（大多数人不需要，问了反而像必填）、`--data` 自定义数据目录、发布通道选择
 （只有 tag release，没有 snapshot）、装指定版本（要装旧版的人会自己 curl）。
@@ -197,19 +199,19 @@ komari 对此零检查：`-e http://1.2.3.4:25774` 直接就用，明文传 toke
 ### 自动注册在 `install.sh` 里做，不在 agent 里 **[用户]**
 
 面板开一个一小时的窗口，`install.sh --register KEY` 拿 key 换这台机器自己的 token，写进它本来
-就要写的 `/etc/monitor/agent.env`。**agent 一行代码没动。**
+就要写的 `/opt/monitor/agent.env`。**agent 一行代码没动。**
 
 **为什么不放 agent 里**：agent 有一条无状态铁律。komari 把 auto-discovery 放在 agent 启动路径
 上，代价就是换来的 token 得落盘（`auto-discovery.json`，`0644`——那台机器上任何用户都读得到）。
-放在安装脚本里，token 落在已经有的那个 `0700` 目录里，不需要第二个文件，也不需要 agent 记住
-任何东西。
+放在安装脚本里，token 落在它本来就要写的那个 `0600` 文件里，不需要第二个文件，也不需要 agent
+记住任何东西。
 
 和 komari 的 auto-discovery 逐项对比：
 
 | | komari | 这里 |
 |---|---|---|
 | 注册发起方 | agent 每次启动 | `install.sh` 安装时 |
-| token 落盘 | agent 目录 `auto-discovery.json`，`0644` | `/etc/monitor/agent.env`，`0700` 目录 |
+| token 落盘 | agent 目录 `auto-discovery.json`，`0644` | `/opt/monitor/agent.env`，`0600` root |
 | key 有效期 | 永久 | 一小时，面板可提前关 |
 | 单个 key 能建多少节点 | 无限 | 一个窗口 100 个 |
 | 重跑安装命令 | 读 json 复用 | 读 env 复用，同样不会重复添加 |

@@ -11,13 +11,17 @@ set -eu
 
 REPO="stqfdyr/monitor"
 SERVICE="monitor-hub"
-BIN="/usr/local/bin/monitor-hub"
 UNIT="/etc/systemd/system/monitor-hub.service"
-# StateDirectory= below puts the database here and hands it to the unit's
-# dynamic user, which is why nothing in this script ever chowns anything. Under
-# DynamicUser= systemd keeps the real directory at /var/lib/private/monitor and
-# leaves this path as a symlink into it for root.
-DATA="/var/lib/monitor"
+# Everything but the unit lives under one directory: the two binaries at the
+# top, and every byte the hub writes -- database and themes/ -- under data/.
+# One path to back up, one to move to another box, and the same split the
+# container image has, where data/ is what gets mounted at /data.
+ROOT="/opt/monitor"
+BIN="$ROOT/monitor-hub"
+DATA="$ROOT/data"
+# A fixed data directory needs a fixed owner: DynamicUser= picks its uid at
+# start, and a recycled one would leave the database unreadable.
+USER_NAME="monitor"
 # Stamped into the unit this script writes, and checked before it overwrites
 # one. A hub someone set up by hand is a different deployment: replacing its
 # unit would swap a loopback listener and a --site for 0.0.0.0 and no TLS,
@@ -127,10 +131,18 @@ install_hub() {
 		check_port "$PORT"
 	fi
 
+	id -u "$USER_NAME" >/dev/null 2>&1 ||
+		useradd --system --no-create-home --shell /usr/sbin/nologin "$USER_NAME" ||
+		die "无法创建系统用户 $USER_NAME"
+	install -d -m 0755 "$ROOT"
+	# 0700 owned by the service user, so the group it lands in is irrelevant
+	# and nothing here depends on useradd having made one.
+	install -d -m 0700 -o "$USER_NAME" "$DATA"
+
 	# A first run is what prints the one-time password, and only a missing
 	# database makes one. Checked before anything is installed.
 	first=""
-	[ -f "$DATA/monitor.db" ] || [ -f /var/lib/private/monitor/monitor.db ] || first=1
+	[ -f "$DATA/monitor.db" ] || first=1
 
 	# The tag comes out of GitHub's own redirect for "latest", so there is no
 	# API call to be rate-limited and no JSON to parse. Only the FIRST hop
@@ -149,7 +161,7 @@ install_hub() {
 	ok "下载" "$(du -h "$tmp/$asset" | cut -f1)"
 
 	# Verified against the release's own checksum file, so a truncated transfer
-	# or a swapped asset is caught before anything lands in /usr/local/bin.
+	# or a swapped asset is caught before anything lands in /opt/monitor.
 	curl -fsSL --max-time 30 "$base/sha256sums.txt" -o "$tmp/sums" ||
 		die "校验文件下载失败；这个版本可能早于 sha256sums.txt，请改用手动安装"
 	want="$(sed -n "s/^\([0-9a-f]\{64\}\)  *$asset\$/\1/p" "$tmp/sums")"
@@ -192,11 +204,11 @@ Type=simple
 ExecStart=$BIN $args
 Restart=always
 RestartSec=5
-# The database and the themes/ directory beside it live here. systemd creates
-# it and hands it to the dynamic user, so no chown is needed anywhere.
-StateDirectory=monitor
-WorkingDirectory=$DATA
-DynamicUser=yes
+# The database and the themes/ directory beside it live in data/, and that is
+# the only path this service may write to -- not even the binary above it.
+User=$USER_NAME
+WorkingDirectory=$ROOT
+ReadWritePaths=$DATA
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -263,17 +275,11 @@ UNIT
 # ---- uninstall ----
 uninstall_hub() {
 	if [ ! -f "$BIN" ] && [ ! -f "$UNIT" ]; then
-		# The data outlives the unit, so --purge still has a job here. The
-		# marker went with the unit, so ownership is inferred from the shape
-		# this script leaves: StateDirectory= under DynamicUser= puts the real
-		# directory in /var/lib/private and makes $DATA a symlink to it. A
-		# hand-rolled deployment has a real directory at $DATA and no twin,
-		# and that is someone else's database.
+		# The data outlives the unit, so --purge still has a job here.
 		if [ -n "$PURGE" ] && [ -e "$DATA" ]; then
-			[ -L "$DATA" ] && [ -d /var/lib/private/monitor ] ||
-				die "$DATA 不是这个脚本留下的形状，不敢删；请自己确认后手动删除"
 			confirm "服务已经卸载了。删除 $DATA 下的数据库？不可撤销" || return 0
-			rm -rf "$DATA" /var/lib/private/monitor
+			rm -rf "$DATA"
+			rmdir "$ROOT" 2>/dev/null || true
 			ok "数据" "已删除"
 			return 0
 		fi
@@ -296,9 +302,9 @@ uninstall_hub() {
 	systemctl daemon-reload
 	ok "服务" "已移除"
 	if [ -n "$PURGE" ]; then
-		# Both paths: $DATA is the symlink systemd leaves behind, and the real
-		# directory under DynamicUser= is the private one.
-		rm -rf "$DATA" /var/lib/private/monitor
+		rm -rf "$DATA"
+		# Only when the agent is not installed beside it.
+		rmdir "$ROOT" 2>/dev/null || true
 		ok "数据" "已删除"
 	else
 		field "数据" "保留在 $DATA，重新安装会直接接着用"
@@ -355,7 +361,7 @@ hub 只监听 127.0.0.1，公网访问不到，需要自己配 nginx / caddy / C
 
 重跑一次就是升级：校验通过后才替换二进制，起不来会自动回滚到上一版；
 没写的参数沿用上次的，所以升级不会把端口和 --site 冲掉。
-数据固定在 $DATA，卸载默认保留。
+二进制和数据都在 $ROOT 下（数据库和主题在 $DATA），卸载默认保留数据。
 
 已经有一个手工部署的 monitor-hub 时，这个脚本会拒绝动它——它写的服务单元带
 自己的标记，认不出标记就不覆盖，免得把你的监听地址和 --site 换成默认值。

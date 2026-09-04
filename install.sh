@@ -4,6 +4,11 @@
 #   curl -fsSL https://hub.example.com/install.sh | sh -s -- --server URL --register KEY [options]
 set -eu
 
+# Binary and token in one directory, the same one the hub uses, so a node has
+# a single path to look at and a single path to clean up.
+ROOT="/opt/monitor"
+BIN="$ROOT/monitor-agent"
+ENV_FILE="$ROOT/agent.env"
 SERVER=""
 TOKEN=""
 REGISTER=""
@@ -78,7 +83,7 @@ if [ -z "$TOKEN" ]; then
 	# Re-running the same command must not add a second node. This machine's
 	# token is already here, and it outlives the window that issued it, so the
 	# env file is the answer before the hub is asked.
-	TOKEN=$(sed -n 's/^MONITOR_TOKEN=//p' /etc/monitor/agent.env 2>/dev/null || true)
+	TOKEN=$(sed -n 's/^MONITOR_TOKEN=//p' "$ENV_FILE" 2>/dev/null || true)
 	if [ -n "$TOKEN" ]; then
 		echo "this machine is already registered; keeping its token"
 	fi
@@ -119,13 +124,14 @@ if [ "$INIT" = openrc ]; then
 else
 	systemctl stop monitor-agent 2>/dev/null || true
 fi
-install -m 0755 "$TMP" /usr/local/bin/monitor-agent
+install -d -m 0755 "$ROOT"
+install -m 0755 "$TMP" "$BIN"
 
 # The token lives in a root-only environment file rather than the unit, so it
-# stays out of `systemctl cat` and the world-readable journal.
-install -d -m 0700 /etc/monitor
+# stays out of `systemctl cat` and the world-readable journal. 0600 root is
+# what keeps it private -- $ROOT itself is readable, the binaries are in it.
 umask 077
-cat >/etc/monitor/agent.env <<ENV
+cat >"$ENV_FILE" <<ENV
 MONITOR_SERVER=$SERVER
 MONITOR_TOKEN=$TOKEN
 ENV
@@ -134,7 +140,7 @@ if [ "$INIT" = openrc ]; then
 	cat >/etc/init.d/monitor-agent <<RC
 #!/sbin/openrc-run
 description="monitor agent"
-command="/usr/local/bin/monitor-agent"
+command="$BIN"
 command_args="--interval $INTERVAL${INSECURE:+ --insecure}"
 supervisor="supervise-daemon"
 respawn_delay=5
@@ -148,7 +154,7 @@ depend() {
 # The token stays in the root-only env file instead of the service script.
 start_pre() {
 	set -a
-	. /etc/monitor/agent.env
+	. $ENV_FILE
 	set +a
 }
 RC
@@ -167,8 +173,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=/etc/monitor/agent.env
-ExecStart=/usr/local/bin/monitor-agent --interval $INTERVAL${INSECURE:+ --insecure}
+EnvironmentFile=$ENV_FILE
+ExecStart=$BIN --interval $INTERVAL${INSECURE:+ --insecure}
 Restart=always
 RestartSec=5
 DynamicUser=yes

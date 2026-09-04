@@ -131,7 +131,7 @@ hub 自己拉不到 release 时，在面板设置里填 `github_proxy`，它只�
 
 `install.sh` 认 systemd 和 OpenRC：前者写 unit（`DynamicUser` + `ProtectSystem` 等加固），
 后者写 `/etc/init.d/monitor-agent`，用 `supervise-daemon` 拿到等价的自动重启。两边 token 都只在
-root-only 的 `/etc/monitor/agent.env` 里。
+root-only 的 `/opt/monitor/agent.env` 里。
 
 **等价的只有自动重启。** OpenRC 那边的 agent 以 root 跑：`DynamicUser` 是 systemd 白送的降权，
 OpenRC 没有对应开关，要降权得自己建用户再指过去。agent 并不需要 root（只读 `/proc` 和 `/sys` 里

@@ -53,15 +53,28 @@ sudo sh install-hub.sh
 脚本最后会把 nginx / caddy / CF 隧道三种配法打出来。密码事后也能找回：
 `journalctl -u monitor-hub | grep Emergency`。
 
-脚本做的事：核对 release 的 `sha256sums.txt` 之后才把二进制放进 `/usr/local/bin`，写一个
-`DynamicUser=yes` 的 systemd 单元，数据固定在 `/var/lib/monitor`。**重跑一次就是升级**——校验通过才
-替换，起不来自动回滚到上一版，没写的参数沿用上次的。
+脚本做的事：核对 release 的 `sha256sums.txt` 之后才把二进制放进 `/opt/monitor`，建一个 `monitor`
+系统用户，写一个 systemd 单元。**重跑一次就是升级**——校验通过才替换，起不来自动回滚到上一版，
+没写的参数沿用上次的。
+
+除了 systemd 单元，其它都在一个目录下——备份和搬机器只认这一个路径，和容器里的 `/data` 是同一套
+划分：
+
+```
+/opt/monitor/
+├── monitor-hub          # hub 二进制
+├── monitor-agent        # 这台机器也装了 agent 的话
+├── agent.env            # agent 的 token，0600 root
+└── data/                # 服务唯一可写的目录，0700 monitor
+    ├── monitor.db
+    └── themes/          # 后台装的外部主题
+```
 
 | 参数 | 说明 |
 |---|---|
 | `--port <n>` | **本机**监听端口，默认 `28080` |
 | `--site <url>` | 一般不用填，见「反向代理」 |
-| `--uninstall` | 卸载，数据保留在 `/var/lib/monitor` |
+| `--uninstall` | 卸载，数据保留在 `/opt/monitor/data` |
 | `--purge` | 卸载并删除数据库 |
 
 ## 运行

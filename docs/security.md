@@ -121,7 +121,8 @@ unit 文件给的是 `MemoryMax=256M`：无闸门的 570 MB 是它的 2.2 倍，
 
 ### agent 侧
 
-安装脚本把 token 写进 `/etc/monitor/agent.env`，`0600` + `umask 077`，目录 `0700`。**不写在 systemd unit 里**——unit 内容会出现在 `systemctl cat` 和 journal 里。
+安装脚本把 token 写进 `/opt/monitor/agent.env`，`0600` + `umask 077`——`/opt/monitor` 本身是
+`0755`（二进制在里面），私密性全靠文件位。**不写在 systemd unit 里**——unit 内容会出现在 `systemctl cat` 和 journal 里。
 
 systemd 单元加固：`DynamicUser`、`NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome`、`PrivateTmp`、`PrivateDevices`、`RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK`、`MemoryMax=64M`。
 
