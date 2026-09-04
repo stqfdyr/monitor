@@ -7,10 +7,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use axum::extract::State;
-use axum::http::{header, StatusCode, Uri};
+use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::auth::random_token;
 use crate::{App, Shared};
@@ -35,24 +36,29 @@ pub struct Theme {
     pub selected: bool,
 }
 
-pub async fn serve(State(app): State<Shared>, uri: Uri) -> Response {
+pub async fn serve(State(app): State<Shared>, headers: HeaderMap, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
+    let known = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok());
     if is_api_path(path) {
         return (StatusCode::NOT_FOUND, format!("no such endpoint: /{path}")).into_response();
     }
 
     if path == "admin" || path.starts_with("admin/") {
         let path = path.strip_prefix("admin").unwrap_or(path).trim_start_matches('/');
-        return embedded::<AdminAssets>(path, "the panel is not built; run `npm run build` in web-admin/");
+        return embedded::<AdminAssets>(
+            path,
+            "the panel is not built; run `npm run build` in web-admin/",
+            known,
+        );
     }
 
     let theme = app.db.get("theme").unwrap_or_default();
     if let Some(root) = external_theme(&app.themes, &theme) {
-        if let Some(response) = disk(&root, path) {
+        if let Some(response) = disk(&root, path, known) {
             return response;
         }
     }
-    embedded::<DefaultThemeAssets>(path, "the default theme is missing; run scripts/theme.sh")
+    embedded::<DefaultThemeAssets>(path, "the default theme is missing; run scripts/theme.sh", known)
 }
 
 fn is_api_path(path: &str) -> bool {
@@ -68,37 +74,64 @@ fn is_asset(path: &str) -> bool {
     path.starts_with("assets/")
 }
 
-fn embedded<T: RustEmbed>(requested: &str, remedy: &str) -> Response {
+fn embedded<T: RustEmbed>(requested: &str, remedy: &str, known: Option<&str>) -> Response {
     let path = if requested.is_empty() { "index.html" } else { requested };
     if let Some(file) = T::get(path) {
-        return asset(path, file.data.into_owned());
+        return asset(path, file.data.into_owned(), known);
     }
     if is_asset(path) {
         return (StatusCode::NOT_FOUND, format!("no such asset: /{path}")).into_response();
     }
     match T::get("index.html") {
-        Some(index) => asset("index.html", index.data.into_owned()),
+        Some(index) => asset("index.html", index.data.into_owned(), known),
         None => (StatusCode::NOT_FOUND, remedy.to_owned()).into_response(),
     }
 }
 
-fn disk(root: &Path, requested: &str) -> Option<Response> {
+fn disk(root: &Path, requested: &str, known: Option<&str>) -> Option<Response> {
     let path = if requested.is_empty() { "index.html" } else { requested };
     if let Some(data) = read_inside(root, path) {
-        return Some(asset(path, data));
+        return Some(asset(path, data, known));
     }
     // None, not a 404: an external theme without the file leaves the answer to
     // the built-in one, which refuses it there.
     if is_asset(path) {
         return None;
     }
-    read_inside(root, "index.html").map(|data| asset("index.html", data))
+    read_inside(root, "index.html").map(|data| asset("index.html", data, known))
 }
 
-fn asset(path: &str, data: Vec<u8>) -> Response {
+/// One file, with the caching the two kinds of path earn.
+///
+/// Hashed names under `assets/` are immutable for a year: the browser never
+/// comes back to ask, so an ETag there would be a hash computed for nobody.
+///
+/// Everything else is the SPA shell, and it is `no-cache` -- revalidate every
+/// time -- because its bytes change under the same URL: a new hub build, or
+/// the public page being switched to another theme. Without a validator that
+/// means re-sending the whole shell on every request, which is what a CDN in
+/// front is then tempted to paper over with a timed `s-maxage`, and a timed
+/// window is exactly what makes a theme switch take a minute to show up. With
+/// one, the revalidation costs a 304 and the switch lands on the next request.
+fn asset(path: &str, data: Vec<u8>, known: Option<&str>) -> Response {
     let mime = mime_guess::from_path(path).first_or_octet_stream();
-    let cache = if is_asset(path) { "public, max-age=31536000, immutable" } else { "no-cache" };
-    ([(header::CONTENT_TYPE, mime.as_ref()), (header::CACHE_CONTROL, cache)], data).into_response()
+    if is_asset(path) {
+        let cache = "public, max-age=31536000, immutable";
+        return ([(header::CONTENT_TYPE, mime.as_ref()), (header::CACHE_CONTROL, cache)], data)
+            .into_response();
+    }
+    // Half a SHA-256 of the body. Strong, because it is the body: two shells
+    // that hash the same are the same shell.
+    let etag = format!("\"{}\"", &hex::encode(Sha256::digest(&data))[..32]);
+    let headers = [
+        (header::CONTENT_TYPE, mime.as_ref()),
+        (header::CACHE_CONTROL, "no-cache"),
+        (header::ETAG, etag.as_str()),
+    ];
+    if known == Some(etag.as_str()) {
+        return (StatusCode::NOT_MODIFIED, headers).into_response();
+    }
+    (headers, data).into_response()
 }
 
 /// Reads only regular files whose canonical path remains below `root`.
@@ -477,6 +510,35 @@ mod tests {
         assert!(remove(&base, "default").is_err() && remove(&base, "../etc").is_err());
 
         fs::remove_dir_all(base).unwrap();
+    }
+
+    /// The shell changes under a fixed URL -- a new build, or the public page
+    /// switched to another theme -- so it revalidates. The validator is what
+    /// keeps that from costing the whole file, and what makes a switch land on
+    /// the next request instead of when a proxy's timer runs out.
+    #[test]
+    fn the_spa_shell_revalidates_by_etag_and_a_hashed_asset_carries_none() {
+        let etag = |r: &Response| r.headers().get(header::ETAG).map(|v| v.to_str().unwrap().to_owned());
+
+        let first = asset("index.html", b"<html>default</html>".to_vec(), None);
+        assert_eq!(first.status(), StatusCode::OK);
+        let tag = etag(&first).expect("the shell must carry a validator");
+
+        // Same shell, and the browser says which one it holds: nothing to send.
+        let again = asset("index.html", b"<html>default</html>".to_vec(), Some(&tag));
+        assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+
+        // Switched theme: same URL, same request header, different bytes -- so
+        // the tag moved with them and the answer is the new shell.
+        let switched = asset("index.html", b"<html>demo</html>".to_vec(), Some(&tag));
+        assert_eq!(switched.status(), StatusCode::OK);
+        assert_ne!(etag(&switched), Some(tag));
+
+        // A hashed name is immutable for a year: the browser never comes back
+        // to ask, so hashing it would be work done for nobody.
+        let hashed = asset("assets/index-CSjcYfL9.js", b"console.log(1)".to_vec(), None);
+        assert_eq!(hashed.status(), StatusCode::OK);
+        assert_eq!(etag(&hashed), None);
     }
 
     /// The two guards on a theme name, which the settings page runs together:

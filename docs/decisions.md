@@ -861,6 +861,41 @@ secret、argon2 哈希，本来就必须当机密对待；节点 token 不比它
 komari 的主题市场就是这么干的）；实时预览模式 `/?theme=xxx`（主题用绝对路径 `/assets/...` 构建，
 index.html 换了资源还走当前主题，页面直接混搭坏掉，除非改主题契约的根）。
 
+### SPA 外壳带 ETag，指纹资源不带 **[用户]**
+
+`serve` 发两类东西，缓存策略正好相反。
+
+`assets/` 下的文件名自带内容哈希，所以是 `max-age=31536000, immutable`——浏览器一年不回来问，
+给它算 ETag 是为没有人服务。
+
+其余都是 SPA 外壳：几百字节的 HTML，加主题包自带的 `favicon.svg`。它们的 URL 固定而字节会变
+（换主题、升级 hub），所以是 `no-cache`，每次校验。
+
+**但 `no-cache` 缺了验证器就等于每次全量重传。** 这不是理论上的浪费，它会逼着前面的代理补一层。
+本机的 nginx 就补过：
+
+```nginx
+proxy_hide_header Cache-Control;
+add_header Cache-Control "public, max-age=0, must-revalidate, s-maxage=60" always;
+```
+
+它的注释很老实——「hub 不带 ETag/Last-Modified，所以 no-cache 等于每次全量回源」。**而时间窗看
+不见「内容变了」这件事**：在后台把公开页切回默认主题，它还是显示上一个主题，要等边缘那 60 秒过完。
+看着像缓存 bug，根因是 hub 少发了一个头。README 推荐的反代配置是裸 `proxy_pass`，任何人把 hub 放
+到 CDN 后面都会走一遍同样的推理，得出同样的 `s-maxage`，然后撞上同样的延迟。
+
+ETag 取内容 SHA-256 的前一半。**强** ETag，因为它就是内容：两份外壳哈希相同就是同一份外壳。切主题
+→ 字节变 → ETag 变 → 边缘当场失效，下一个请求拿到的就是新主题；没变则回 304，几十字节。加上它
+之后 nginx 那三行可以删掉，透传 `no-cache` 即可（实测 `cf-cache-status` 从 `HIT` 变成
+`REVALIDATED`）。
+
+**不用 Last-Modified**：内嵌主题走 rust-embed，没有可信的 mtime；而二进制的构建时间不随主题切换
+变——那恰恰是唯一需要它变的时刻。
+
+**否决**：给 `assets/` 也算 ETag（`immutable` 已经让浏览器一年不回源，哈希是白算的）；弱 ETag
+（`W/` 允许「语义等价」的差异，而外壳没有这种东西）；把外壳改成 `no-store`（连校验都不许，比现状
+更费）。
+
 ### shadcn/ui **[用户]**
 
 `web-admin/src/components/ui/` 和主题的 `src/components/ui/` 是 CLI 生成的组件，**不要手改**——
