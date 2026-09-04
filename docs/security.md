@@ -190,13 +190,36 @@ SQLite 建文件只认 umask，默认的 022 是所有人可读。然后**打开
 - page size 必须和当前库一致——WAL 模式下在线备份 API 不接受页大小变化，这条是把
   `SQLITE_READONLY` 换成一句人话
 
-上传边收边写进库文件旁的临时文件，`create_new` + `0600`，最大 `api::MAX_RESTORE`（256 MiB），
-无论成败都删——连同 SQLite 可能在它旁边建的 `-wal`/`-shm`。校验和覆盖都在 `spawn_blocking` 里：
-`integrity_check` 要读完整个文件，256 MiB 的上传不该占着 runtime 线程。**它是全站唯一把调用方的字节写进磁盘的路径**，所以字节数在 handler 里自己数一遍，
-不只靠那一层 `RequestBodyLimitLayer`。
+上传分片写进库文件旁的临时文件（`0600`），整份最大 `api::MAX_RESTORE`（256 MiB），无论成败都删
+——连同 SQLite 可能在它旁边建的 `-wal`/`-shm`。校验和覆盖都在 `spawn_blocking` 里：`integrity_check`
+要读完整个文件，256 MiB 的上传不该占着 runtime 线程。
 
-**反代的上限在 hub 的上限之前生效**：nginx 默认 `client_max_body_size 1m`，Cloudflare 免费版是
-100 MB。备份比它大的时候，413 来自反代，hub 这边一行日志都没有——见 README 的反向代理一节。
+**这和主题上传是全站仅有的两条把调用方的字节写进磁盘的路径**，所以三层上界各自独立成立，不靠上一层
+兜底：单请求由 `RequestBodyLimitLayer(MAX_CHUNK)` 卡在 8 MiB；整份由 `total` 在**第一个请求**就卡
+（超限连第一个字节都不会发出来）；handler 里再自己数一遍收到的字节，写超 `total` 当场中止并把文件
+截回片首。分片本身把单次请求的落盘上界从 256 MiB 降到了 8 MiB。
+
+**反代的上限在 hub 的上限之前生效**：nginx 默认 `client_max_body_size 1m` 连一片都放不过去，要改成
+`8m`。这个数只跟分片大小有关，不随数据库增长（Cloudflare 免费版那 100 MB 因此也不再是天花板）。
+被反代拒掉时 413 来自反代，hub 这边一行日志都没有，所以面板收到 413 会直接把 `client_max_body_size`
+念出来——见 README 的反向代理一节。
+
+### 上传的主题是在访客浏览器里运行的第三方代码
+
+主题上传（`POST /api/themes`）要 `Admin`，但装进去的 JS/CSS 会在**公开状态页**上对每个访客执行，
+和 hub 同源。这不是上传引入的新信任边界——把目录复制进 `<themes>/` 一直是同样的效果——但入口从
+「能 ssh 到机器」降到了「有面板密码」，所以面板上那句「只装你信得过的来源」是这条路的全部防线。
+
+装之前对压缩包本身的检查（逐条目类型、路径、条目数、单文件与解压总量，见
+[decisions.md](decisions.md#主题可以从面板上传格式是-themetargz-用户)）挡的是**写到目录外**和
+**撑爆磁盘**，不体检里面的 JS——那件事没法自动做。
+
+三个上界：整包 `api::MAX_THEME`（32 MiB）、解压总量 64 MiB、单文件 8 MiB。解压总量必须和上传上限
+分开，gz 的压缩比没有上界。
+
+预览图（`GET /api/themes/{short}/preview`）同样要 `Admin`，读的是写死的 `preview.png`——**文件名是
+常量而不是 manifest 里的字段，所以没有第二处路径要防**。大小在这里重新拦一次（8 MiB），因为直接
+复制进 `<themes>/` 的主题没经过解压那道闸。
 
 ### 恢复之后
 

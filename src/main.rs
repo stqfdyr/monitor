@@ -310,24 +310,27 @@ async fn main() -> Result<()> {
         .route("/api/ping-tasks/{id}", delete(api::delete_ping_task))
         .route("/api/settings", get(api::settings).put(api::save_settings))
         .route("/api/themes", get(api::themes))
+        .route("/api/themes/{short}", delete(api::delete_theme))
+        .route("/api/themes/{short}/preview", get(api::theme_preview))
         .route("/api/db", get(api::db_stats))
         .route("/api/db/backup", get(api::db_backup))
         .route("/api/db/vacuum", post(api::db_vacuum))
         .fallback(frontend::serve)
         // A report is a few hundred bytes; anything larger is not one.
         .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
-        // Merged in after that layer rather than under it: a restored backup
-        // is megabytes, and two nested limits are the smaller of the two.
-        // It carries its own ceiling, and it is behind `Admin`.
-        .merge(Router::new().route(
-            "/api/db/restore",
-            post(api::db_restore).layer(tower_http::limit::RequestBodyLimitLayer::new(api::MAX_RESTORE)),
-        ))
-        // A day of one node's chart is 236 kB of JSON against 30 kB gzipped,
-        // and the theme's bundle is much the same shape. Not on a 101: both
-        // sockets upgrade through one, and a body encoder has no business
-        // wrapping a connection about to stop being HTTP. The default predicate
-        // skips images, SSE and anything under 32 bytes.
+        // The two chunked uploads, merged in after that layer rather than
+        // under it. What they raise is the ceiling on a single request -- one
+        // 4 MiB piece -- not on the file behind it: a 256 MiB backup arrives
+        // through 64 of these, so no reverse proxy has to know how big the
+        // database is. The whole-file ceilings live on `total` instead, and
+        // are checked before the first byte is sent.
+        .merge(
+            Router::new()
+                .route("/api/db/restore", post(api::db_restore))
+                .route("/api/themes", post(api::upload_theme))
+                .layer(tower_http::limit::RequestBodyLimitLayer::new(api::MAX_CHUNK))
+                .with_state(app.clone()),
+        )
         .layer(tower_http::compression::CompressionLayer::new().compress_when(
             tower_http::compression::predicate::DefaultPredicate::new().and(
                 |status: StatusCode, _: Version, _: &HeaderMap, _: &Extensions| {

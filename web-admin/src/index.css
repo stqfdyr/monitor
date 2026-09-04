@@ -107,6 +107,11 @@
      whose content clears the fold widens the page as you leave it. */
   html { scrollbar-gutter: stable; }
   body { @apply bg-background text-foreground; }
+  /* Tailwind v4 leaves `button` and `input` on the browser's default cursor
+     (v3 made buttons a pointer). Radix renders Switch as a button, so without
+     this a clickable row loses its pointer exactly where the control is. The
+     component's own `disabled:cursor-not-allowed` is more specific and wins. */
+  [data-slot="switch"], input[type="checkbox"] { cursor: pointer; }
 }
 
 /* Tabular figures keep live numbers from twitching as they update. */

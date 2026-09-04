@@ -474,12 +474,117 @@ const READABLE_SETTINGS: &[&str] = &[
 
 // ---- the database itself ----
 
-/// The ceiling on an uploaded backup, and the reason `/api/db/restore` sits
-/// outside the router's 64 KiB body limit: a real backup is megabytes. It is
-/// still bounded -- the bytes land in a file next to the database before
-/// anything looks at them, and an admin session is not a licence to fill the
-/// disk.
-pub const MAX_RESTORE: usize = 256 * 1024 * 1024;
+/// The largest single request the two upload routes accept, and the reason
+/// they sit outside the router's 64 KiB body limit. It is twice the 4 MiB the
+/// panel sends, so the chunk size stays the panel's business alone and needs
+/// no handshake to agree on.
+///
+/// **This, not the two ceilings below, is what a reverse proxy has to pass.**
+/// A backup of any size arrives 4 MiB at a time, so `client_max_body_size` no
+/// longer tracks the size of the database.
+pub const MAX_CHUNK: usize = 8 * 1024 * 1024;
+
+/// Whole-file ceilings, one per route, checked against the declared `total` on
+/// the first request rather than by counting bytes as they arrive -- an
+/// oversized upload is refused before a byte of it is sent.
+///
+/// The backup ceiling is where it is because restoring holds the connection
+/// the agents write through: at the measured ~40 MB/s that is about 6.5
+/// seconds of blocked reporting, and the reachable database sizes for a few
+/// hundred nodes sit two orders of magnitude below it.
+pub const MAX_RESTORE: u64 = 256 * 1024 * 1024;
+pub const MAX_THEME: u64 = 32 * 1024 * 1024;
+
+/// One request of an upload: `total` is the whole file, `offset` where this
+/// piece belongs in it.
+///
+/// There is no upload id, no session and no server-side bookkeeping: the state
+/// of an upload *is* the length of the file on disk. A piece continues one only
+/// if it starts exactly where the last left off, `offset = 0` truncates
+/// whatever an interrupted attempt left behind, and so nothing is ever left to
+/// collect.
+#[derive(Deserialize)]
+pub struct Chunk {
+    offset: u64,
+    total: u64,
+}
+
+/// Appends one piece to `path`, answering with the file's length afterwards;
+/// the caller compares that against `total` to know whether it is done.
+///
+/// A piece lands whole or not at all -- a failure truncates back to where it
+/// started -- so retrying one always lines up on the same offset.
+///
+/// ponytail: strictly sequential, one round trip per chunk. Concurrent pieces
+/// would need pwrite, a commit step and a hash to prove there are no holes,
+/// and would buy about a second on a 6.7 MB backup.
+async fn receive(path: &str, chunk: &Chunk, max: u64, body: axum::body::Body) -> Result<u64, anyhow::Error> {
+    if chunk.total == 0 || chunk.total > max {
+        anyhow::bail!("文件必须在 1 字节到 {} MiB 之间", max / 1024 / 1024);
+    }
+    if chunk.offset > chunk.total {
+        anyhow::bail!("分片位置越过了文件末尾");
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    // Only the first piece may create the file, and it truncates: whatever an
+    // interrupted upload left behind is overwritten rather than collected.
+    if chunk.offset == 0 {
+        options.write(true).create(true).truncate(true);
+    } else {
+        options.append(true);
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!("这次上传已经不在了，请从头开始")
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let already = file.metadata()?.len();
+    if already != chunk.offset {
+        anyhow::bail!("分片接不上：已经收到 {already} 字节，这一片却从 {} 开始", chunk.offset);
+    }
+
+    match append(&mut file, chunk, body).await {
+        Ok(received) => Ok(chunk.offset + received),
+        Err(e) => {
+            // Undo a half-written piece so retrying it lines up again.
+            let _ = file.set_len(chunk.offset);
+            Err(e)
+        }
+    }
+}
+
+/// Streams one request body onto the end of `file`. The byte count is checked
+/// here as well as by the route's body limit: these are the only paths on the
+/// hub that write a caller's bytes to disk, so they do not lean on a layer
+/// someone could reorder away.
+async fn append(
+    file: &mut std::fs::File,
+    chunk: &Chunk,
+    body: axum::body::Body,
+) -> Result<u64, anyhow::Error> {
+    use std::io::Write;
+    use std::pin::Pin;
+
+    let mut stream = body.into_data_stream();
+    let mut received = 0u64;
+    while let Some(piece) =
+        std::future::poll_fn(|cx| futures_core::Stream::poll_next(Pin::new(&mut stream), cx)).await
+    {
+        let piece = piece?;
+        received += piece.len() as u64;
+        if chunk.offset + received > chunk.total {
+            anyhow::bail!("这一片超出了声明的文件大小");
+        }
+        file.write_all(&piece)?;
+    }
+    Ok(received)
+}
 
 /// A scratch file beside the database, so the copy lands on the same
 /// filesystem the database itself has room on. The random half keeps two
@@ -535,21 +640,35 @@ pub async fn db_backup(_: Admin, State(app): State<Shared>) -> Response {
     }
 }
 
-/// Replaces the live database with an uploaded backup.
+/// Replaces the live database with an uploaded backup, one chunk per request.
 ///
-/// The upload is streamed to disk and checked as a whole before a single page
-/// of it is copied: see `Db::check_backup`. Afterwards every session in the
-/// restored file is dropped and the caller is handed a new one -- a backup
-/// carries the session rows it had when it was taken, and restoring one is no
-/// reason to bring logged-out sessions back to life.
+/// The upload streams to a file beside the database and is checked as a whole
+/// before a single page of it is copied: see `Db::check_backup`. Afterwards
+/// every session in the restored file is dropped and the caller is handed a
+/// new one -- a backup carries the session rows it had when it was taken, and
+/// restoring one is no reason to bring logged-out sessions back to life.
 pub async fn db_restore(
     _: Admin,
     State(app): State<Shared>,
+    Query(chunk): Query<Chunk>,
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> Response {
-    let path = scratch_path(&app, "restore");
-    let outcome = restore(&app, &path, body).await;
+    // One fixed path, which is what lets the file's own length be the entire
+    // protocol. Two admins uploading at once collide on the offset check
+    // instead of interleaving into one file.
+    // ponytail: one upload in flight per hub. A second slot would need ids and
+    // a way to expire them, for a button one person presses once a year.
+    let path = format!("{}.upload", app.db.file());
+    let received = match receive(&path, &chunk, MAX_RESTORE, body).await {
+        Ok(received) => received,
+        Err(e) => return bad(&format!("{e:#}")),
+    };
+    if received < chunk.total {
+        return Json(json!({"received": received})).into_response();
+    }
+
+    let outcome = restore(&app, &path).await;
     // SQLite writes a -wal and a -shm beside any file it opens in WAL mode,
     // and a plain copy of a running hub's database is exactly that. They go
     // when the connection closes cleanly; these three lines are what covers
@@ -575,46 +694,16 @@ pub async fn db_restore(
     }
 }
 
-async fn restore(app: &Shared, path: &str, body: axum::body::Body) -> Result<(), anyhow::Error> {
-    receive(path, body).await?;
-    // Both halves read the whole file: `PRAGMA integrity_check` on a 256 MiB
-    // upload is not runtime work either, and the copy that follows holds the
-    // connection the agents write through.
+async fn restore(app: &Shared, path: &str) -> Result<(), anyhow::Error> {
+    // Both halves read the whole file, off the runtime: `PRAGMA
+    // integrity_check` on a 256 MiB upload is not runtime work either, and the
+    // copy that follows holds the connection the agents write through.
     let (app, source) = (app.clone(), path.to_owned());
     tokio::task::spawn_blocking(move || {
         app.db.check_backup(&source)?;
         app.db.restore_from(&source)
     })
     .await?
-}
-
-/// Streams the request body into `path`, which is created owner-only and must
-/// not exist. The byte count is checked here as well as by the route's body
-/// limit: this is the only path on the hub that writes a caller's bytes to
-/// disk, so it does not lean on a layer someone could reorder away.
-async fn receive(path: &str, body: axum::body::Body) -> Result<(), anyhow::Error> {
-    use std::io::Write;
-    use std::pin::Pin;
-
-    let mut file = std::fs::OpenOptions::new();
-    file.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
-    let mut file = file.open(path)?;
-
-    let mut stream = body.into_data_stream();
-    let mut written = 0usize;
-    while let Some(chunk) =
-        std::future::poll_fn(|cx| futures_core::Stream::poll_next(Pin::new(&mut stream), cx)).await
-    {
-        let chunk = chunk?;
-        written += chunk.len();
-        if written > MAX_RESTORE {
-            anyhow::bail!("the upload is larger than {} MiB", MAX_RESTORE / 1024 / 1024);
-        }
-        file.write_all(&chunk)?;
-    }
-    Ok(())
 }
 
 /// Drops history past the retention window and rebuilds the file around what
@@ -633,6 +722,67 @@ pub async fn db_vacuum(_: Admin, State(app): State<Shared>) -> Response {
     match done.map_err(|e| anyhow::anyhow!(e)).and_then(|r| r) {
         Ok(result) => Json(result).into_response(),
         Err(e) => fail(e),
+    }
+}
+
+/// Installs an uploaded theme archive, one chunk per request.
+///
+/// The archive lands in the themes directory under a name `valid_short`
+/// rejects, so a partial upload is invisible to both the theme list and the
+/// public page. Installing it is `frontend::install`, which unpacks to a
+/// staging directory and publishes with a rename -- the switch to a new theme
+/// is atomic, and there is no moment where the page is served out of a
+/// half-written directory.
+pub async fn upload_theme(
+    _: Admin,
+    State(app): State<Shared>,
+    Query(chunk): Query<Chunk>,
+    body: axum::body::Body,
+) -> Response {
+    let path = app.themes.join(".upload.tar.gz");
+    let name = path.to_string_lossy().into_owned();
+    let received = match receive(&name, &chunk, MAX_THEME, body).await {
+        Ok(received) => received,
+        Err(e) => return bad(&format!("{e:#}")),
+    };
+    if received < chunk.total {
+        return Json(json!({"received": received})).into_response();
+    }
+
+    // Off the runtime: gunzip plus a few thousand small writes.
+    let installed = {
+        let (app, path) = (app.clone(), path.clone());
+        tokio::task::spawn_blocking(move || crate::frontend::install(&app.themes, &path)).await
+    };
+    let _ = std::fs::remove_file(&path);
+    match installed.map_err(|e| anyhow::anyhow!(e)).and_then(|r| r) {
+        Ok(theme) => Json(json!({"theme": theme})).into_response(),
+        Err(e) => bad(&format!("{e:#}")),
+    }
+}
+
+/// The thumbnail the theme list shows, when the theme ships one. A theme
+/// without it answers 404, which is what the panel hides the image on -- so
+/// nothing has to report whether a preview exists.
+pub async fn theme_preview(_: Admin, State(app): State<Shared>, Path(short): Path<String>) -> Response {
+    match crate::frontend::preview(&app.themes, &short) {
+        // Not cached: reinstalling a theme under the same name replaces the
+        // image too, and this is a panel-only request on a local file.
+        Some(png) => {
+            ([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "no-cache")], png).into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// Deletes an installed theme. Deleting the one in use is allowed: the public
+/// page falls back to the built-in theme from the next request on, which is
+/// the same path a broken theme already takes, and leaving the setting alone
+/// means reinstalling the theme picks it up again.
+pub async fn delete_theme(_: Admin, State(app): State<Shared>, Path(short): Path<String>) -> Response {
+    match crate::frontend::remove(&app.themes, &short) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => bad(&format!("{e:#}")),
     }
 }
 
@@ -720,6 +870,37 @@ mod tests {
 
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
+    }
+
+    /// The whole chunked-upload protocol: an upload is only ever as long as
+    /// what has landed, so a piece continues it, restarts it, or is refused.
+    #[tokio::test]
+    async fn a_chunk_continues_an_upload_only_where_the_last_one_ended() {
+        let path = std::env::temp_dir().join(format!("monitor-chunk-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let piece = |offset, total| Chunk { offset, total };
+        let body = |bytes: &'static [u8]| axum::body::Body::from(bytes);
+
+        // Two pieces in order, and the length answers where the next one goes.
+        assert_eq!(receive(path, &piece(0, 6), 1024, body(b"abc")).await.unwrap(), 3);
+        assert_eq!(receive(path, &piece(3, 6), 1024, body(b"def")).await.unwrap(), 6);
+        assert_eq!(std::fs::read(path).unwrap(), b"abcdef");
+
+        // A gap, a rewind and an overshoot are all the same refusal.
+        assert!(receive(path, &piece(9, 12), 1024, body(b"xyz")).await.is_err());
+        assert!(receive(path, &piece(3, 12), 1024, body(b"xyz")).await.is_err());
+        assert!(receive(path, &piece(6, 7), 1024, body(b"toolong")).await.is_err());
+        // ...and none of them moved the file, so the upload can carry on.
+        assert_eq!(std::fs::metadata(path).unwrap().len(), 6);
+
+        // The ceiling is checked against the declared total, before any bytes.
+        assert!(receive(path, &piece(0, 4096), 1024, body(b"a")).await.is_err());
+        assert!(receive(path, &piece(0, 0), 1024, body(b"")).await.is_err());
+
+        // Starting over truncates whatever an interrupted attempt left.
+        assert_eq!(receive(path, &piece(0, 2), 1024, body(b"hi")).await.unwrap(), 2);
+        assert_eq!(std::fs::read(path).unwrap(), b"hi");
+        std::fs::remove_file(path).unwrap();
     }
 
     /// A connected agent holding one report. The receiver comes back because

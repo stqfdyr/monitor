@@ -158,9 +158,9 @@ server {
     location / {
         proxy_pass http://127.0.0.1:28080;
         proxy_http_version 1.1;
-        # nginx 默认只收 1 MB 请求体，导入备份会被反代自己 413 掉。
-        # 只有 /api/db/restore 需要它，其余路径 hub 自己卡在 64 KiB。
-        client_max_body_size 256m;
+        # 导入备份和上传主题是分片传的，单片 4 MiB，所以这个数只跟分片
+        # 大小有关，跟数据库多大无关。其余路径 hub 自己卡在 64 KiB。
+        client_max_body_size 8m;
         proxy_set_header Host              $host;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
@@ -187,15 +187,16 @@ ingress:
 
 **在边缘做了路径白名单的话，升级 hub 时记得同步**：新版本加的路由会被上一版的名单挡在外面，
 而且 403 来自边缘，hub 侧一行日志都没有。面板用到的全部路径见
-[docs/architecture.md](docs/architecture.md) 的路由表；这一版新增的是 `/api/db`、`/api/db/backup`、
-`/api/db/restore`、`/api/db/vacuum`。
+[docs/architecture.md](docs/architecture.md) 的路由表；这一版新增的是 `POST /api/themes`（上传主题）
+和 `DELETE /api/themes/{short}`。
 
 ### 几条通用注意
 
 - 转发 `Upgrade` / `Connection` 头，关闭缓冲，读写超时远大于 60 秒，否则节点会周期性掉线
-- **请求体上限要大于备份文件**：nginx 默认 `client_max_body_size 1m`，导入备份会被反代自己 413 掉
-  （caddy 默认不限）。hub 侧的硬上限是 256 MiB。套 Cloudflare 的话免费版还有 100 MB 的上传上限，
-  那是这条路的真正天花板
+- **请求体上限只需要 8 MiB**：导入备份和上传主题都是分片传的（单片 4 MiB，hub 侧单请求硬上限
+  8 MiB），所以这个数不随数据库增长——256 MiB 的备份也是 64 个 4 MiB 的请求。nginx 默认
+  `client_max_body_size 1m` 仍然拦得住一片，要改成 `8m`（caddy 默认不限）；Cloudflare 免费版
+  100 MB 的上传上限则不再是天花板，单个请求离它差一个数量级
 - 放行 `POST` / `PUT` / `DELETE`
 - 透传 `X-Forwarded-Proto`，否则会话 cookie 拿不到 `Secure`
 - 透传 `X-Forwarded-For`，否则登录限流会按代理地址计数

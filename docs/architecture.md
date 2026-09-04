@@ -148,21 +148,44 @@ OpenRC 没有对应开关，要降权得自己建用户再指过去。agent 并�
 **登录**：`POST /api/auth/login`、`POST /api/auth/logout`、`GET /api/auth/github`、`GET /api/auth/github/callback`
 
 **面板**（全部要 `Admin` 提取器）：
-`POST /api/nodes`、`PUT /api/nodes/order`、`PUT|DELETE /api/nodes/{id}`、`POST /api/nodes/{id}/token`、`PUT /api/nodes/{id}/traffic`、`GET|POST /api/ping-tasks`、`DELETE /api/ping-tasks/{id}`、`GET|PUT /api/settings`、`GET /api/themes`、`GET /api/db`、`GET /api/db/backup`、`POST /api/db/restore`、`POST /api/db/vacuum`
+`POST /api/nodes`、`PUT /api/nodes/order`、`PUT|DELETE /api/nodes/{id}`、`POST /api/nodes/{id}/token`、`PUT /api/nodes/{id}/traffic`、`GET|POST /api/ping-tasks`、`DELETE /api/ping-tasks/{id}`、`GET|PUT /api/settings`、`GET|POST /api/themes`、`DELETE /api/themes/{short}`、`GET /api/themes/{short}/preview`、`GET /api/db`、`GET /api/db/backup`、`POST /api/db/restore`、`POST /api/db/vacuum`
 
-**数据库那四个各是一次整文件操作**，都在 `tokio::task::spawn_blocking` 里跑，因为它们持有 agent
-上报用的那条连接：
+**数据库那四个各是一次整文件操作**，都在 `tokio::task::spawn_blocking` 里跑。持有 agent 上报那条
+连接的只有恢复和回收；导出走的是自己开的第二条连接，WAL 让它和写入并行（见
+[decisions.md](decisions.md#导出不占上报那把锁-用户)）：
 
 | 路径 | 做什么 | SQLite 侧 |
 |---|---|---|
 | `GET /api/db` | 文件大小、WAL 大小、可回收字节、各表行数 | `page_size` × `freelist_count` 与 `COUNT(*)` |
-| `GET /api/db/backup` | 下载整库副本 | `VACUUM INTO`，副本落在库文件旁边，打开后立刻 unlink，随响应消失 |
-| `POST /api/db/restore` | 用上传的备份覆盖当前库 | 先整份校验，再走在线备份 API 逐页覆盖 |
+| `GET /api/db/backup` | 下载整库副本 | `VACUUM INTO`，第二条连接，不占上报的锁；副本落在库文件旁边，打开后立刻 unlink，随响应消失 |
+| `POST /api/db/restore` | 用上传的备份覆盖当前库 | 分片收齐后先整份校验，再走在线备份 API 逐页覆盖 |
 | `POST /api/db/vacuum` | 清过期明细并把空页还给磁盘 | `prune` + `VACUUM` + `wal_checkpoint(TRUNCATE)` |
 
-`/api/db/restore` 是**唯一不在 64 KiB 请求体上限里**的路径（备份是几 MB 到几百 MB），它自带
-`api::MAX_RESTORE = 256 MiB`，在 `main.rs` 里以 `merge` 挂在全局那层 limit 之外——两层 limit 嵌套
-取的是小的那个。上传边收边落盘，不进内存。
+## 分片上传
+
+`POST /api/db/restore` 和 `POST /api/themes` 是**仅有的两条不在 64 KiB 请求体上限里**的路径，在
+`main.rs` 里以 `merge` 挂在全局那层 limit 之外，各自带 `api::MAX_CHUNK = 8 MiB`——两层 limit 嵌套
+取的是小的那个。协议只有一行：
+
+```text
+POST /api/db/restore?offset=<已经收到多少>&total=<整个文件多大>   body = 原始字节
+POST /api/themes?offset=<...>&total=<...>                      body = 原始字节
+```
+
+**没有 upload id，没有会话，没有要回收的东西**：一次上传的状态就是那个临时文件的长度。`offset`
+必须正好等于文件当前长度，否则 400；`offset = 0` 直接截断，于是上一次中断留下的残骸被下一次覆盖，
+这就是全部的垃圾回收。收满 `total` 的那一个请求顺手把事做完（校验+恢复，或解压+安装），返回最终
+结果；没收满的返回 `{"received": <长度>}`。一片要么整片落地要么回滚到片首，所以重传永远接得上。
+
+三个上限各管一层，不要混：
+
+| 数 | 常量 | 管什么 |
+|---|---|---|
+| 4 MiB | 面板里的 `CHUNK` | 前端切多大。服务端不参与，改它不用动 hub |
+| 8 MiB | `api::MAX_CHUNK` | 单个请求的硬上限，**也是反代 `client_max_body_size` 要放行的数** |
+| 256 MiB / 32 MiB | `api::MAX_RESTORE` / `MAX_THEME` | 整个文件，按路由分开；校验 `total`，第一个请求就拒 |
+
+备份多大都不影响反代那一个数：256 MiB 的备份是 64 个 4 MiB 的请求。上传边收边落盘，不进内存。
 
 其余路径按下面顺序处理：
 

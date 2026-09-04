@@ -999,7 +999,16 @@ impl Db {
     /// runtime -- every other statement here is sub-millisecond, this one is
     /// not.
     pub fn backup_into(&self, dest: &str) -> Result<()> {
-        self.conn().execute("VACUUM INTO ?1", [dest])?;
+        // A second connection to the same file. `VACUUM INTO` only reads, and
+        // WAL lets it read a consistent snapshot while the agents keep writing
+        // through the first one -- exporting is the one heavy operation here
+        // that does not have to stop them, and it is the one people press.
+        // A fresh connection inherits none of the PRAGMAs in SCHEMA, so the
+        // busy timeout has to be set again or a checkpoint racing this read
+        // returns SQLITE_BUSY immediately.
+        let reader = Connection::open(self.file())?;
+        reader.busy_timeout(std::time::Duration::from_secs(5))?;
+        reader.execute("VACUUM INTO ?1", [dest])?;
         // The copy is the credential store in one portable file: node tokens
         // in the clear, the GitHub secret, the password hash. SQLite creates
         // it under the umask, which on the usual 022 is world-readable.

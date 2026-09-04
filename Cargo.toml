@@ -26,6 +26,10 @@ rust-embed = "8"
 mime_guess = "2"
 tokio-util = { version = "0.7", features = ["io"] }
 tower-http = { version = "0.6", features = ["limit", "compression-gzip"] }
+# Theme archives. Both are pure Rust: the release binary is built with `cross`
+# and the image is FROM scratch, so a C dependency or a shelled-out tar is out.
+tar = { version = "0.4", default-features = false }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
 serde_urlencoded = "0.7"

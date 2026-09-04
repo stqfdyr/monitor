@@ -12,7 +12,7 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { api, type Node, type PingTask } from "@/lib/api"
+import { api, upload, type Node, type PingTask } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, monthUsage, uptime } from "@/lib/format"
 
 const GIB = 1024 ** 3
@@ -842,10 +842,13 @@ type Theme = {
 
 function Themes() {
   const [themes, setThemes] = useState<Theme[] | null>(null)
+  const [busy, setBusy] = useState("")
+  const [doomed, setDoomed] = useState<Theme | null>(null)
+  const picker = useRef<HTMLInputElement>(null)
 
-  useEffect(() => {
+  const load = () =>
     api<{ themes: Theme[] }>("/themes").then((data) => setThemes(data.themes)).catch(() => setThemes([]))
-  }, [])
+  useEffect(() => { load() }, [])
 
   async function select(short: string) {
     try {
@@ -857,30 +860,122 @@ function Themes() {
     }
   }
 
+  async function install(file: File) {
+    setBusy("upload")
+    try {
+      const { theme } = await upload<{ theme: Theme }>("/themes", file)
+      // The hub reads a theme off disk on every request, so it is already
+      // live -- reloading the list is only so this page catches up.
+      toast.success(`已安装 ${theme.name} ${theme.version}`)
+      load()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setBusy("")
+    }
+  }
+
+  async function remove(theme: Theme) {
+    setBusy("delete")
+    try {
+      await api(`/themes/${theme.short}`, { method: "DELETE" })
+      toast.success(`已删除 ${theme.name}`)
+      load()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setBusy("")
+      setDoomed(null)
+    }
+  }
+
   if (!themes) return null
   return (
-    <div className="grid gap-3 sm:grid-cols-2">
-      {themes.map((theme) => (
-        <Card key={theme.short} className="gap-4 p-5">
-          <div className="flex items-start gap-3">
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2">
-                <h3 className="font-medium">{theme.name}</h3>
-                {theme.selected && <Badge>当前</Badge>}
-              </div>
-              <p className="mt-1 text-sm text-muted-foreground">{theme.description}</p>
-            </div>
-            <Button size="sm" variant={theme.selected ? "secondary" : "default"} disabled={theme.selected} onClick={() => select(theme.short)}>
-              {theme.selected ? "使用中" : "使用"}
-            </Button>
-          </div>
-          <p className="text-xs text-muted-foreground">
-            {theme.author} · {theme.version}
-            {theme.url && <> · <a className="hover:underline" href={theme.url} target="_blank" rel="noreferrer">源码</a></>}
+    <div className="space-y-4">
+      <Card className="gap-4 p-5">
+        <div>
+          <h3 className="text-sm font-medium">安装主题</h3>
+          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+            选主题作者发布的 <code>theme.tar.gz</code>（里面是 <code>dist/</code> 和 <code>theme.json</code>）。
+            装好立刻可选，不用重启 hub；同名主题会被整体替换。
+            <br />
+            主题是在访客浏览器里运行的第三方代码，只装你信得过的来源。
           </p>
-        </Card>
-      ))}
-      {themes.length === 0 && <p className="text-sm text-muted-foreground">没有可用主题</p>}
+        </div>
+        <div>
+          <Button size="sm" disabled={!!busy} onClick={() => picker.current?.click()}>
+            <Upload /> {busy === "upload" ? "安装中…" : "上传主题包"}
+          </Button>
+          <input
+            ref={picker}
+            type="file"
+            accept=".gz,.tgz,application/gzip"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0]
+              e.target.value = ""
+              if (file) install(file)
+            }}
+          />
+        </div>
+      </Card>
+
+      {/* items-start：有预览图和没有的卡片不该为了等高而留白 */}
+      <div className="grid items-start gap-3 sm:grid-cols-2">
+        {themes.map((theme) => (
+          <Card key={theme.short} className="gap-4 p-5">
+            {/* 主题包里可选的 preview.png。没有就是 404，图自己藏起来，
+                所以后端不用告诉前端有没有这张图。 */}
+            <img
+              src={`/api/themes/${theme.short}/preview`}
+              alt=""
+              className="aspect-video w-full rounded-md border object-cover object-top"
+              onError={(e) => { e.currentTarget.remove() }}
+            />
+            <div className="flex items-start gap-3">
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <h3 className="font-medium">{theme.name}</h3>
+                  {theme.selected && <Badge>当前</Badge>}
+                </div>
+                <p className="mt-1 text-sm text-muted-foreground">{theme.description}</p>
+              </div>
+              <div className="flex shrink-0 items-center gap-1">
+                <Button size="sm" variant={theme.selected ? "secondary" : "default"} disabled={theme.selected} onClick={() => select(theme.short)}>
+                  {theme.selected ? "使用中" : "使用"}
+                </Button>
+                {/* The built-in theme is served from the binary and has no
+                    directory to delete -- it is also the fallback everything
+                    else lands on. */}
+                {theme.short !== "default" && (
+                  <Button size="icon" variant="ghost" disabled={!!busy} onClick={() => setDoomed(theme)}>
+                    <Trash2 />
+                  </Button>
+                )}
+              </div>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {theme.author} · {theme.version}
+              {theme.url && <> · <a className="hover:underline" href={theme.url} target="_blank" rel="noreferrer">源码</a></>}
+            </p>
+          </Card>
+        ))}
+      </div>
+
+      {doomed && (
+        <ConfirmDialog
+          title={`删除 ${doomed.name}？`}
+          description={
+            doomed.selected
+              ? "这是当前使用的主题，删除后公开页会回到内置的默认主题。"
+              : "主题目录会从磁盘上删掉，重新上传主题包可以装回来。"
+          }
+          confirmLabel="删除"
+          busy={!!busy}
+          onClose={() => setDoomed(null)}
+          onConfirm={() => remove(doomed)}
+        />
+      )}
     </div>
   )
 }
@@ -913,7 +1008,6 @@ function SettingsTab() {
   return (
     <div className="space-y-4">
       <Card className="gap-4 p-5">
-        <h3 className="text-sm font-medium">站点</h3>
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label="站点名称">
             <Input value={String(s.site_name ?? "")} onChange={(e) => set("site_name", e.target.value)} placeholder="Monitor" />
@@ -934,13 +1028,16 @@ function SettingsTab() {
             />
           </Field>
         </div>
-        <label className="flex cursor-pointer items-center gap-2 text-sm">
+        {/* 不是 <label>：点文字不该切换开关，只有开关自己可点。
+            aria-labelledby 保住读屏软件那边的关联。 */}
+        <div className="flex items-center gap-2 text-sm">
           <Switch
+            aria-labelledby="public-page-label"
             checked={s.public_page !== "off"}
             onCheckedChange={(v) => set("public_page", v ? "on" : "off")}
           />
-          开放公开状态页，关闭后所有页面需登录
-        </label>
+          <span id="public-page-label">开放公开状态页，关闭后所有页面需登录</span>
+        </div>
         <div>
           <Button
             size="sm"
@@ -1060,6 +1157,7 @@ function Data() {
   const [busy, setBusy] = useState("")
   const [confirm, setConfirm] = useState<"vacuum" | null>(null)
   const [pending, setPending] = useState<File | null>(null)
+  const [sent, setSent] = useState(0)
   const picker = useRef<HTMLInputElement>(null)
 
   const load = () => api<DbInfo>("/db").then(setInfo).catch((e: Error) => toast.error(e.message))
@@ -1081,12 +1179,9 @@ function Data() {
 
   async function restore(file: File) {
     setBusy("restore")
+    setSent(0)
     try {
-      await api("/db/restore", {
-        method: "POST",
-        body: file,
-        headers: { "content-type": "application/octet-stream" },
-      })
+      await upload("/db/restore", file, setSent)
       toast.success("已恢复，正在重新加载")
       // Every node, setting and session on the page came from the database
       // that was just replaced.
@@ -1184,7 +1279,7 @@ function Data() {
         <ConfirmDialog
           title="用备份覆盖当前数据？"
           description={`将用 ${pending.name}（${bytes(pending.size)}）整体替换当前数据库。当前的节点、设置和历史全部丢失，且无法撤销。`}
-          confirmLabel="确认恢复"
+          confirmLabel={busy === "restore" ? `已上传 ${bytes(sent)} / ${bytes(pending.size)}` : "确认恢复"}
           busy={!!busy}
           onClose={() => setPending(null)}
           onConfirm={() => restore(pending)}

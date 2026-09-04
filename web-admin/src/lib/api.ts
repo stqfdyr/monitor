@@ -81,6 +81,47 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 /**
+ * 4 MiB. The only number a reverse proxy has to pass, whatever the file behind
+ * it weighs -- the hub accepts up to 8 MiB per request, so this can move
+ * without touching the server or agreeing on it first.
+ */
+const CHUNK = 4 * 1024 * 1024
+
+/**
+ * Uploads a file one chunk at a time. There is no upload id: the hub tracks an
+ * upload by the length of what it has already written, so a chunk simply says
+ * where it starts. The last one carries the answer.
+ */
+export async function upload<T>(
+  path: string,
+  file: File,
+  onProgress?: (sent: number) => void,
+): Promise<T> {
+  if (file.size === 0) throw new ApiError(400, "文件是空的")
+  let last: Response | null = null
+  for (let offset = 0; offset < file.size; offset += CHUNK) {
+    const res = await fetch(`/api${path}?offset=${offset}&total=${file.size}`, {
+      method: "POST",
+      headers: { "content-type": "application/octet-stream" },
+      body: file.slice(offset, offset + CHUNK),
+    })
+    if (!res.ok) {
+      // A 413 never reached the hub -- the proxy in front of it answered, and
+      // its own logs are the only place that shows up. Name the setting.
+      throw new ApiError(
+        res.status,
+        res.status === 413
+          ? "反向代理拒收了 4 MiB 的分片，把 nginx 的 client_max_body_size 调到 8m"
+          : (await res.text()) || res.statusText,
+      )
+    }
+    last = res
+    onProgress?.(Math.min(offset + CHUNK, file.size))
+  }
+  return last!.json()
+}
+
+/**
  * Live node list. Uses the WebSocket the hub pushes every two seconds and
  * falls back to polling if it cannot be established.
  */

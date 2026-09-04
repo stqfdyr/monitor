@@ -108,10 +108,14 @@ cd web-admin && npm run dev
 ```text
 /tmp/themes/<short>/theme.json
 /tmp/themes/<short>/dist/index.html
+/tmp/themes/<short>/preview.png     # 可选，后台主题卡片上的缩略图
 ```
 
 目录名必须等于 `theme.json` 的 `short`；短名只允许字母、数字、`-`、`_`。完整接口契约见默认主题
 仓库的 README。
+
+本地开发就用上面这个形状直接复制，改一次看一次；发布给别人装的时候打成
+`tar czf theme.tar.gz dist theme.json preview.png`，对方在后台「主题」页上传即可。
 
 登录后建一个节点，拿到 token，在 [agent 仓库](https://github.com/stqfdyr/agent) 里跑一个指向本机
 hub 的 agent：
@@ -154,12 +158,28 @@ df -B1 --output=size,used / | tail -1
 # 5. 累计流量跨 hub 重启不回退（见 traffic.md 的完整步骤）
 
 # 6. 备份能导出，也能原样恢复（C 是 cookie jar）
+#    上传是分片的：?offset= 必须等于服务端已经收到的字节数，收满 total 的那一片返回最终结果
 curl -s -b $C -o /tmp/b.db $H/api/db/backup && file /tmp/b.db        # SQLite 3.x database
-curl -s -o /dev/null -w "%{http_code}\n" $H/api/db/backup            # 401，四条 /api/db/* 都是
+curl -s -o /dev/null -w "%{http_code}\n" $H/api/db/backup            # 401，五条 /api/db/* 都是
+S=$(stat -c%s /tmp/b.db)
+curl -s -b $C -c $C -X POST --data-binary @/tmp/b.db \
+     "$H/api/db/restore?offset=0&total=$S"                           # {"ok":true} + 新 cookie
 head -c 200000 /dev/urandom > /tmp/junk
-curl -s -b $C -X POST --data-binary @/tmp/junk $H/api/db/restore     # 400 而不是 413：
-                                                                     # 这条路不在 64 KiB 上限里
-curl -s -b $C -X POST --data-binary @/tmp/b.db $H/api/db/restore     # {"ok":true} + 新 cookie
+curl -s -b $C -X POST --data-binary @/tmp/junk \
+     "$H/api/db/restore?offset=0&total=200000"                       # 400，不是这个 hub 的备份
+curl -s -b $C -X POST --data-binary @/tmp/junk \
+     "$H/api/db/restore?offset=99&total=200000"                      # 400，分片接不上
+head -c 9000000 /dev/zero | curl -s -o /dev/null -w "%{http_code}\n" -b $C -X POST \
+     --data-binary @- "$H/api/db/restore?offset=0&total=9000000"     # 413，单请求超 8 MiB
+
+# 7. 主题能上传、当场生效、能删（拿主题仓库发布的 theme.tar.gz，或者把 target/theme/ 打一个）
+S=$(stat -c%s /tmp/t.tar.gz)
+curl -s -b $C -X POST --data-binary @/tmp/t.tar.gz "$H/api/themes?offset=0&total=$S"
+curl -s -b $C $H/api/themes                                          # 列表里多一个
+curl -s -b $C -X PUT -d '{"theme":"<short>"}' -H 'content-type: application/json' $H/api/settings
+curl -s $H/ | head -c 200                                            # 公开页已经是新主题，hub 没重启
+command ls -1a /tmp/themes                                           # 只有正式目录，无 .staging-*
+curl -s -b $C -X DELETE $H/api/themes/<short>                        # 204，公开页回落内置主题
 ```
 
 ## 截图检查前端
