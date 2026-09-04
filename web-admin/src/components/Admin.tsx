@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { CalendarClock, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
+import { CalendarClock, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -844,6 +844,7 @@ function Themes() {
   const [themes, setThemes] = useState<Theme[] | null>(null)
   const [busy, setBusy] = useState("")
   const [doomed, setDoomed] = useState<Theme | null>(null)
+  const [zoomed, setZoomed] = useState<Theme | null>(null)
   const picker = useRef<HTMLInputElement>(null)
 
   const load = () =>
@@ -875,6 +876,27 @@ function Themes() {
     }
   }
 
+  // Only a theme whose manifest points at a GitHub repository has somewhere
+  // to update from; the hub refuses anything else, this just hides the button.
+  const updatable = (theme: Theme) =>
+    theme.short !== "default" && theme.url.startsWith("https://github.com/")
+
+  async function update(theme: Theme) {
+    setBusy(`update:${theme.short}`)
+    try {
+      const { updated, version } = await api<{ updated: boolean; version: string }>(
+        `/themes/${theme.short}/update`,
+        { method: "POST" },
+      )
+      toast.success(updated ? `${theme.name} 已更新到 ${version}` : `${theme.name} 已是最新版本 ${version}`)
+      if (updated) load()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setBusy("")
+    }
+  }
+
   async function remove(theme: Theme) {
     setBusy("delete")
     try {
@@ -897,6 +919,9 @@ function Themes() {
           <h3 className="text-sm font-medium">安装主题</h3>
           <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
             上传主题作者发布的 <code>theme.tar.gz</code>，同名主题整体替换。
+            <br />
+            主题的 <code>url</code> 指向 GitHub 仓库时，卡片上的 <RefreshCw className="inline size-3" /> 从它最新的
+            release 取 <code>theme.tar.gz</code>，版本没变就不下载。
             <br />
             主题代码在访客浏览器中执行，请只安装可信来源。
           </p>
@@ -924,15 +949,26 @@ function Themes() {
         {themes.map((theme) => (
           <Card key={theme.short} className="gap-4 p-5">
             {/* 主题包里可选的 preview.png，所以后端不用告诉前端有没有这张图：
-                没有就是 404，图一直不显示。必须从 hidden 开始——带边框的
-                aspect-video 空盒子会在响应回来之前就画出来，闪一下再消失。 */}
-            <img
-              src={`/api/themes/${theme.short}/preview`}
-              alt=""
+                没有就是 404，图一直不显示。hidden 挂在 <a> 上而不是 <img> 上——
+                隐藏的是整个链接，否则卡片里留着一个高度为 0 却照样吃 gap-4 的空
+                链接。必须从 hidden 开始：带边框的 aspect-video 空盒子会在响应回
+                来之前就画出来，闪一下再消失。
+                缩略图被压到卡片那点宽度，比例不是 16:9 的还会被 object-cover
+                裁掉边，所以图本身要能点开看原尺寸——就地开一个对话框，不跳走。 */}
+            <button
+              type="button"
+              title="查看完整预览图"
               hidden
-              onLoad={(e) => { e.currentTarget.hidden = false }}
-              className="aspect-video w-full rounded-md border object-cover object-top"
-            />
+              className="cursor-zoom-in"
+              onClick={() => setZoomed(theme)}
+            >
+              <img
+                src={`/api/themes/${theme.short}/preview`}
+                alt={`${theme.name} 预览图`}
+                onLoad={(e) => { e.currentTarget.parentElement!.hidden = false }}
+                className="aspect-video w-full rounded-md border object-cover object-top"
+              />
+            </button>
             <div className="flex items-start gap-3">
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
@@ -945,6 +981,17 @@ function Themes() {
                 <Button size="sm" variant={theme.selected ? "secondary" : "default"} disabled={theme.selected} onClick={() => select(theme.short)}>
                   {theme.selected ? "使用中" : "使用"}
                 </Button>
+                {updatable(theme) && (
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    title="从 GitHub 更新"
+                    disabled={!!busy}
+                    onClick={() => update(theme)}
+                  >
+                    <RefreshCw className={busy === `update:${theme.short}` ? "animate-spin" : ""} />
+                  </Button>
+                )}
                 {/* The built-in theme is served from the binary and has no
                     directory to delete -- it is also the fallback everything
                     else lands on. */}
@@ -962,6 +1009,24 @@ function Themes() {
           </Card>
         ))}
       </div>
+
+      {/* 原图，不是卡片上那张裁过的：宽度给到 4xl，高度让 80vh 兜住，
+          object-contain 保证整张都在框里而不是被切一刀。 */}
+      {zoomed && (
+        <Dialog open onOpenChange={(open) => !open && setZoomed(null)}>
+          <DialogContent className="sm:max-w-4xl">
+            <DialogHeader>
+              <DialogTitle>{zoomed.name} 预览图</DialogTitle>
+              <DialogDescription>{zoomed.author} · {zoomed.version}</DialogDescription>
+            </DialogHeader>
+            <img
+              src={`/api/themes/${zoomed.short}/preview`}
+              alt={`${zoomed.name} 预览图`}
+              className="max-h-[80vh] w-full rounded-md border object-contain"
+            />
+          </DialogContent>
+        </Dialog>
+      )}
 
       {doomed && (
         <ConfirmDialog

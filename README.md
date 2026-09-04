@@ -217,6 +217,9 @@ ingress:
 主题目录复制到 `--themes` 指向的位置后，在后台「主题」页切换，无需重启。选中的主题缺失或损坏时回落到内置默认主题。主题包格式见
 [monitor-theme-default](https://github.com/stqfdyr/monitor-theme-default)。
 
+主题的 `theme.json` 里 `url` 指向 GitHub 仓库时，卡片上的 ⟳ 从该仓库最新的 release 取 `theme.tar.gz`
+装上；tag 和已装版本相同就不下载。走「设置」里的 GitHub 代理。
+
 ## 安全
 
 - 节点 token 只在登录后的面板视图里出现，公开页拿不到；可随时换发，换发即踢掉旧 agent

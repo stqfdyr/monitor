@@ -754,13 +754,146 @@ pub async fn upload_theme(
     // Off the runtime: gunzip plus a few thousand small writes.
     let installed = {
         let (app, path) = (app.clone(), path.clone());
-        tokio::task::spawn_blocking(move || crate::frontend::install(&app.themes, &path)).await
+        tokio::task::spawn_blocking(move || {
+            crate::frontend::install(&app.themes, std::fs::File::open(&path)?, None)
+        })
+        .await
     };
     let _ = std::fs::remove_file(&path);
     match installed.map_err(|e| anyhow::anyhow!(e)).and_then(|r| r) {
         Ok(theme) => Json(json!({"theme": theme})).into_response(),
         Err(e) => bad(&format!("{e:#}")),
     }
+}
+
+/// The asset a theme repository publishes, and the only name the hub fetches:
+/// the same `theme.tar.gz` the upload button takes.
+const ARCHIVE: &str = "theme.tar.gz";
+
+#[derive(Deserialize)]
+struct Release {
+    tag_name: String,
+    #[serde(default)]
+    assets: Vec<Asset>,
+}
+
+#[derive(Deserialize)]
+struct Asset {
+    name: String,
+}
+
+/// The `<owner>/<repo>` a theme's `url` names, when it names a GitHub
+/// repository at all.
+///
+/// A whitelist, not a filter. Every address the update path fetches is built
+/// out of these two strings, so nothing a manifest says can send the hub at a
+/// host it did not choose -- which is why there is no private-address check to
+/// get wrong here. The one host that is not github.com is the GitHub proxy in
+/// the panel's own settings, which the operator set and the agent relay
+/// already fetches through.
+fn github_repo(url: &str) -> Option<(&str, &str)> {
+    let (owner, rest) = url.strip_prefix("https://github.com/")?.split_once('/')?;
+    // A link to a branch or a file is still a link to the repository.
+    let repo = rest.split('/').next()?;
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    (path_segment(owner) && path_segment(repo)).then_some((owner, repo))
+}
+
+/// One URL path segment the hub is willing to build a github.com address out
+/// of: nothing that opens a new segment, and nothing that climbs out of this
+/// one.
+fn path_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && segment.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+}
+
+/// Reinstalls one theme from the latest GitHub release of the repository its
+/// own manifest points at.
+///
+/// The manifest supplies `<owner>/<repo>` and nothing else: the release is read
+/// from api.github.com and the archive from github.com, both at addresses the
+/// hub builds itself, so there is never a URL out of the theme to follow. The
+/// installed version is compared against the release tag first, which is what
+/// most presses do -- and only that -- so this is also the "check for updates"
+/// button.
+pub async fn update_theme(_: Admin, State(app): State<Shared>, Path(short): Path<String>) -> Response {
+    match update(&app, &short).await {
+        Ok((updated, version)) => Json(json!({"updated": updated, "version": version})).into_response(),
+        Err(e) => bad(&format!("{e:#}")),
+    }
+}
+
+async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error> {
+    use anyhow::{bail, Context};
+
+    let installed = crate::frontend::themes(app)?
+        .into_iter()
+        .find(|theme| theme.short == short)
+        .context("没有这个主题")?;
+    if short == "default" {
+        bail!("内置主题跟着 hub 一起升级，不单独更新");
+    }
+    let (owner, repo) = github_repo(&installed.url)
+        .context("这个主题的 url 不是 https://github.com/<owner>/<repo>，只能手动上传新包")?;
+
+    // Unauthenticated: 60 requests an hour from this address, for a button
+    // nobody holds down. GitHub answers 403 without a User-Agent.
+    let release: Release = app
+        .http
+        .get(format!("https://api.github.com/repos/{owner}/{repo}/releases/latest"))
+        .header(header::USER_AGENT, "monitor-hub")
+        .send()
+        .await?
+        .error_for_status()
+        .with_context(|| format!("读不到 {owner}/{repo} 的最新 release"))?
+        .json()
+        .await?;
+
+    // Tags read `v1.2.3`, manifests carry `1.2.3`. Equal means up to date;
+    // anything else is installed, a deliberate downgrade included -- the author
+    // moved the release, and this button follows the author.
+    let tag = &release.tag_name;
+    if tag.strip_prefix('v').unwrap_or(tag) == installed.version {
+        return Ok((false, installed.version));
+    }
+    if !path_segment(tag) {
+        bail!("release 的 tag {tag:?} 不能出现在下载地址里");
+    }
+    // Checked here rather than by downloading and reading a 404: the asset name
+    // is the contract, and saying so is the whole error message.
+    if !release.assets.iter().any(|asset| asset.name == ARCHIVE) {
+        bail!("release {tag} 里没有 {ARCHIVE}");
+    }
+
+    // Through the panel's GitHub proxy when it has one -- the archive is the
+    // part a blocked network cannot reach. The API call above is not proxied:
+    // most proxies only front releases, and a hub that cannot read the tag
+    // still has the upload button.
+    let url =
+        crate::proxied(app, format!("https://github.com/{owner}/{repo}/releases/download/{tag}/{ARCHIVE}"));
+    let response =
+        app.http.get(url).timeout(std::time::Duration::from_secs(120)).send().await?.error_for_status()?;
+    // The transfer stops at Content-Length, so checking it is checking the
+    // body: a header that understates the archive cannot make it arrive
+    // larger. GitHub always sends one; a proxy that drops it is refused rather
+    // than read unbounded.
+    match response.content_length() {
+        Some(size) if size <= MAX_THEME => {}
+        Some(size) => bail!("主题包 {} MiB，超过 {} MiB 的上限", size / 1024 / 1024, MAX_THEME / 1024 / 1024),
+        None => bail!("下载没有给出大小，无法确认它在 {} MiB 以内", MAX_THEME / 1024 / 1024),
+    }
+    let archive = response.bytes().await?;
+
+    // Same unpacking, checks and atomic replace an upload goes through, told
+    // which theme it is allowed to land on.
+    let (themes, short) = (app.themes.clone(), short.to_owned());
+    let theme = tokio::task::spawn_blocking(move || {
+        crate::frontend::install(&themes, std::io::Cursor::new(archive), Some(&short))
+    })
+    .await??;
+    Ok((true, theme.version))
 }
 
 /// The thumbnail the theme list shows, when the theme ships one. A theme
@@ -904,6 +1037,44 @@ mod tests {
 
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
+    }
+
+    /// The update button follows a manifest's `url` to build a download
+    /// address, so what counts as a GitHub repository is the whole of the
+    /// trust boundary: whatever this accepts, the hub will fetch.
+    #[test]
+    fn only_a_github_repository_url_can_name_a_release_to_download() {
+        assert_eq!(github_repo("https://github.com/stqfdyr/monitor"), Some(("stqfdyr", "monitor")));
+        // A link to the repository, however the author wrote it down.
+        assert_eq!(github_repo("https://github.com/a/b.git"), Some(("a", "b")));
+        assert_eq!(github_repo("https://github.com/a/b/tree/main"), Some(("a", "b")));
+        assert_eq!(github_repo("https://github.com/a/b/"), Some(("a", "b")));
+
+        for hostile in [
+            "",
+            // Not github.com, however much of it is in the string.
+            "http://github.com/a/b",
+            "https://github.com.evil.test/a/b",
+            "https://github.com@evil.test/a/b",
+            "https://evil.test/https://github.com/a/b",
+            // On github.com, but not naming a repository to fetch from.
+            "https://github.com/a",
+            "https://github.com//b",
+            "https://github.com/../../etc/passwd",
+            "https://github.com/a/..",
+            // Anything that could open a segment of its own in the URL built
+            // out of it -- encoded, queried or fragmented.
+            "https://github.com/a/b%2f..%2fc",
+            "https://github.com/a/b?x=1",
+            "https://github.com/a b",
+        ] {
+            assert_eq!(github_repo(hostile), None, "{hostile} must not name a download");
+        }
+
+        // The release tag lands in that URL too, and arrives from the API
+        // rather than from the manifest.
+        assert!(path_segment("v0.1.15") && path_segment("2024.1"));
+        assert!(!path_segment("release/1.0") && !path_segment("..") && !path_segment(""));
     }
 
     /// The whole chunked-upload protocol: an upload is only ever as long as

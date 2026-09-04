@@ -122,12 +122,21 @@ async fn install_script() -> Response {
 /// pointing that path somewhere new. It stays inside the bounds `agent_binary`
 /// already holds: four at a time, a 120-second timeout, and a streamed body.
 fn release_url(app: &App, arch: &str) -> String {
-    let direct = format!(
-        "https://github.com/{AGENT_REPO}/releases/latest/download/monitor-agent-{arch}-unknown-linux-musl"
-    );
+    proxied(
+        app,
+        format!(
+            "https://github.com/{AGENT_REPO}/releases/latest/download/monitor-agent-{arch}-unknown-linux-musl"
+        ),
+    )
+}
+
+/// Puts the panel's GitHub proxy in front of a github.com URL, when one is set.
+/// Shared by the agent relay and the theme updater: a hub that cannot reach
+/// github.com for one cannot reach it for the other.
+pub fn proxied(app: &App, url: String) -> String {
     match app.db.get("github_proxy").filter(|v| !v.trim().is_empty()) {
-        Some(proxy) => format!("{}/{direct}", proxy.trim().trim_end_matches('/')),
-        None => direct,
+        Some(proxy) => format!("{}/{url}", proxy.trim().trim_end_matches('/')),
+        None => url,
     }
 }
 
@@ -314,6 +323,7 @@ async fn main() -> Result<()> {
         .route("/api/themes", get(api::themes))
         .route("/api/themes/{short}", delete(api::delete_theme))
         .route("/api/themes/{short}/preview", get(api::theme_preview))
+        .route("/api/themes/{short}/update", post(api::update_theme))
         .route("/api/db", get(api::db_stats))
         .route("/api/db/backup", get(api::db_backup))
         .route("/api/db/vacuum", post(api::db_vacuum))

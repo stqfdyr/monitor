@@ -148,7 +148,7 @@ OpenRC 没有对应开关，要降权得自己建用户再指过去。agent 并�
 **登录**：`POST /api/auth/login`、`POST /api/auth/logout`、`GET /api/auth/github`、`GET /api/auth/github/callback`
 
 **面板**（全部要 `Admin` 提取器）：
-`POST /api/nodes`、`PUT /api/nodes/order`、`PUT|DELETE /api/nodes/{id}`、`POST /api/nodes/{id}/token`、`PUT /api/nodes/{id}/traffic`、`GET|POST /api/ping-tasks`、`DELETE /api/ping-tasks/{id}`、`GET|PUT /api/settings`、`GET|POST /api/themes`、`DELETE /api/themes/{short}`、`GET /api/themes/{short}/preview`、`GET /api/db`、`GET /api/db/backup`、`POST /api/db/restore`、`POST /api/db/vacuum`
+`POST /api/nodes`、`PUT /api/nodes/order`、`PUT|DELETE /api/nodes/{id}`、`POST /api/nodes/{id}/token`、`PUT /api/nodes/{id}/traffic`、`GET|POST /api/ping-tasks`、`DELETE /api/ping-tasks/{id}`、`GET|PUT /api/settings`、`GET|POST /api/themes`、`DELETE /api/themes/{short}`、`GET /api/themes/{short}/preview`、`POST /api/themes/{short}/update`、`GET /api/db`、`GET /api/db/backup`、`POST /api/db/restore`、`POST /api/db/vacuum`
 
 **数据库那四个各是一次整文件操作**，都在 `tokio::task::spawn_blocking` 里跑。持有 agent 上报那条
 连接的只有恢复和回收；导出走的是自己开的第二条连接，WAL 让它和写入并行（见

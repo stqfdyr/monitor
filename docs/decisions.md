@@ -782,8 +782,59 @@ secret、argon2 哈希，本来就必须当机密对待；节点 token 不比它
 删除是它的对偶，删掉正在用的那个也允许——`external_theme` 拿不到目录就回落内置主题，和主题损坏走的
 是同一条路；`setting` 里的 `theme` 保持不动，重新装回同名主题就自动生效。
 
-**否决**：从 URL 拉主题（komari 有，那要连带做 SSRF 防护、GitHub release 探测、代理配置三摊事，
-而"下载好再上传"只多一步）；主题市场；上传后自动切换（装和用是两个决定）。
+**否决**：主题市场；上传后自动切换（装和用是两个决定）。"从 URL 拉主题"当时也在这一行里，理由是
+"要连带做 SSRF 防护、GitHub release 探测、代理配置三摊事"——后来做了，见下一节，三摊里有一摊是白送的。
+
+### 更新按钮：只认已装主题自己 `url` 指的那个 GitHub 仓库 **[用户]**
+
+推翻上一节的否决。第三方主题发了新版，原来只能"下载好再上传"；现在卡片上多一个 ⟳，
+`POST /api/themes/{short}/update`。
+
+**信任锚是那个主题自己**。装的时候你已经信了这个作者，更新就是继续从同一个仓库拿——和 apt 一样。
+所以来源不是用户在面板上现填的 URL，而是已装 `theme.json` 里的 `url`，它必须长成
+`https://github.com/<owner>/<repo>`，否则按钮根本不显示、后端也直接拒。
+
+**"三摊事"实际是一摊半**：
+
+- **SSRF 防护是白名单，不是黑名单**。`github_repo()` 从 `url` 里只取出 `owner` 和 `repo` 两个字符串，
+  每段都过 `path_segment()`（`[A-Za-z0-9._-]`，拒 `.`/`..`/空）。之后两条地址全由 hub 自己拼：
+  `api.github.com/repos/{owner}/{repo}/releases/latest` 和
+  `github.com/{owner}/{repo}/releases/download/{tag}/theme.tar.gz`。**主机是常量，没有"要不要拦内网
+  地址"这个问题**。komari 那边是反过来的：拿用户 URL 去连，再用 `isPrivateIP` 黑名单拦——而它
+  `downloadThemeFromURL` 用的是 `http.Get`，默认跟随重定向且**重定向后不再校验**，一个 302 到
+  169.254.169.254 就绕过去了（同一个坑它在 theme_market.go 里补了 `CheckRedirect`，theme.go 这条路没补）。
+- **release 探测就是一次 GET**。tag 来自 API 而不是 manifest，但它也要进 URL，所以同样过
+  `path_segment()`。资产**按名字取 `theme.tar.gz`**，不是 komari 的 `assets[0].browser_download_url`
+  ——我们发的 release 里 `theme.tar.gz.sha256` 就排在旁边，取第一个是掷骰子。而且**不用 API 给的那个
+  下载 URL**，只用它确认资产在不在，地址自己拼。
+- **代理配置白送**：`github_proxy` 是面板本来就有的设置（agent 二进制中转在用），抽出一个
+  `proxied()` 两处共用。API 那一跳不走代理——多数 GitHub 代理只front releases，而读不到 tag 时还有
+  上传按钮兜底，降级不是不可用。
+
+**先比版本，再决定下不下载**。tag `v1.2.3` 去掉 `v` 和 manifest 的 `version` 比，相同就返回
+`{"updated":false}` 走人，一个字节都不传。所以这一个按钮同时是"检查更新"——不需要第二个按钮，也不
+需要后台轮询。komari 的 `UpdateTheme` 不比版本，每次点都重下重装。
+
+**包里的 `short` 必须是按钮上那个**。`install()` 多一个 `expect: Option<&str>` 参数，上传传 `None`
+（装它自称的名字），更新传 `Some(short)`。不然一个"更新"能把 A 主题换成 B 主题，或者覆盖掉隔壁没关系
+的主题目录——komari 正是按新 manifest 的 `short` 建目录，点 A 的更新可以装出一个 B 来。这道闸放在
+`publish()` 里而不是 handler 里，因为两条安装路都从那儿过。
+
+**除此之外没有新代码路径**：下载完的字节直接喂给上一节那套 `install()`——同样的条目类型检查、路径
+穿越检查、解压炸弹三道闸、`.staging-` 落地加一次 rename 发布。`install()` 从收 `&Path` 改成收
+`impl Read`，所以更新这条路连临时文件都不用落盘。
+
+**没做 sha256 校验**，这跟 `web-theme.pin` 不一样：pin 里的哈希是写在 hub 仓库里的信任锚，而 release
+旁边的 `theme.tar.gz.sha256` 和包本身同源同权限，能换包的人就能换哈希。HTTPS 已经保证了传输完整性，
+再算一遍只是仪式。
+
+**大小闸看 `Content-Length`**：传输在 `Content-Length` 处结束，所以头里报小了 body 也长不出来，
+超 32 MiB 或干脆没这个头（代理丢了）都直接拒，不进内存。komari 那边是 `io.ReadAll(resp.Body)`，
+没有 `LimitReader`（market 那条路有，theme 这条路没有）。
+
+**否决**：主题市场（komari 有，508 行 + 多源管理 + 目录缓存 + 一个要有人维护的 `v1.json`；我们的
+主题作者写一行 `url` 就够了）；后台定时查更新（一个按钮的事，不值一个后台任务和一列"有新版"状态）；
+把下载地址写进 `theme.json`（多一个用户可控 URL，正是白名单要避免的）。
 
 ### 预览图是包内约定的文件名，不是 manifest 字段 **[用户]**
 

@@ -114,8 +114,15 @@ cd web-admin && npm run dev
 目录名必须等于 `theme.json` 的 `short`；短名只允许字母、数字、`-`、`_`。完整接口契约见默认主题
 仓库的 README。
 
+`theme.json` 的字段全部必填，缺任一个主题就不会出现在列表里（hub 日志有一条 warn 说缺哪个）。
+不想填源码地址写 `"url": ""`，卡片自动不显示「源码」链接。
+
 本地开发就用上面这个形状直接复制，改一次看一次；发布给别人装的时候打成
 `tar czf theme.tar.gz dist theme.json preview.png`，对方在后台「主题」页上传即可。
+
+**想让用户能点更新按钮**：`url` 写成 `https://github.com/<owner>/<repo>`，仓库的 release 里放一个
+名叫 `theme.tar.gz` 的资产，tag 写成 `v<theme.json 里的 version>`（`v` 可有可无）。hub 比 tag 和已装
+版本，相同就不下载。资产必须叫这个名字——hub 不取 release 里的第一个资产。
 
 登录后建一个节点，拿到 token，在 [agent 仓库](https://github.com/stqfdyr/agent) 里跑一个指向本机
 hub 的 agent：

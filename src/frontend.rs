@@ -1,6 +1,7 @@
 //! Built-in admin UI plus a replaceable public theme.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -141,7 +142,9 @@ fn manifest(root: &Path, short: &str) -> Option<Theme> {
     if data.len() > 64 * 1024 {
         return None;
     }
-    let theme: Theme = serde_json::from_slice(&data).ok()?;
+    let theme: Theme = serde_json::from_slice(&data)
+        .inspect_err(|e| tracing::warn!("{short}/theme.json 不是有效的 manifest，主题不会出现在列表里：{e}"))
+        .ok()?;
     (theme.short == short).then_some(theme)
 }
 
@@ -200,18 +203,21 @@ const MAX_EXPANDED: u64 = 64 << 20;
 /// moment where the public page is served out of an incomplete directory.
 /// A theme being replaced is renamed aside rather than deleted, and renamed
 /// back if the publish cannot complete.
-pub fn install(themes: &Path, archive: &Path) -> Result<Theme> {
+///
+/// `expect` is the short name the caller is replacing, when it is replacing a
+/// particular one -- an upload installs whatever it carries, an update may not.
+pub fn install<R: Read>(themes: &Path, archive: R, expect: Option<&str>) -> Result<Theme> {
     let staging = themes.join(format!(".staging-{}", &random_token()[..16]));
-    let installed = unpack(archive, &staging).and_then(|()| publish(themes, &staging));
+    let installed = unpack(archive, &staging).and_then(|()| publish(themes, &staging, expect));
     if installed.is_err() {
         let _ = fs::remove_dir_all(&staging);
     }
     installed
 }
 
-fn unpack(archive: &Path, into: &Path) -> Result<()> {
+fn unpack<R: Read>(archive: R, into: &Path) -> Result<()> {
     fs::create_dir(into)?;
-    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(fs::File::open(archive)?));
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(archive));
     let mut expanded = 0u64;
     for (seen, entry) in archive.entries()?.enumerate() {
         let mut entry = entry.context("主题包不是有效的 tar.gz")?;
@@ -247,7 +253,7 @@ fn unpack(archive: &Path, into: &Path) -> Result<()> {
 
 /// Checks the unpacked directory is a theme this hub can actually serve, then
 /// moves it into place under the name its manifest asks for.
-fn publish(themes: &Path, staging: &Path) -> Result<Theme> {
+fn publish(themes: &Path, staging: &Path, expect: Option<&str>) -> Result<Theme> {
     let manifest = read_inside(staging, "theme.json").context("主题包里没有 theme.json")?;
     if manifest.len() > 64 * 1024 {
         bail!("theme.json 过大");
@@ -255,6 +261,12 @@ fn publish(themes: &Path, staging: &Path) -> Result<Theme> {
     let theme: Theme = serde_json::from_slice(&manifest).context("theme.json 格式不对")?;
     if !valid_short(&theme.short) {
         bail!("theme.json 里的 short 不能作为目录名：{:?}", theme.short);
+    }
+    // Updating a theme replaces the one named on the button. A package whose
+    // manifest carries some other `short` would install a second theme instead
+    // -- or overwrite an unrelated one -- and report it as that update.
+    if let Some(expected) = expect.filter(|&expected| expected != theme.short) {
+        bail!("这个包里是主题 {:?}，不是 {expected:?}", theme.short);
     }
     // The one file `serve` needs. Without it every request falls through to
     // the built-in theme, which looks exactly like the upload having done
@@ -390,13 +402,13 @@ mod tests {
                 builder.append_link(&mut header, name, target).unwrap();
             }
             builder.into_inner().unwrap().finish().unwrap();
-            &archive
+            fs::File::open(&archive).unwrap()
         };
 
         // The directory is named by the manifest, never by the file that
         // arrived.
-        let theme =
-            install(&base, pack(&[("theme.json", manifest), ("dist/index.html", b"v1")], None)).unwrap();
+        let theme = install(&base, pack(&[("theme.json", manifest), ("dist/index.html", b"v1")], None), None)
+            .unwrap();
         assert_eq!(theme.short, "aurora");
         assert_eq!(fs::read(base.join("aurora/dist/index.html")).unwrap(), b"v1");
 
@@ -404,9 +416,10 @@ mod tests {
         install(
             &base,
             pack(&[("theme.json", manifest), ("dist/index.html", b"v2"), ("dist/old.js", b"x")], None),
+            None,
         )
         .unwrap();
-        install(&base, pack(&[("theme.json", manifest), ("dist/index.html", b"v3")], None)).unwrap();
+        install(&base, pack(&[("theme.json", manifest), ("dist/index.html", b"v3")], None), None).unwrap();
         assert_eq!(fs::read(base.join("aurora/dist/index.html")).unwrap(), b"v3");
         assert!(!base.join("aurora/dist/old.js").exists(), "the replaced theme must not leave files behind");
 
@@ -419,7 +432,7 @@ mod tests {
             pack(&[("theme.json", manifest), ("dist/index.html", b"x")], Some(("dist/link", "/etc/passwd"))),
             pack(&[("dist/index.html", b"x")], None),
         ] {
-            assert!(install(&base, bad).is_err());
+            assert!(install(&base, bad, None).is_err());
         }
 
         // None of that touched the theme being served, and none of it left a
@@ -437,11 +450,26 @@ mod tests {
         install(
             &base,
             pack(&[("theme.json", manifest), ("dist/index.html", b"v3"), ("preview.png", b"PNG")], None),
+            None,
         )
         .unwrap();
         assert_eq!(preview(&base, "aurora").unwrap(), b"PNG");
-        install(&base, pack(&[("theme.json", manifest), ("dist/index.html", b"v3")], None)).unwrap();
+        install(&base, pack(&[("theme.json", manifest), ("dist/index.html", b"v3")], None), None).unwrap();
         assert!(preview(&base, "aurora").is_none() && preview(&base, "default").is_none());
+
+        // An update replaces the theme whose button was pressed, so a package
+        // that renamed itself is refused rather than installed alongside.
+        assert!(install(
+            &base,
+            pack(&[("theme.json", manifest), ("dist/index.html", b"v4")], None),
+            Some("nebula"),
+        )
+        .is_err());
+        assert!(!base.join("nebula").exists());
+        assert_eq!(fs::read(base.join("aurora/dist/index.html")).unwrap(), b"v3");
+        install(&base, pack(&[("theme.json", manifest), ("dist/index.html", b"v4")], None), Some("aurora"))
+            .unwrap();
+        assert_eq!(fs::read(base.join("aurora/dist/index.html")).unwrap(), b"v4");
 
         // And deleting it is the way back out.
         remove(&base, "aurora").unwrap();
