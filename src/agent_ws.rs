@@ -2,7 +2,9 @@
 //! notifications. One long-lived connection either end can speak first on, and
 //! frames that name their own method, readable with curl or a browser console.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -47,7 +49,8 @@ pub struct Agent {
     /// The latest report, or `Null` between connecting and the first one.
     pub metrics: serde_json::Value,
     pub last_seen: i64,
-    /// Wall-clock minute of the last row written to `metric`.
+    /// Wall-clock minute this session has already accounted for. A history
+    /// row is written when a report lands past it.
     pub last_minute: i64,
     /// `(unix seconds, total_rx, total_tx)` as they stood at the last history
     /// row, so the next one carries the average rate over the gap. Without it
@@ -65,7 +68,11 @@ impl Agent {
             tx,
             metrics: serde_json::Value::Null,
             last_seen: 0,
-            last_minute: 0,
+            // The minute in progress, not zero. Its row is already on disk,
+            // written by the session this one replaces out of the mean of a
+            // whole minute; a reconnect's first report would otherwise
+            // replace it with the single sample that opened the new session.
+            last_minute: Utc::now().timestamp() / 60,
             mark: None,
             minute: Minute::default(),
         }
@@ -189,7 +196,13 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
             inbound = socket.recv() => {
                 last_frame = Instant::now();
                 match inbound {
-                Some(Ok(Message::Text(text))) => match dispatch(&app, node_id, &ip, &text) {
+                // Every report reaches for the one database connection, and a
+                // restore or a vacuum holds it for seconds. Without this the
+                // agents park every worker thread waiting on that lock and
+                // nothing else on the runtime -- the panel, the public page,
+                // the shutdown signal -- gets a turn either.
+                Some(Ok(Message::Text(text))) =>
+                    match tokio::task::block_in_place(|| dispatch(&app, node_id, &ip, &text)) {
                     Ok(true) => locate(app.clone(), node_id, ip.clone()),
                     Ok(false) => {}
                     Err(e) => warn!("node {node_id} sent an unusable message: {e:#}"),
@@ -243,16 +256,34 @@ fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool> {
     Ok(false)
 }
 
-/// Resolves the address a node connects from to a country, once per address.
+/// Addresses already looked up, per node.
+///
+/// A failed lookup leaves the country column empty, so `save_facts` keeps
+/// answering "still owed"; without this an agent reconnecting every few
+/// seconds -- a bad link, or two machines on one token -- would spend one
+/// outbound request per reconnect, forever. The answer can only change when
+/// the address does, so that is what is remembered.
+static ASKED: OnceLock<Mutex<HashMap<i64, (String, Instant)>>> = OnceLock::new();
+const LOCATE_RETRY: Duration = Duration::from_secs(3_600);
+
+/// Resolves the address a node connects from to a country, once per address
+/// and at most once an hour while the lookup keeps failing.
 ///
 /// The answer is a third party's, and it ends up on the public page, so only
 /// two ASCII letters are ever stored. Anything else -- a private address
 /// because the agent and the hub share a network, an outage, a rate limit --
 /// leaves the column empty and the badge off.
 ///
-/// ponytail: no retry and no backoff. The next handshake asks again, and a
-/// handshake is also the only moment the answer can have changed.
+/// ponytail: no backoff beyond that one window, and the memory is the
+/// process's. A hub restart asks again, which is once per node.
 fn locate(app: Shared, node_id: i64, ip: String) {
+    let mut asked = ASKED.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    if asked.get(&node_id).is_some_and(|(seen, at)| *seen == ip && at.elapsed() < LOCATE_RETRY) {
+        return;
+    }
+    asked.insert(node_id, (ip.clone(), Instant::now()));
+    drop(asked);
+
     tokio::spawn(async move {
         let lookup = async {
             let url = format!("https://ipinfo.io/{ip}/country");
@@ -305,10 +336,15 @@ fn check_contract(node_id: i64, metrics: &serde_json::Value) {
 
 fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()> {
     let now = Utc::now().timestamp();
-    let boot_id = metrics.get("boot_id").and_then(|v| v.as_str()).unwrap_or("").to_owned();
-    let rx = metrics.get("net_rx_total").and_then(|v| v.as_i64()).unwrap_or(0);
-    let tx = metrics.get("net_tx_total").and_then(|v| v.as_i64()).unwrap_or(0);
-    let traffic = app.db.accumulate(node_id, &boot_id, rx, tx)?;
+    // A placeholder rather than the empty string, which `accumulate` reads as
+    // "this node has no baseline yet". An agent that sends no boot_id -- an
+    // older one, or a box without the file -- would otherwise re-align on
+    // every report and never book a byte.
+    let boot_id = metrics.get("boot_id").and_then(|v| v.as_str()).filter(|b| !b.is_empty()).unwrap_or("-");
+    // No reading is not a reading of zero: see `accumulate`.
+    let counter = |k: &str| metrics.get(k).and_then(|v| v.as_i64());
+    let counters = counter("net_rx_total").zip(counter("net_tx_total"));
+    let traffic = app.db.accumulate(node_id, boot_id, counters)?;
 
     // The UI shows the hub's accumulated figures, so they are folded into the
     // live payload and the raw kernel counters stay a wire-protocol detail.
@@ -325,7 +361,8 @@ fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()>
     // token, or the socket is unwinding. The bytes above are real and stay
     // booked; there is no longer a session to file them under.
     let Some(entry) = agents.get_mut(&node_id) else { return Ok(()) };
-    if entry.last_seen == 0 {
+    let first = entry.last_seen == 0;
+    if first {
         check_contract(node_id, &metrics);
     }
     // History is one row per minute; the live view gets every report.
@@ -352,10 +389,18 @@ fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()>
         entry.minute = Minute::default();
         row
     });
+    // A session that has just started measures the next row's rate from its
+    // own first report; without a mark the row would carry the agent's
+    // instantaneous reading instead of the average over the gap.
+    entry.mark.get_or_insert((now, traffic.total_rx, traffic.total_tx));
     drop(agents);
 
-    if let Some(row) = row {
-        app.db.insert_metric(node_id, minute * 60, &row)?;
+    if let Some(row) = &row {
+        app.db.insert_metric(node_id, minute * 60, row)?;
+    }
+    // "Offline since" is read off this column, so a session that ends before
+    // its first minute boundary still has to leave a mark.
+    if row.is_some() || first {
         app.db.touch_seen(node_id, now)?;
     }
     Ok(())
@@ -377,7 +422,13 @@ pub fn push_ping_tasks(app: &App) {
         .map(|(id, agent)| (*id, agent.tx.clone()))
         .collect();
     for (node_id, sender) in connected {
-        let _ = sender.try_send(ping_tasks_message(app, node_id));
+        // The queue only ever carries these, so a full one is an agent that
+        // has stopped reading its socket. It is dropped within SILENCE and
+        // reconnects onto the current list; what is not acceptable is the
+        // panel reporting a push that never happened.
+        if sender.try_send(ping_tasks_message(app, node_id)).is_err() {
+            warn!("node {node_id} is not draining its queue; it gets the new probe list when it reconnects");
+        }
     }
 }
 
@@ -421,6 +472,10 @@ mod tests {
         let app = app();
         let (id, _held) = connect(&app);
         let minute = Utc::now().timestamp() / 60 * 60;
+        // A session already running when this minute opened: the first report
+        // of a new one lands inside a minute somebody else has accounted for,
+        // which is the reconnect case below.
+        app.agents.write().unwrap().get_mut(&id).unwrap().last_minute -= 1;
 
         dispatch(&app, id, "1.2.3.4", &report_json("boot-a", 1_000, 500)).unwrap();
         dispatch(&app, id, "1.2.3.4", &report_json("boot-a", 3_000, 1_500)).unwrap();
@@ -460,10 +515,8 @@ mod tests {
             .to_string()
         };
 
-        // A connection's first report opens a row and clears the running
-        // mean, so the minute under test starts after it.
-        dispatch(&app, id, "ip", &burst(1_000, 0, 0.0, 0)).unwrap();
-        // Busy half the minute, then quiet.
+        // Busy half the minute, then quiet. The first reading is also the
+        // traffic baseline: nothing is booked until a second one arrives.
         dispatch(&app, id, "ip", &burst(1_000, 0, 100.0, 100)).unwrap();
         // Rewind the bookkeeping a minute, so the next report crosses the
         // boundary with a minute of elapsed time behind it.
@@ -486,6 +539,62 @@ mod tests {
         assert_eq!(row["mem_used"], 151);
         // And the live view still shows the instant, which is what it is for.
         assert_eq!(app.agents.read().unwrap()[&id].metrics["net_rx"], 0);
+    }
+
+    /// A reconnect lands mid-minute, and that minute's row already holds the
+    /// mean of the session before it. Replacing it with the one sample that
+    /// opened the new session is what makes the chart stop integrating to the
+    /// totals printed beside it.
+    #[test]
+    fn a_reconnect_leaves_the_minute_it_lands_in_alone() {
+        let app = app();
+        let (id, _held) = connect(&app);
+        app.agents.write().unwrap().get_mut(&id).unwrap().last_minute -= 1;
+        dispatch(&app, id, "ip", &report_json("boot-a", 1_000, 500)).unwrap();
+        let before = app.db.metrics(id, 0, 60).unwrap();
+        assert_eq!(before.len(), 1, "the running session wrote the row for this minute");
+
+        // The socket drops and the agent is back inside the same minute.
+        let (tx, _rx) = mpsc::channel(4);
+        app.agents.write().unwrap().insert(id, Agent::new(2, tx));
+        let loud = json!({"jsonrpc": "2.0", "method": "report",
+                          "params": {"boot_id": "boot-a", "cpu": 99.0, "net_rx_total": 9_000,
+                                     "net_tx_total": 4_500}})
+        .to_string();
+        dispatch(&app, id, "ip", &loud).unwrap();
+
+        assert_eq!(app.db.metrics(id, 0, 60).unwrap(), before, "the row keeps the minute it described");
+        // The bytes are still booked; only the history row is left alone.
+        assert_eq!(app.agents.read().unwrap()[&id].metrics["total_rx"], 8_000);
+    }
+
+    /// An agent that sends no boot_id -- an older one, or a box without the
+    /// file -- still has its traffic accumulated. Reading the empty string as
+    /// "no baseline" would re-align on every report and book nothing, for
+    /// months, with no sign of it anywhere.
+    #[test]
+    fn traffic_accumulates_for_an_agent_that_sends_no_boot_id() {
+        let app = app();
+        let (id, _held) = connect(&app);
+        let report = |rx: i64| {
+            json!({"jsonrpc": "2.0", "method": "report",
+                   "params": {"cpu": 1.0, "net_rx_total": rx, "net_tx_total": 0}})
+            .to_string()
+        };
+        dispatch(&app, id, "ip", &report(1_000)).unwrap();
+        dispatch(&app, id, "ip", &report(3_000)).unwrap();
+        assert_eq!(app.agents.read().unwrap()[&id].metrics["total_rx"], 2_000);
+
+        // A report with no counters at all books nothing and, above all,
+        // leaves the baseline where it was: the next one is a delta.
+        let blind = json!({"jsonrpc": "2.0", "method": "report", "params": {"cpu": 1.0}}).to_string();
+        dispatch(&app, id, "ip", &blind).unwrap();
+        dispatch(&app, id, "ip", &report(4_000)).unwrap();
+        assert_eq!(
+            app.agents.read().unwrap()[&id].metrics["total_rx"],
+            3_000,
+            "a missing reading must not re-baseline the counter to zero"
+        );
     }
 
     #[test]

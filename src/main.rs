@@ -42,6 +42,10 @@ pub struct App {
     /// not multiply the query load. See `api::live_snapshot`.
     pub snapshot: Mutex<[(i64, axum::extract::ws::Utf8Bytes); 2]>,
     pub throttle: auth::Throttle,
+    /// Failed agent registrations, counted apart from failed sign-ins: the two
+    /// have different threat models, and a batch install run with a stale key
+    /// must not lock the operator out of the panel.
+    pub registrations: auth::Throttle,
     pub http: reqwest::Client,
     /// Public base URL when `--site` was given, empty otherwise -- the
     /// default, where the hub is reached at whatever ip:port the browser used
@@ -60,6 +64,7 @@ impl App {
             agents: RwLock::default(),
             snapshot: Mutex::new([(0, Default::default()), (0, Default::default())]),
             throttle: auth::Throttle::default(),
+            registrations: auth::Throttle::default(),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
@@ -345,13 +350,20 @@ async fn main() -> Result<()> {
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(api::MAX_CHUNK))
                 .with_state(app.clone()),
         )
-        .layer(tower_http::compression::CompressionLayer::new().compress_when(
-            tower_http::compression::predicate::DefaultPredicate::new().and(
-                |status: StatusCode, _: Version, _: &HeaderMap, _: &Extensions| {
-                    status != StatusCode::SWITCHING_PROTOCOLS
-                },
+        // Not the agent binary, and not a database backup: both are already
+        // compressed, both are megabytes, and deflating them buys nothing on
+        // the same cores argon2 and the SQLite writer share.
+        .layer(
+            tower_http::compression::CompressionLayer::new().compress_when(
+                tower_http::compression::predicate::DefaultPredicate::new()
+                    .and(tower_http::compression::predicate::NotForContentType::const_new(
+                        "application/octet-stream",
+                    ))
+                    .and(|status: StatusCode, _: Version, _: &HeaderMap, _: &Extensions| {
+                        status != StatusCode::SWITCHING_PROTOCOLS
+                    }),
             ),
-        ))
+        )
         .with_state(app);
 
     let listener = match tokio::net::TcpListener::bind(args.listen).await {
@@ -437,7 +449,10 @@ fn host_is_loopback(authority: &str) -> bool {
         Some(v6) => v6.split(']').next().unwrap_or(""),
         None => authority.split(':').next().unwrap_or(""),
     };
-    host.is_empty() || host == "localhost" || host == "::1" || host.starts_with("127.")
+    // Parsed, not prefix-matched: `127.example.com` is a registered name a
+    // browser resolves to wherever its owner points it, and reading it as
+    // loopback silences the one warning saying the cookie is in the clear.
+    host.is_empty() || host == "localhost" || host.parse::<IpAddr>().is_ok_and(|a| a.is_loopback())
 }
 
 /// Prints a one-time admin password when the database is first created.
@@ -612,6 +627,10 @@ mod tests {
         assert!(app("https://hub.example.com").secure_cookies(&proto(Some("http"))));
         assert!(!app("http://hub.example.com").secure_cookies(&proto(Some("https"))));
         assert!(!exposed_over_plain_http("https://m.example.com"));
+        // A registered name is not an address, however it starts: reading one
+        // as loopback drops the warning that the cookie is in the clear.
+        assert!(exposed_over_plain_http("http://127.example.com"));
+        assert!(exposed_over_plain_http("http://127.0.0.1.nip.io"));
 
         // No --site: the proxy's header is the only word on the scheme.
         let bare = app("");

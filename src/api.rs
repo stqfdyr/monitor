@@ -44,6 +44,31 @@ fn bad(message: &str) -> Response {
 
 // ---- read paths, shared between the panel and the public page ----
 
+/// Everything a report may show under `metrics` on the public page: the agent
+/// contract minus the raw kernel counters, which are a wire-protocol detail
+/// and hand out a machine's whole lifetime traffic, plus the four figures the
+/// hub folds in itself. The panel sees the report as it arrived.
+const PUBLIC_METRICS: [&str; 18] = [
+    "uptime",
+    "cpu",
+    "load",
+    "mem_total",
+    "mem_used",
+    "swap_total",
+    "swap_used",
+    "disk_total",
+    "disk_used",
+    "net_rx",
+    "net_tx",
+    "tcp",
+    "udp",
+    "procs",
+    "total_rx",
+    "total_tx",
+    "month_rx",
+    "month_tx",
+];
+
 /// One node as the UI consumes it: stored config, live metrics and the hub's
 /// accumulated traffic in a single object.
 fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool) -> Value {
@@ -89,13 +114,13 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         "day_rx": traffic.day_rx,
         "day_tx": traffic.day_tx,
     });
-    // Raw kernel counters are a wire-protocol detail, and they expose a
-    // machine's whole lifetime traffic to anyone loading the public page.
+    // An allowlist, not a denylist: the agent ships from its own repository,
+    // so a field added there would otherwise reach anonymous visitors the day
+    // it is released -- and the third iron rule says no address, no hostname
+    // and no note ever does.
     if !full {
         if let Some(m) = view["metrics"].as_object_mut() {
-            m.remove("boot_id");
-            m.remove("net_rx_total");
-            m.remove("net_tx_total");
+            m.retain(|k, _| PUBLIC_METRICS.contains(&k.as_str()));
         }
     }
     // Address, private notes and the token never leave the panel. The token is
@@ -172,7 +197,7 @@ pub async fn metrics(
     // Skipped when the probes were not asked for -- the resources tab has
     // nothing to label, and this is a turn at the write connection.
     let probes =
-        if wants("ping") { app.db.ping_task_names().unwrap_or_else(|_| json!({})) } else { json!({}) };
+        if wants("ping") { app.db.ping_task_names(id).unwrap_or_else(|_| json!({})) } else { json!({}) };
     let metrics = if wants("metrics") { app.db.metrics(id, since, step) } else { Ok(vec![]) };
     let ping = if wants("ping") { app.db.ping_records(id, since, step) } else { Ok(vec![]) };
     match (metrics, ping) {
@@ -368,7 +393,10 @@ pub async fn agent_register(
     name: String,
 ) -> Response {
     let ip = client_ip(&headers, peer.ip());
-    if app.throttle.locked(ip) {
+    // Counted apart from the sign-in page: a batch install started with a
+    // stale key is a fumbled deploy, not an attack on the panel, and sharing
+    // one counter locks the operator out of their own hub for LOCKOUT.
+    if app.registrations.locked(ip) {
         return (StatusCode::TOO_MANY_REQUESTS, "too many attempts, try again later").into_response();
     }
     // One answer for both "no window is open" and "that key is wrong": the
@@ -383,7 +411,7 @@ pub async fn agent_register(
         // Only a wrong key counts against the address. With the window shut
         // there is no secret to guess, and counting then would let anyone lock
         // an address they name in `X-Forwarded-For` out of the sign-in page.
-        app.throttle.record_failure(ip);
+        app.registrations.record_failure(ip);
         return closed();
     }
     match app.db.nodes_created_since(until - REGISTER_WINDOW) {
@@ -409,6 +437,7 @@ pub async fn agent_register(
     let token = random_token();
     match app.db.create_node(&node, &token) {
         Ok(_) => {
+            app.registrations.clear(ip);
             invalidate_snapshot(&app);
             token.into_response()
         }
@@ -597,9 +626,10 @@ pub const MAX_CHUNK: usize = 8 * 1024 * 1024;
 /// oversized upload is refused before a byte of it is sent.
 ///
 /// The backup ceiling is where it is because restoring holds the connection
-/// the agents write through: at the measured ~40 MB/s that is about 6.5
-/// seconds of blocked reporting, and the reachable database sizes for a few
-/// hundred nodes sit two orders of magnitude below it.
+/// every read and write goes through: at the measured ~40 MB/s that is about
+/// 6.5 seconds in which the panel and the public page wait too, not only
+/// reporting. The reachable database sizes for a few hundred nodes sit two
+/// orders of magnitude below it.
 pub const MAX_RESTORE: u64 = 256 * 1024 * 1024;
 pub const MAX_THEME: u64 = 32 * 1024 * 1024;
 
@@ -1084,6 +1114,40 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
     Json(Value::Object(out))
 }
 
+/// Why one setting cannot be stored, or `None` when it can.
+///
+/// Separate from the writing below because every key is checked before any is
+/// written: changing the password drops every session, and a 400 raised after
+/// that -- on a later key, in whatever order the map iterates -- carries no
+/// Set-Cookie, so the admin would be signed out of every device by a password
+/// change the UI reported as rejected.
+fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
+    // Settings are stored as text. A caller sending the natural JSON type --
+    // `{"public_page": false}`, `{"retention_days": 7}` -- used to be skipped
+    // by a bare `continue`, so nothing was written and the answer said saved.
+    let Some(value) = value.as_str() else { return Some(format!("{key} must be a string")) };
+    match key {
+        "theme" if !crate::frontend::selectable(app, value) => Some("theme is not installed".into()),
+        // Housekeeping clamps whatever it reads, so an unparseable value
+        // would be stored, shown back, and quietly mean 30 days forever.
+        "retention_days" if !value.parse::<i64>().is_ok_and(|d| (1..=3_650).contains(&d)) => {
+            Some("retention days must be a number from 1 to 3650".into())
+        }
+        // The hub fetches this URL itself, so it has to be one: a scheme it
+        // cannot speak turns every agent download into a 502 that says
+        // nothing about the setting that caused it.
+        "github_proxy"
+            if !(value.is_empty() || value.starts_with("http://") || value.starts_with("https://")) =>
+        {
+            Some("GitHub proxy must start with http:// or https://".into())
+        }
+        "admin_password" if value.len() < 12 => Some("password must be at least 12 characters".into()),
+        "admin_password" => None,
+        k if READABLE_SETTINGS.contains(&k) || k == "github_client_secret" => None,
+        _ => Some(format!("unknown setting: {key}")),
+    }
+}
+
 pub async fn save_settings(
     _: Admin,
     State(app): State<Shared>,
@@ -1091,49 +1155,30 @@ pub async fn save_settings(
     Json(body): Json<Value>,
 ) -> Response {
     let Some(map) = body.as_object() else { return bad("expected an object") };
+    for (key, value) in map {
+        if let Some(message) = setting_error(&app, key, value) {
+            return bad(&message);
+        }
+    }
     // Set when the password changed, so the caller can be handed a fresh
     // session instead of being logged out by their own password change.
     let mut reissued = String::new();
     for (key, value) in map {
-        let Some(value) = value.as_str() else { continue };
-        let stored = match key.as_str() {
-            "theme" if !crate::frontend::selectable(&app, value) => return bad("theme is not installed"),
-            // Housekeeping clamps whatever it reads, so an unparseable value
-            // would be stored, shown back, and quietly mean 30 days forever.
-            "retention_days" if !value.parse::<i64>().is_ok_and(|d| (1..=3_650).contains(&d)) => {
-                return bad("retention days must be a number from 1 to 3650")
+        let value = value.as_str().unwrap_or_default();
+        // Changing the password logs every existing session out; the caller
+        // gets a replacement.
+        if key == "admin_password" {
+            match hash_password(value).and_then(|h| {
+                app.db.set("admin_password_hash", &h)?;
+                app.db.drop_all_sessions()?;
+                issue_session(&app, &headers)
+            }) {
+                Ok(cookie) => reissued = cookie,
+                Err(e) => return fail(e),
             }
-            // The hub fetches this URL itself, so it has to be one: a scheme
-            // it cannot speak turns every agent download into a 502 that says
-            // nothing about the setting that caused it.
-            "github_proxy"
-                if !(value.is_empty() || value.starts_with("http://") || value.starts_with("https://")) =>
-            {
-                return bad("GitHub proxy must start with http:// or https://")
-            }
-            k if READABLE_SETTINGS.contains(&k) || k == "github_client_secret" => value,
-            // Changing the password logs every existing session out.
-            "admin_password" => {
-                if value.len() < 12 {
-                    return bad("password must be at least 12 characters");
-                }
-                // Every existing session dies with the old password; the
-                // caller gets a replacement below.
-                match hash_password(value).and_then(|h| {
-                    app.db.set("admin_password_hash", &h)?;
-                    app.db.drop_all_sessions()?;
-                    issue_session(&app, &headers)
-                }) {
-                    Ok(cookie) => {
-                        reissued = cookie;
-                        continue;
-                    }
-                    Err(e) => return fail(e),
-                }
-            }
-            _ => return bad(&format!("unknown setting: {key}")),
-        };
-        if let Err(e) = app.db.set(key, stored) {
+            continue;
+        }
+        if let Err(e) = app.db.set(key, value) {
             return fail(e);
         }
     }
@@ -1415,9 +1460,15 @@ mod tests {
         node(&app, "hidden", false);
         app.db.save_facts(open, &json!({"hostname": "vps-1"}), "198.51.100.9").unwrap();
 
-        // A live report, so the public view has metrics to strip.
-        let _held =
-            connect(&app, open, json!({"boot_id": "abc", "net_rx_total": 134_000_000_000i64, "cpu": 1.0}));
+        // A live report, so the public view has metrics to strip. `hostname`
+        // is what a node token in the wrong hands can put in one, and what
+        // the agent repository could add to the contract tomorrow.
+        let _held = connect(
+            &app,
+            open,
+            json!({"boot_id": "abc", "net_rx_total": 134_000_000_000i64, "cpu": 1.0,
+                   "hostname": "db-prod-01", "ip": "203.0.113.7"}),
+        );
 
         let public = visible_nodes(&app, false).unwrap();
         assert_eq!(public.len(), 1, "a node marked private must not be listed");
@@ -1430,8 +1481,10 @@ mod tests {
             !serde_json::to_string(&public).unwrap().contains("token-of-open"),
             "no node's token may appear anywhere in a public payload"
         );
-        // Raw kernel counters would hand out the machine's lifetime traffic.
-        for hidden in ["boot_id", "net_rx_total", "net_tx_total"] {
+        // Raw kernel counters would hand out the machine's lifetime traffic,
+        // and anything the contract does not name is not published at all --
+        // the report comes from a machine holding one node's token.
+        for hidden in ["boot_id", "net_rx_total", "net_tx_total", "hostname", "ip"] {
             assert!(public[0]["metrics"].get(hidden).is_none(), "{hidden} must not be public");
         }
         assert_eq!(public[0]["metrics"]["cpu"], 1.0, "the rest of the report still goes out");
@@ -1601,8 +1654,8 @@ mod tests {
     fn a_node_view_carries_traffic_even_while_offline() {
         let app = app();
         let id = node(&app, "n", true);
-        app.db.accumulate(id, "b", 100, 100).unwrap();
-        app.db.accumulate(id, "b", 900, 500).unwrap();
+        app.db.accumulate(id, "b", Some((100, 100))).unwrap();
+        app.db.accumulate(id, "b", Some((900, 500))).unwrap();
         app.db.touch_seen(id, 1_700_000_000).unwrap();
 
         let view = &visible_nodes(&app, true).unwrap()[0];
@@ -1613,6 +1666,54 @@ mod tests {
         // The live entry went with the connection, so "offline since" has to
         // come off the node row.
         assert_eq!(view["last_seen"], 1_700_000_000);
+    }
+
+    /// A settings write lands whole or not at all. Changing the password
+    /// drops every session and parks the replacement cookie on the response,
+    /// so a 400 raised after it -- on a later key, in whatever order the map
+    /// iterates -- signs the admin out of every device with nothing to say so.
+    #[tokio::test]
+    async fn a_settings_write_is_all_or_nothing() {
+        let app = std::sync::Arc::new(app());
+        app.db.set("admin_password_hash", "the-old-hash").unwrap();
+        let save = |body: Value| save_settings(Admin, State(app.clone()), HeaderMap::new(), Json(body));
+
+        // BTreeMap order puts the password first, which is the bad case.
+        let refused = save(json!({"admin_password": "a-long-enough-one", "retention_days": "abc"})).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(app.db.get("admin_password_hash").as_deref(), Some("the-old-hash"));
+
+        // A well-named key carrying the wrong type is refused rather than
+        // dropped while the answer says it was saved.
+        let refused = save(json!({"public_page": false})).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(app.db.get("public_page"), None);
+
+        let saved = save(json!({"public_page": "off", "retention_days": "7"})).await;
+        assert_eq!(saved.status(), StatusCode::OK);
+        assert_eq!(app.db.get("retention_days").as_deref(), Some("7"));
+    }
+
+    /// The install script and the sign-in page keep their own counters: five
+    /// machines started with a stale key is a fumbled deploy, and sharing one
+    /// counter locks the operator out of the panel for the lockout window.
+    #[tokio::test]
+    async fn a_wrong_registration_key_does_not_lock_the_sign_in_page() {
+        let app = std::sync::Arc::new(app());
+        app.db.set("register_key", "the-key").unwrap();
+        app.db.set("register_until", &(Utc::now().timestamp() + 60).to_string()).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer wrong".parse().unwrap());
+        let peer: std::net::SocketAddr = "198.51.100.7:9000".parse().unwrap();
+
+        // The attempt after the last one allowed answers 429, not 403.
+        for _ in 0..5 {
+            let refused =
+                agent_register(State(app.clone()), ConnectInfo(peer), headers.clone(), "n".into()).await;
+            assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        }
+        assert!(app.registrations.locked(peer.ip()), "the register route counts its own failures");
+        assert!(!app.throttle.locked(peer.ip()), "and the panel's sign-in page is not one of them");
     }
 
     #[test]

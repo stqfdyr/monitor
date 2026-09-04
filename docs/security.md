@@ -261,8 +261,24 @@ if full {
 是下面那条规则本身——公开出去无害才放公共部分——不是「它是不是从敏感字段推出来的」。地址本身仍然
 只在 `full` 分支里。
 
-`boot_id`、`net_rx_total`、`net_tx_total` 同样只留给面板：前者是机器标识，后两个是网卡的**整机
+`metrics` 这一整块走的是**白名单**（`api::PUBLIC_METRICS`），不是「删掉几个已知敏感字段」：
+
+```rust
+if !full {
+    m.retain(|k, _| PUBLIC_METRICS.contains(&k.as_str()));
+}
+```
+
+`boot_id`、`net_rx_total`、`net_tx_total` 因此只留给面板：前者是机器标识，后两个是网卡的**整机
 历史**计数（面板上那个「总流量」是 hub 自己累加的，两者不是一回事）。
+
+**为什么必须是白名单**：`metrics` 是 agent 上报的 params **原样存下来**的（`agent_ws::report`），
+而 agent 在另一个仓库、另一条发版节奏上。黑名单意味着那边加一个字段，这边就漏一个字段，而且是
+在匿名页面上漏。更直接的一条：拿到任意一个节点 token 的人（一台被拿下的 VPS，或者安装命令粘错了
+地方）可以自己往 params 里塞 `hostname`、`ip`、`remark`，黑名单会把它们一路送到公开页——正好是
+第三条铁律禁止的三个字段。白名单下这些键根本进不了 JSON。
+
+改 agent 上报字段时：新字段默认**不**公开，确认无害再加进 `PUBLIC_METRICS`。
 
 测试：`the_public_view_hides_private_nodes_and_sensitive_fields`。单节点的历史查询走 `readable()`，
 同样检查登录状态 + 节点公开标志 + 全局开关，测试
@@ -287,8 +303,11 @@ if full {
 `POST /api/register-window` 生成得了）、窗口内注册数上限（`api::REGISTER_LIMIT`，100 个）。
 
 - **窗口没开和 key 不对返回同一句话**，不替探测的人区分这两件事
-- **只有 key 不对才计进登录限流**（`auth::Throttle`，同一套 per-IP 计数）。窗口关着时不计——那时
-  没有可猜的秘密，而计数会让任何人靠伪造 `X-Forwarded-For` 把别人的地址锁出登录页
+- **只有 key 不对才计数**（`App.registrations`，per-IP）。窗口关着时不计——那时没有可猜的秘密，
+  而计数会让任何人靠伪造 `X-Forwarded-For` 把别人的地址锁出登录页
+- **这个计数器和登录页的 `App.throttle` 是两个**。共用一个的话，一条批量安装脚本拿着过期的 key
+  跑五台机器，就把操作者自己的出口地址锁出面板 15 分钟，而注册成功也不会清掉计数（登录成功会）。
+  两条路的威胁模型不一样：一边是猜密码，一边是装机手滑。注册成功时清掉本地址的计数
 - 单次请求的上界：两次 setting 读、一次 `COUNT`、一次 `INSERT`，不出网，请求体由路由的 64 KiB
   限制封顶。名字取自请求体，`trim` 后去掉控制字符、截到 64 个**字符**（不是字节）
 - 两个 setting 在 `/api/settings` 里**只读回显**，`save_settings` 仍然拒绝这两个 key 名——窗口

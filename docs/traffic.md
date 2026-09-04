@@ -21,14 +21,16 @@ hub 在 `db::accumulate()`（`src/db.rs`）里做这件事：
 **只有一条规则：只计入 hub 亲眼看着计数器涨过去的那部分字节。**
 
 ```
-if 这次的 boot_id 和上次存的一样:
+if 这次上报里读不出计数器:
+    整行不动                     ← 没有读数，既不计流量也不改基线，直接返回
+elif 这次的 boot_id 和上次存的一样:
     delta = max(当前读数 - 上次读数, 0)
 else:
     delta = 0                   ← 这个 boot 下还没有基线，只对基线，不计流量
 
 total_rx += delta               ← 单调递增，永不回退
 month_rx += delta
-last_rx = 当前读数              ← 无论哪条分支都更新
+last_rx = 当前读数              ← 上面两条分支都更新
 ```
 
 rx 和 tx 各判各的，一个方向变小不影响另一个方向的增量。
@@ -58,15 +60,28 @@ rx 和 tx 各判各的，一个方向变小不影响另一个方向的增量。
 测试：`a_shrinking_reading_re_aligns_instead_of_re_counting_history`、
 `two_machines_sharing_one_token_cannot_inflate_the_total`。
 
+**「读不出」和「读到 0」必须分开。** `net_rx_total` 缺字段、是 null、类型不对，都不是「这台机器
+跑了 0 字节」。当成 0 存下去就是把基线对到了零点：这一轮 `max(0 - 500 GB, 0) = 0` 看着无害，
+下一轮正常上报直接算出 500 GB 的增量记进单调递增的 `total`，只能手工改回来。所以
+`accumulate()` 收的是 `Option<(i64, i64)>`，`None` 那条分支连 UPDATE 都不发——不计流量，也不动基线。
+
+**agent 没报 `boot_id` 也要能累加。** 老版本 agent、或者没有 `/proc/sys/kernel/random/boot_id`
+的机器，`report()` 会用一个固定占位符 `"-"` 代替空串再往下传。空串在 `accumulate()` 里的含义是
+「这个节点还没有基线」——真让它一路传下去，每次上报都走「重新对基线」分支，这个节点的流量
+**永远停在 0**，而且日志里连一行都不会有（`reports a new boot` 那句被 `!prev_boot.is_empty()`
+挡住了）。换成占位符之后，重启的识别退回「读数变小」这一条，够用：内核计数器重启后是从 0 开始的。
+
+测试：`traffic_accumulates_for_an_agent_that_sends_no_boot_id`。
+
 ## 五个必须守住的不变量
 
 ### 1. 没有基线的读数只建立基线，不计流量
 
 ```rust
-let (d_rx, d_tx) = if prev_boot.is_empty() || prev_boot != boot_id {
-    (0, 0)
-} else {
-    ((rx - last_rx).max(0), (tx - last_tx).max(0))
+let (d_rx, d_tx) = match counters {
+    None => (0, 0),  // 这一轮连 UPDATE 都不发，基线原样留着
+    Some(_) if prev_boot.is_empty() || prev_boot != boot_id => (0, 0),
+    Some((rx, tx)) => ((rx - last_rx).max(0), (tx - last_tx).max(0)),
 };
 ```
 
@@ -162,6 +177,15 @@ hub 上商家月度重置实际发生在重置日当天 08:00，而「今日流�
 ## 手动修正
 
 面板可以改累计值：`PUT /api/nodes/{id}/traffic`，对应 `db::set_traffic()`。用途是换机器、迁移、或者修正一次误算。
+
+**改月度值的同时必须把 `month_start` 盖成当前周期。** 需要修正的节点往往正是那种「掉线到跨了
+重置日」的节点，它磁盘上留着的是上一个周期的 `month_start`。不盖的话上面第 5 条（读取侧再判一次
+周期）会把刚填进去的数读成 0——面板上看着像没生效；等节点重新上线，`accumulate()` 又发现跨了周期，
+把 `month_rx` 重置成这一次的增量，修正彻底丢掉。`total_rx/total_tx` 没有这个问题，它不按周期存。
+
+`day_start` 不盖：这条接口不改日计数器，让它按正常规则在下一次上报时翻页就行。
+
+测试：`a_month_correction_is_stamped_with_the_period_it_was_made_in`。
 
 ## 怎么验证
 
