@@ -701,6 +701,11 @@ function Nodes({ nodes, refresh, site }: { nodes: Node[]; refresh: () => void; s
                       <GripVertical className="size-4" />
                     </button>
                     <div className="min-w-0 font-medium">{n.name}</div>
+                    {n.country && (
+                      <Badge variant="outline" className="shrink-0 font-normal text-muted-foreground">
+                        {n.country}
+                      </Badge>
+                    )}
                   </div>
                 </TableCell>
                 {/* Addresses live only here, never on the public page. */}

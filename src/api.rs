@@ -50,6 +50,10 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
     let mut view = json!({
         "id": node.id,
         "name": node.name,
+        // A country, not an address: it says which market a node sits in,
+        // which is what a status page is for, and it locates nothing. The
+        // address it was derived from stays behind the panel with the rest.
+        "country": node.country,
         "sort": node.sort,
         "public": node.public,
         "online": current.is_some(),

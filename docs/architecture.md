@@ -85,7 +85,7 @@ agent 收到后会**保留没变化的任务**（同 id + 同 target + 同 inter
 | 表 | 作用 | 注意 |
 |---|---|---|
 | `setting` | key/value 配置 | 替代配置文件。见下方设置键列表 |
-| `node` | 节点配置 + agent 上报的静态信息 | `token` 存明文，面板要能重新显示安装命令；只在 `full` 视图输出 |
+| `node` | 节点配置 + agent 上报的静态信息 | `token` 存明文，面板要能重新显示安装命令；只在 `full` 视图输出。`country` 是 hub 从 `ip` 查来的两字母国家码，**公开**，见 [decisions.md](decisions.md) |
 | `traffic` | **单调递增的流量累计** | 1:1 于 node，但生命周期完全不同（每次上报都写） |
 | `metric` | 历史明细，**每节点每分钟一行** | `WITHOUT ROWID`，按保留天数定期删。**一行描述它前面那一分钟，不是它那一瞬**：`net_rx/net_tx` 从累计器差值算出，`cpu`/`mem_used`/`disk_used`/`swap_used`/`tcp`/`udp`/`procs` 是分钟内均值。见 [decisions.md](decisions.md) |
 | `ping_task` / `ping_node` | 探测任务及其节点分配 | 多对多 |
@@ -237,3 +237,6 @@ hub 重启后会在一个上报周期内重建，所以不落盘。
   不会把查询量乘上观众数
 - `src/main.rs` — `/agent/{arch}` 的转发闸门是固定的 4 个 permit（`RELAY_GATE`），不做磁盘缓存。
   安装是低频操作；真到需要的时候，按 release tag 缓存一份比调大闸门有用
+- `src/agent_ws.rs` — 国家码查询（`locate`）没有重试、没有退避、没有进程内缓存。库里那一行就是
+  缓存，失效条件是地址变化；查失败就等下一次握手。真需要重试的时候说明 hub 出网有问题，那是另一
+  件事

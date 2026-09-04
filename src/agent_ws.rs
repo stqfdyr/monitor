@@ -189,11 +189,11 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
             inbound = socket.recv() => {
                 last_frame = Instant::now();
                 match inbound {
-                Some(Ok(Message::Text(text))) => {
-                    if let Err(e) = dispatch(&app, node_id, &ip, &text) {
-                        warn!("node {node_id} sent an unusable message: {e:#}");
-                    }
-                }
+                Some(Ok(Message::Text(text))) => match dispatch(&app, node_id, &ip, &text) {
+                    Ok(true) => locate(app.clone(), node_id, ip.clone()),
+                    Ok(false) => {}
+                    Err(e) => warn!("node {node_id} sent an unusable message: {e:#}"),
+                },
                 Some(Ok(Message::Close(_))) | None => break Ok(()),
                 Some(Ok(_)) => {}
                 Some(Err(e)) => break Err(e.into()),
@@ -223,10 +223,13 @@ fn release(app: &App, node_id: i64, session: u64) -> bool {
     true
 }
 
-fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<()> {
+/// Handles one inbound frame, and answers whether the node is now owed a
+/// country. Looking one up is an outbound request, so it happens off this
+/// path -- see `locate`.
+fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool> {
     let rpc: Rpc = serde_json::from_str(text)?;
     match rpc.method.as_str() {
-        "hello" => app.db.save_facts(node_id, &rpc.params, ip)?,
+        "hello" => return app.db.save_facts(node_id, &rpc.params, ip),
         "report" => report(app, node_id, rpc.params)?,
         "ping.result" => {
             let task_id = rpc.params.get("task_id").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -237,7 +240,35 @@ fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<()> {
         }
         other => debug!("node {node_id} sent unknown method {other}"),
     }
-    Ok(())
+    Ok(false)
+}
+
+/// Resolves the address a node connects from to a country, once per address.
+///
+/// The answer is a third party's, and it ends up on the public page, so only
+/// two ASCII letters are ever stored. Anything else -- a private address
+/// because the agent and the hub share a network, an outage, a rate limit --
+/// leaves the column empty and the badge off.
+///
+/// ponytail: no retry and no backoff. The next handshake asks again, and a
+/// handshake is also the only moment the answer can have changed.
+fn locate(app: Shared, node_id: i64, ip: String) {
+    tokio::spawn(async move {
+        let lookup = async {
+            let url = format!("https://ipinfo.io/{ip}/country");
+            anyhow::Ok(app.http.get(url).send().await?.error_for_status()?.text().await?)
+        };
+        let cc = match lookup.await {
+            Ok(body) => body.trim().to_ascii_uppercase(),
+            Err(e) => return debug!("node {node_id}: no country for {ip}: {e:#}"),
+        };
+        if cc.len() != 2 || !cc.bytes().all(|b| b.is_ascii_uppercase()) {
+            return debug!("node {node_id}: {ip} resolved to no country");
+        }
+        if let Err(e) = app.db.set_country(node_id, &cc) {
+            warn!("node {node_id}: storing country {cc} failed: {e:#}");
+        }
+    });
 }
 
 /// Everything a report has to carry for the hub to store a complete row, plus

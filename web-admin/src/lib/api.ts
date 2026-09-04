@@ -53,6 +53,8 @@ export type Node = {
   month_start: string
   /** Panel only. */
   hostname?: string
+  /** ISO 3166-1 alpha-2, looked up from the address the agent connects from. */
+  country: string
   ip?: string
   ipv4?: string
   ipv6?: string

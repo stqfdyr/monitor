@@ -1036,6 +1036,35 @@ agent 本来就是 musl 静态二进制，Alpine 上跑得了，缺的只是 ini
 
 后台只有几个内部页面。`web-admin/src/App.tsx` 里的小型 `usePath()` 就够了，用 `history.pushState` + `popstate`。
 
+### 国家码在线查一次，不引 IP 库 **[用户]**
+
+节点名旁边一个两字母胶囊（`DMIT US`），和在线时长同一种胶囊。
+
+**数据来源是 hub 自己观测到的连接地址**（`node.ip`，`agent_ws` 握手时从 `client_ip` 拿的），不是
+agent 上报的——agent 只认识自己网卡上的地址，NAT 后面那台报出来的是内网地址。这一条同时意味着
+agent 不需要出网、不需要改协议、不需要发版。
+
+**否决 mmdb 本地库**（komari 的做法：`GeoLite2-Country.mmdb` 下载到 `./data/`，加
+`maxminddb` 依赖，另给一个更新按钮）。它换来的是离线可用和无限次查询，而这里的查询次数等于
+**节点数**——只在一个节点第一次连上、或者换了 IP 的时候查。为几十次查询扛一个 6 MB 的文件、一条
+更新路径和一个依赖，不划算。komari 还把四个 provider 抽成了 `GeoIPService` 接口在面板里切换，
+这里一个够。
+
+用 `https://ipinfo.io/{ip}/country`：https、免 token、响应体就是 `US` 两个字节。hub 早有
+`reqwest`（转发 agent 二进制用的），所以是零新依赖。
+
+规则都在 `agent_ws::locate` 和 `Db::save_facts` 两处：
+
+- **一个地址只查一次。** 查到就存库，之后每次重连都读库。
+- **地址变了才作废。** `save_facts` 一条 UPDATE 里比对旧地址，不一样就把 country 清空，同时告诉
+  调用方「这个节点欠一次查询」。换机房、换 IP 自动跟上。
+- **查不到就空着，不重试、不退避。** 下一次握手自然会再问一遍，而握手也正好是答案唯一可能变化的
+  时刻。hub 和 agent 在同一个内网时地址是私网的，查不出国家，胶囊就不出现——这是对的，不是缺陷。
+- **只接受两个 ASCII 字母。** 这是第三方给的字符串，且它会出现在公开页上，所以校验在入库之前做。
+
+**这个字段是公开的**，和 ip / hostname / remark 不同——理由见
+[security.md 的公开状态页](security.md#公开状态页)。
+
 ---
 
 ## 用户明确砍掉的功能

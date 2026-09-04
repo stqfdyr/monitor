@@ -55,6 +55,10 @@ CREATE TABLE IF NOT EXISTS node (
   swap_total INTEGER NOT NULL DEFAULT 0, disk_total INTEGER NOT NULL DEFAULT 0,
   agent_version TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '',
   ipv4 TEXT NOT NULL DEFAULT '', ipv6 TEXT NOT NULL DEFAULT '',
+  -- ISO 3166-1 alpha-2, looked up from `ip` once per address. Empty until the
+  -- lookup answers, and empty is what a node whose country nobody could tell
+  -- stays: the public page just leaves the badge off.
+  country TEXT NOT NULL DEFAULT '',
   -- Survives the disconnection it describes, unlike the in-memory live entry:
   -- an offline node's page is exactly where "since when" is worth reading.
   last_seen INTEGER NOT NULL DEFAULT 0,
@@ -118,7 +122,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Bump it and add a `migrate_to_N` when the schema changes under a database
 /// that is already in service.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Adds a column that older databases lack. A duplicate column means the
 /// migration has already run; every other error is real and must propagate.
@@ -202,6 +206,10 @@ fn migrate_to_2(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_to_3(conn: &Connection) -> Result<()> {
+    add_column(conn, "node", "country TEXT NOT NULL DEFAULT ''")
+}
+
 /// Brings a database that is already in service up to `SCHEMA_VERSION` and
 /// stamps it. `from` is the version it is at now, so a fresh file passes
 /// `SCHEMA_VERSION` and only gets the stamp.
@@ -214,6 +222,9 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     }
     if from < 2 {
         migrate_to_2(conn)?;
+    }
+    if from < 3 {
+        migrate_to_3(conn)?;
     }
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     Ok(())
@@ -281,6 +292,10 @@ pub struct Node {
     pub ipv4: String,
     #[serde(default)]
     pub ipv6: String,
+    /// ISO 3166-1 alpha-2 for `ip`, uppercase, or empty when unknown. Public:
+    /// it is on the status page next to the node's name.
+    #[serde(default)]
+    pub country: String,
     /// Unix seconds of the node's last report, written once a minute alongside
     /// the metric row. Zero for a node that has never reported.
     #[serde(default)]
@@ -556,14 +571,21 @@ impl Db {
         Ok(self.conn().query_row("SELECT id FROM node WHERE token = ?1", [token], |r| r.get(0)).optional()?)
     }
 
-    /// Stores the slow-changing facts an agent sends when it connects.
-    pub fn save_facts(&self, id: i64, f: &serde_json::Value, ip: &str) -> Result<()> {
+    /// Stores the slow-changing facts an agent sends when it connects, and
+    /// answers whether the node still needs a country looked up.
+    ///
+    /// A new address invalidates the old country, so the two move together in
+    /// one statement: `SET` reads the row as it was, so the comparison is
+    /// against the stored address, not the one being written.
+    pub fn save_facts(&self, id: i64, f: &serde_json::Value, ip: &str) -> Result<bool> {
         let s = |k: &str| f.get(k).and_then(|v| v.as_str()).unwrap_or("").to_owned();
         let n = |k: &str| f.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
-        self.conn().execute(
+        let conn = self.conn();
+        conn.execute(
             "UPDATE node SET hostname=?2, os=?3, kernel=?4, arch=?5, virt=?6, cpu_name=?7,
                              cpu_cores=?8, mem_total=?9, swap_total=?10, disk_total=?11,
-                             agent_version=?12, ip=?13, ipv4=?14, ipv6=?15
+                             agent_version=?12, ip=?13, ipv4=?14, ipv6=?15,
+                             country=CASE WHEN ip=?13 THEN country ELSE '' END
              WHERE id=?1",
             params![
                 id,
@@ -583,6 +605,13 @@ impl Db {
                 s("ipv6")
             ],
         )?;
+        Ok(conn.query_row("SELECT country = '' FROM node WHERE id=?1", [id], |r| r.get(0))?)
+    }
+
+    /// Records the country a lookup came back with. Set apart from the panel's
+    /// own writes: `update_node` never touches this column.
+    pub fn set_country(&self, id: i64, cc: &str) -> Result<()> {
+        self.conn().execute("UPDATE node SET country=?2 WHERE id=?1", params![id, cc])?;
         Ok(())
     }
 
@@ -1259,6 +1288,7 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         ip: s("ip"),
         ipv4: s("ipv4"),
         ipv6: s("ipv6"),
+        country: s("country"),
         last_seen: n("last_seen"),
         token: s("token"),
     }
@@ -1459,6 +1489,25 @@ mod tests {
         let token = format!("token-{}", rand::random::<u32>());
         db.create_node(&Node { name: "n".into(), traffic_reset_day: reset_day, ..Default::default() }, &token)
             .unwrap()
+    }
+
+    /// The country is derived from the address, so it has to be dropped the
+    /// moment the address stops matching it -- and only then, or every
+    /// reconnect would spend an outbound request re-asking a settled question.
+    #[test]
+    fn a_country_outlives_a_reconnect_and_dies_with_the_address_it_came_from() {
+        let db = db();
+        let id = node(&db, 1);
+        let facts = serde_json::json!({"hostname": "h"});
+        let save = |ip: &str| db.save_facts(id, &facts, ip).unwrap();
+        let stored = || db.node(id).unwrap().unwrap().country;
+
+        assert!(save("198.51.100.4"), "a node with no country is owed a lookup");
+        db.set_country(id, "US").unwrap();
+        assert!(!save("198.51.100.4"), "the same address asks nothing a second time");
+        assert_eq!(stored(), "US");
+        assert!(save("203.0.113.9"), "a new address is a new question");
+        assert_eq!(stored(), "", "and the answer to the old one is gone");
     }
 
     #[test]
