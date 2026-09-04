@@ -12,7 +12,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::agent_ws::Agent;
-use crate::auth::{authed, hash_password, issue_session, random_token, with_cookies};
+use crate::auth::{
+    authed, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
+};
 use crate::db::{Node, PingTask, Traffic};
 use crate::{agent_ws, App, Shared};
 
@@ -710,7 +712,7 @@ async fn restore(app: &Shared, path: &str) -> Result<(), anyhow::Error> {
 /// is left, which is the only way SQLite gives the space back to the
 /// filesystem.
 pub async fn db_vacuum(_: Admin, State(app): State<Shared>) -> Response {
-    let keep = app.db.get("retention_days").and_then(|v| v.parse::<i64>().ok()).unwrap_or(30).clamp(1, 3_650);
+    let keep = app.db.retention_days();
     let app = app.clone();
     // A rebuild of the whole file, holding the connection the agents write
     // through: it belongs on a blocking thread.
@@ -789,6 +791,38 @@ pub async fn delete_theme(_: Admin, State(app): State<Shared>, Path(short): Path
 pub async fn themes(_: Admin, State(app): State<Shared>) -> Response {
     match crate::frontend::themes(&app) {
         Ok(themes) => Json(json!({"themes": themes})).into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+/// Every live session, the caller's own marked.
+///
+/// `id` is the stored SHA-256 of the session token, not the token: it names a
+/// row without being something a browser could present as a cookie.
+pub async fn sessions(_: Admin, State(app): State<Shared>, headers: HeaderMap) -> Response {
+    let mine = current_session(&headers);
+    match app.db.sessions() {
+        Ok(rows) => Json(
+            rows.into_iter()
+                .map(|(hash, expires_at)| {
+                    json!({
+                        "current": mine.as_deref() == Some(hash.as_str()),
+                        "created_at": issued_at(expires_at),
+                        "id": hash,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+/// Deleting a row that is not there is not an error: two panels open on the
+/// same list both get the device signed out, which is what was asked for.
+pub async fn delete_session(_: Admin, State(app): State<Shared>, Path(id): Path<String>) -> Response {
+    match app.db.drop_session(&id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => fail(e),
     }
 }
@@ -1248,8 +1282,11 @@ mod tests {
         let id = node(&app, "n", true);
         let now = Utc::now().timestamp();
         // One sample a day for a month, so a row's presence names its window.
+        // The minute of slack keeps day seven off the 168-hour cutoff exactly:
+        // on the boundary, a second passing between these inserts and the query
+        // below drops it and the count comes out one short.
         for day in 0..30 {
-            app.db.insert_metric(id, now - day * 86_400, &json!({"cpu": 1.0})).unwrap();
+            app.db.insert_metric(id, now - day * 86_400 + 60, &json!({"cpu": 1.0})).unwrap();
         }
         let ask = |hours| {
             let query = format!("hours={hours}&series=metrics");
@@ -1293,6 +1330,39 @@ mod tests {
             .unwrap();
         let token = cookie.split(';').next().unwrap().split('=').nth(1).unwrap();
         assert!(app.db.session_valid(&sha256(token)), "the replacement session must work");
+    }
+
+    /// The panel hides the delete button on the caller's own row, so the mark
+    /// is the only thing standing between an admin and signing themselves out.
+    #[tokio::test]
+    async fn the_session_list_marks_the_caller_and_hides_expired_rows() {
+        let app = std::sync::Arc::new(app());
+        let (mine, theirs, stale) = (random_token(), random_token(), random_token());
+        let now = Utc::now().timestamp();
+        app.db.create_session(&sha256(&mine), now + 3_600).unwrap();
+        app.db.create_session(&sha256(&theirs), now + 7_200).unwrap();
+        app.db.create_session(&sha256(&stale), now - 1).unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, format!("monitor_session={mine}").parse().unwrap());
+        let body = axum::body::to_bytes(
+            sessions(Admin, axum::extract::State(app.clone()), headers).await.into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+        let rows: Vec<Value> = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(rows.len(), 2, "an expired session is not a session");
+        assert_eq!(rows[0]["id"], sha256(&theirs), "newest first");
+        assert_eq!(rows[0]["current"], false);
+        assert_eq!(rows[1]["id"], sha256(&mine));
+        assert_eq!(rows[1]["current"], true, "the caller's own row must be marked");
+        assert_eq!(rows[1]["created_at"].as_i64().unwrap(), now + 3_600 - 14 * 86_400);
+
+        delete_session(Admin, axum::extract::State(app.clone()), Path(sha256(&theirs))).await;
+        assert!(!app.db.session_valid(&sha256(&theirs)), "the deleted device is signed out");
+        assert!(app.db.session_valid(&sha256(&mine)), "and nobody else is");
     }
 
     #[tokio::test]

@@ -308,6 +308,8 @@ async fn main() -> Result<()> {
         .route("/api/nodes/{id}/traffic", put(api::patch_traffic))
         .route("/api/ping-tasks", get(api::ping_tasks).post(api::save_ping_task))
         .route("/api/ping-tasks/{id}", delete(api::delete_ping_task))
+        .route("/api/sessions", get(api::sessions))
+        .route("/api/sessions/{id}", delete(api::delete_session))
         .route("/api/settings", get(api::settings).put(api::save_settings))
         .route("/api/themes", get(api::themes))
         .route("/api/themes/{short}", delete(api::delete_theme))
@@ -492,8 +494,7 @@ async fn housekeeping(app: Shared) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3_600));
     loop {
         ticker.tick().await;
-        let keep =
-            app.db.get("retention_days").and_then(|v| v.parse::<i64>().ok()).unwrap_or(30).clamp(1, 3_650);
+        let keep = app.db.retention_days();
         if let Err(e) = app.db.prune(keep) {
             warn!("pruning history failed: {e:#}");
         }

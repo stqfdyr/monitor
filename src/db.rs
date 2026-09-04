@@ -968,14 +968,35 @@ impl Db {
         main_file(&self.conn())
     }
 
+    /// The retention window `prune` and the data page both work from. Stored
+    /// as text by the settings form, so a missing or unparsable value is the
+    /// default rather than an error.
+    pub fn retention_days(&self) -> i64 {
+        self.get("retention_days").and_then(|v| v.parse::<i64>().ok()).unwrap_or(30).clamp(1, 3_650)
+    }
+
     /// What the panel's data page reads: how much room the file takes, how
-    /// much of it is free pages waiting for a `VACUUM`, and how many rows are
-    /// behind that.
+    /// much of it is free pages waiting for a `VACUUM`, and how far back the
+    /// history behind that actually reaches.
+    ///
+    /// `oldest` against `retention` is the one pair here that can be wrong:
+    /// history older than the window means `prune` has not been running.
     pub fn stats(&self) -> Result<serde_json::Value> {
+        // Before the connection: `conn()` hands out a guard on a plain Mutex,
+        // and `retention_days` reaches for the same one.
+        let retention = self.retention_days();
         let conn = self.conn();
         let file = main_file(&conn);
         let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
         let free_pages: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+        // Both pruned at the same cutoff, so the earlier of the two is where
+        // history starts. A full scan of each -- the same one the counts below
+        // already pay for.
+        let oldest: Option<i64> = conn.query_row(
+            "SELECT MIN(ts) FROM (SELECT MIN(ts) AS ts FROM metric UNION ALL SELECT MIN(ts) FROM ping_record)",
+            [],
+            |r| r.get(0),
+        )?;
         let mut rows = serde_json::Map::new();
         for table in TABLES {
             let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
@@ -986,6 +1007,8 @@ impl Db {
             "size": bytes_of(&file),
             "wal": bytes_of(&format!("{file}-wal")),
             "free": free_pages * page_size,
+            "oldest": oldest,
+            "retention": retention,
             "rows": rows,
         }))
     }
@@ -1128,6 +1151,19 @@ impl Db {
             .ok()
             .flatten()
             .is_some()
+    }
+
+    /// Live sessions, newest first. Expired rows are filtered here rather than
+    /// left to `expire_sessions`, which only sweeps once an hour.
+    pub fn sessions(&self) -> Result<Vec<(String, i64)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT token_hash, expires_at FROM session WHERE expires_at > ?1 ORDER BY expires_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([Utc::now().timestamp()], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
     }
 
     pub fn drop_session(&self, token_hash: &str) -> Result<()> {
@@ -1364,6 +1400,29 @@ mod tests {
 
         newer.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}")).unwrap();
         db.check_backup(&bad).unwrap();
+    }
+
+    /// `oldest` is what the data page holds against the retention window, so it
+    /// has to reach across both pruned tables, not just whichever has rows.
+    #[test]
+    fn stats_report_the_earliest_history_row_and_the_window_it_is_kept_for() {
+        let scratch = Scratch::new();
+        let db = Db::open(&scratch.0).unwrap();
+        let id = node(&db, 1);
+        let now = Utc::now().timestamp();
+
+        assert_eq!(db.stats().unwrap()["oldest"], serde_json::Value::Null, "no history, no start");
+        assert_eq!(db.stats().unwrap()["retention"], 30, "an unset window is the default");
+
+        db.insert_metric(id, now - 3 * 86_400, &serde_json::json!({"cpu": 1.0})).unwrap();
+        assert_eq!(db.stats().unwrap()["oldest"], now - 3 * 86_400);
+
+        // Older, and in the other table: the earlier of the two wins.
+        db.insert_ping(id, 1, now - 9 * 86_400, 12).unwrap();
+        assert_eq!(db.stats().unwrap()["oldest"], now - 9 * 86_400);
+
+        db.set("retention_days", "9999").unwrap();
+        assert_eq!(db.stats().unwrap()["retention"], 3_650, "a stored window is still clamped");
     }
 
     /// Deleted rows leave free pages behind; only a rebuild gives them back to

@@ -896,10 +896,9 @@ function Themes() {
         <div>
           <h3 className="text-sm font-medium">安装主题</h3>
           <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            选主题作者发布的 <code>theme.tar.gz</code>（里面是 <code>dist/</code> 和 <code>theme.json</code>）。
-            装好立刻可选，不用重启 hub；同名主题会被整体替换。
+            上传主题作者发布的 <code>theme.tar.gz</code>，同名主题整体替换。
             <br />
-            主题是在访客浏览器里运行的第三方代码，只装你信得过的来源。
+            主题代码在访客浏览器中执行，请只安装可信来源。
           </p>
         </div>
         <div>
@@ -1060,6 +1059,58 @@ function SettingsTab() {
 
 // The two ways into this panel, on their own page: the GitHub identity it
 // trusts and the password that still works when GitHub does not.
+type Session = { id: string; current: boolean; created_at: number }
+
+function Sessions() {
+  const [rows, setRows] = useState<Session[] | null>(null)
+  const [busy, setBusy] = useState("")
+
+  const load = () => api<Session[]>("/sessions").then(setRows).catch((e: Error) => toast.error(e.message))
+  useEffect(() => { load() }, [])
+
+  async function remove(id: string) {
+    setBusy(id)
+    try {
+      await api(`/sessions/${id}`, { method: "DELETE" })
+      toast.success("已删除会话")
+      load()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setBusy("")
+    }
+  }
+
+  if (!rows) return null
+  return (
+    <Card className="gap-4 p-5">
+      <div>
+        <h3 className="text-sm font-medium">登录会话</h3>
+        <p className="mt-1 text-xs text-muted-foreground">
+          每次登录一条，14 天后过期。删除后该设备下一次请求就被登出。
+        </p>
+      </div>
+      <div className="divide-y">
+        {rows.map((s) => (
+          <div key={s.id} className="flex items-center justify-between gap-3 py-2.5 first:pt-0 last:pb-0">
+            <div className="flex min-w-0 items-center gap-2 text-sm">
+              <span className="tnum">{new Date(s.created_at * 1000).toLocaleString()}</span>
+              {s.current && <Badge variant="secondary">当前设备</Badge>}
+            </div>
+            {/* 当前会话没有删除按钮：右上角的退出登录做的就是这件事，而在这里删
+                只会让已经渲染好的面板以为自己还登着。 */}
+            {!s.current && (
+              <Button size="icon" variant="ghost" disabled={!!busy} onClick={() => remove(s.id)}>
+                <Trash2 />
+              </Button>
+            )}
+          </div>
+        ))}
+      </div>
+    </Card>
+  )
+}
+
 function Security({ site }: { site: string }) {
   const { s, set, save } = useSettings()
   const [password, setPassword] = useState("")
@@ -1068,6 +1119,8 @@ function Security({ site }: { site: string }) {
 
   return (
     <div className="space-y-4">
+      <Sessions />
+
       <Card className="gap-4 p-5">
         <div>
           <h3 className="text-sm font-medium">GitHub 单点登录</h3>
@@ -1139,17 +1192,17 @@ type DbInfo = {
   size: number
   wal: number
   free: number
+  /** Timestamp of the earliest history row, null on a database with none. */
+  oldest: number | null
+  retention: number
   rows: Record<string, number>
 }
 
-// The tables worth naming. `setting`, `traffic` and `ping_node` are one row
-// per node or per key and say nothing about size.
+// The only two tables whose row count says anything about size. Every other
+// one is a row per node or per key.
 const DB_ROWS: [string, string][] = [
-  ["node", "节点"],
   ["metric", "历史明细"],
   ["ping_record", "延迟记录"],
-  ["ping_task", "探测任务"],
-  ["session", "登录会话"],
 ]
 
 function Data() {
@@ -1209,11 +1262,30 @@ function Data() {
           {stat("文件大小", bytes(info.size))}
           {stat("预写日志", bytes(info.wal))}
           {stat("可回收空间", bytes(info.free))}
+          {stat("保留天数", `${info.retention} 天`)}
+          {/* 和保留天数并排：跨度小于保留期是还没攒够，大于保留期就是每小时
+              那次 prune 没在跑。 */}
+          {stat("历史跨度", info.oldest ? `${Math.floor((Date.now() / 1000 - info.oldest) / 86400)} 天` : "—")}
           {DB_ROWS.map(([key, label]) => stat(label, (info.rows[key] ?? 0).toLocaleString()))}
         </div>
         <p className="truncate text-xs text-muted-foreground" title={info.path}>
           <code>{info.path}</code>
         </p>
+      </Card>
+
+      <Card className="gap-4 p-5">
+        <div>
+          <h3 className="text-sm font-medium">回收空间</h3>
+          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+            按保留天数清掉过期明细，再重建数据库文件把空出来的页还给磁盘（SQLite 的 VACUUM）。
+            重建期间需要与数据库等量的空闲磁盘，过程中面板和上报会短暂变慢。
+          </p>
+        </div>
+        <div>
+          <Button size="sm" variant="secondary" disabled={!!busy} onClick={() => setConfirm("vacuum")}>
+            {busy === "vacuum" ? "回收中…" : "立即回收"}
+          </Button>
+        </div>
       </Card>
 
       <Card className="gap-4 p-5">
@@ -1247,21 +1319,6 @@ function Data() {
               e.target.value = ""
             }}
           />
-        </div>
-      </Card>
-
-      <Card className="gap-4 p-5">
-        <div>
-          <h3 className="text-sm font-medium">回收空间</h3>
-          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            按保留天数清掉过期明细，再重建数据库文件把空出来的页还给磁盘（SQLite 的 VACUUM）。
-            重建期间需要与数据库等量的空闲磁盘，过程中面板和上报会短暂变慢。
-          </p>
-        </div>
-        <div>
-          <Button size="sm" variant="secondary" disabled={!!busy} onClick={() => setConfirm("vacuum")}>
-            {busy === "vacuum" ? "回收中…" : "立即回收"}
-          </Button>
         </div>
       </Card>
 

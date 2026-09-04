@@ -136,6 +136,18 @@ fn set_cookie(name: &str, value: &str, max_age: i64, secure: bool) -> String {
     cookie
 }
 
+/// The digest of the caller's own session, so a list of them can mark it.
+pub fn current_session(headers: &HeaderMap) -> Option<String> {
+    cookie_value(headers, COOKIE).map(|token| sha256(&token))
+}
+
+/// When a session with this expiry was issued. `issue_session` sets the expiry
+/// to the moment of issue plus `SESSION_DAYS`, so this is exact, not an
+/// estimate -- change one and the other follows.
+pub fn issued_at(expires_at: i64) -> i64 {
+    expires_at - SESSION_DAYS * 86_400
+}
+
 /// The request's headers decide the Secure flag when the hub has no `--site`;
 /// see `App::secure_cookies`.
 pub fn issue_session(app: &App, headers: &HeaderMap) -> Result<String> {
