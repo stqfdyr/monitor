@@ -87,7 +87,7 @@ impl Default for Throttle {
 }
 
 impl Throttle {
-    fn locked(&self, ip: IpAddr) -> bool {
+    pub(crate) fn locked(&self, ip: IpAddr) -> bool {
         let mut map = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         match map.get(&ip) {
             Some((n, since)) if since.elapsed() < self.window => *n >= MAX_ATTEMPTS,
@@ -99,7 +99,7 @@ impl Throttle {
         }
     }
 
-    fn record_failure(&self, ip: IpAddr) {
+    pub(crate) fn record_failure(&self, ip: IpAddr) {
         let mut map = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         // Addresses past their window are dropped here rather than left to
         // accumulate, which also restarts the count for a returning one.
@@ -107,7 +107,7 @@ impl Throttle {
         map.entry(ip).or_insert((0, Instant::now())).0 += 1;
     }
 
-    fn clear(&self, ip: IpAddr) {
+    pub(crate) fn clear(&self, ip: IpAddr) {
         self.seen.lock().unwrap_or_else(|e| e.into_inner()).remove(&ip);
     }
 }

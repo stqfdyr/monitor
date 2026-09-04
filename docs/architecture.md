@@ -114,9 +114,15 @@ agent 收到后会**保留没变化的任务**（同 id + 同 target + 同 inter
 `src/main.rs` 的路由表是权威定义。
 
 **agent**：`GET /api/agent/ws`（Bearer token）、`GET /install.sh`（公开，不含密钥）、
-`GET /agent/{arch}`（公开，把 release 二进制从 GitHub 转发给节点）
+`GET /agent/{arch}`（公开，把 release 二进制从 GitHub 转发给节点）、
+`POST /api/agent/register`（公开，凭窗口内有效的注册 key 换一个节点 token）
 
 安装命令默认传 `--interval 1`，也可在 1..3600 内调整；hub 只有明文 HTTP 时还会带上 `--insecure`。
+
+`--register KEY` 是给一批机器用的另一种入口：面板（节点 → 批量添加）开一个一小时的窗口，
+`install.sh` 用 key 换这台机器自己的 token，名字取 `hostname`。命令里不含任何节点的凭证，所以
+一条命令可以复制到所有机器上。机器上已经有 `agent.env` 的就直接沿用其中的 token，重跑不会重复
+注册。窗口、上限和限流见 [security.md](security.md)。
 
 二进制总是走 `<hub>/agent/<arch>`，由 hub 从 GitHub Release 取回再转发——能连上 hub 就能装，
 IPv6-only 或者出不去的机器不用再找加速站。并发转发数由 `main::RELAY_GATE` 限到 4。

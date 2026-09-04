@@ -2,7 +2,7 @@
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
-use axum::extract::{FromRequestParts, Path, Query, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 use crate::agent_ws::Agent;
 use crate::auth::{
-    authed, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
+    authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
 };
 use crate::db::{Node, PingTask, Traffic};
 use crate::{agent_ws, App, Shared};
@@ -325,6 +325,108 @@ pub async fn create_node(
             invalidate_snapshot(&app);
             Json(json!({"id": id})).into_response()
         }
+        Err(e) => fail(e),
+    }
+}
+
+// ---- automatic registration ----
+
+/// How long a registration window stays open.
+///
+/// Setting a batch of machines up takes minutes, and forgetting to close the
+/// door afterwards is what people actually do. The window expires on its own
+/// rather than waiting for someone to come back and switch it off.
+const REGISTER_WINDOW: i64 = 3600;
+
+/// How many nodes one window may register.
+///
+/// Without it, whoever holds the key for the hour can fill the node table.
+/// A hundred is far past a plausible batch and far short of a problem.
+const REGISTER_LIMIT: i64 = 100;
+
+/// Trades a registration key for a node token, so a batch of machines can be
+/// installed with one command instead of one panel visit each.
+///
+/// No session stands behind this one: the caller is `install.sh` on a machine
+/// that has never talked to the hub. What stands in for a session is a key the
+/// panel issues, good only inside [`REGISTER_WINDOW`].
+///
+/// One request costs two setting reads, a `COUNT`, and an `INSERT`. It sends
+/// nothing outbound, and the router's 64 KiB body limit bounds the name.
+pub async fn agent_register(
+    State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    // Plain text in, plain text out. The caller is a shell script, and so are
+    // this route's neighbours -- `/install.sh` and `/agent/{arch}` answer with
+    // a script and a binary. A bare token is one `$(curl ...)` away, with no
+    // JSON parser to depend on in a POSIX `sh`.
+    name: String,
+) -> Response {
+    let ip = client_ip(&headers, peer.ip());
+    if app.throttle.locked(ip) {
+        return (StatusCode::TOO_MANY_REQUESTS, "too many attempts, try again later").into_response();
+    }
+    // One answer for both "no window is open" and "that key is wrong": the
+    // difference is only useful to someone who has neither.
+    let closed = || (StatusCode::FORBIDDEN, "registration is closed").into_response();
+    let until = app.db.get("register_until").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+    let Some(key) = app.db.get("register_key").filter(|k| !k.is_empty() && Utc::now().timestamp() < until)
+    else {
+        return closed();
+    };
+    if agent_ws::bearer(&headers) != Some(key.as_str()) {
+        // Only a wrong key counts against the address. With the window shut
+        // there is no secret to guess, and counting then would let anyone lock
+        // an address they name in `X-Forwarded-For` out of the sign-in page.
+        app.throttle.record_failure(ip);
+        return closed();
+    }
+    match app.db.nodes_created_since(until - REGISTER_WINDOW) {
+        Ok(n) if n >= REGISTER_LIMIT => {
+            return (StatusCode::FORBIDDEN, "this window has registered enough nodes").into_response()
+        }
+        Err(e) => return fail(e),
+        Ok(_) => {}
+    }
+
+    // The name comes off a machine nobody has vouched for yet: control
+    // characters would break the panel's rows, and a length has to stop
+    // somewhere. `chars()` rather than bytes, so the cut lands between them.
+    let name: String = name.trim().chars().filter(|c| !c.is_control()).take(64).collect();
+    let name = if name.is_empty() { "unnamed".to_owned() } else { name };
+    // Field defaults live in `Node`'s serde attributes and nowhere else.
+    // `Node::default()` is a different set of values -- private, reset day 0 --
+    // and a node registered here has to land exactly where a panel-added one does.
+    let node = match serde_json::from_value::<Node>(json!({ "name": name })) {
+        Ok(node) => node,
+        Err(e) => return fail(e),
+    };
+    let token = random_token();
+    match app.db.create_node(&node, &token) {
+        Ok(_) => {
+            invalidate_snapshot(&app);
+            token.into_response()
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// Opens a registration window with a fresh key. Whatever key was there stops
+/// working the moment this returns.
+pub async fn open_register(_: Admin, State(app): State<Shared>) -> Response {
+    let key = random_token();
+    let until = (Utc::now().timestamp() + REGISTER_WINDOW).to_string();
+    match app.db.set("register_key", &key).and_then(|()| app.db.set("register_until", &until)) {
+        Ok(()) => Json(json!({"register_key": key, "register_until": until})).into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+/// Closes it early -- the operator saying they are done before the hour is up.
+pub async fn close_register(_: Admin, State(app): State<Shared>) -> Response {
+    match app.db.set("register_key", "").and_then(|()| app.db.set("register_until", "0")) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => fail(e),
     }
 }
@@ -969,6 +1071,12 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
         "github_secret_set".into(),
         json!(app.db.get("github_client_secret").is_some_and(|v| !v.is_empty())),
     );
+    // Read-only here. A window is opened and closed through its own route, so
+    // the key is always one the hub generated, and `save_settings` keeps
+    // refusing both names.
+    for key in ["register_key", "register_until"] {
+        out.insert(key.into(), json!(app.db.get(key).unwrap_or_default()));
+    }
     Json(Value::Object(out))
 }
 
@@ -1407,6 +1515,82 @@ mod tests {
         let refused = create_node(Admin, State(app.clone()), Ok(blank)).await;
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
         assert_eq!(app.db.nodes().unwrap().len(), 2);
+    }
+
+    /// Every gate on the anonymous route, in the order a batch install meets
+    /// them: shut, wrong key, open, expired, closed by hand.
+    #[tokio::test]
+    async fn registration_only_works_inside_a_window_the_panel_opened() {
+        let app = std::sync::Arc::new(app());
+        let register = |key: Option<&str>, name: &str| {
+            let mut headers = HeaderMap::new();
+            if let Some(key) = key {
+                headers.insert("authorization", format!("Bearer {key}").parse().unwrap());
+            }
+            agent_register(
+                State(app.clone()),
+                ConnectInfo("198.51.100.7:40000".parse().unwrap()),
+                headers,
+                name.to_owned(),
+            )
+        };
+
+        // Nothing was opened, so no key is the right one.
+        assert_eq!(register(Some("guess"), "a").await.status(), StatusCode::FORBIDDEN);
+        assert!(app.db.nodes().unwrap().is_empty());
+
+        assert_eq!(open_register(Admin, State(app.clone())).await.status(), StatusCode::OK);
+        let key = app.db.get("register_key").unwrap();
+        assert_eq!(register(Some("guess"), "a").await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(register(None, "a").await.status(), StatusCode::FORBIDDEN);
+        assert!(app.db.nodes().unwrap().is_empty());
+
+        let issued = register(Some(&key), "  web-01\n").await;
+        assert_eq!(issued.status(), StatusCode::OK);
+        let token = axum::body::to_bytes(issued.into_body(), usize::MAX).await.unwrap().to_vec();
+        let token = String::from_utf8(token).unwrap();
+        // The point of the whole route: what came back is a token an agent can
+        // connect with, not merely a 200.
+        let id = app.db.node_by_token(&token).unwrap().expect("token opens a node");
+        let node = app.db.nodes().unwrap().into_iter().find(|n| n.id == id).unwrap();
+        assert_eq!(node.name, "web-01");
+        // Registered nodes land on the panel's defaults, not on `Node::default()`.
+        assert!(node.public);
+        assert_eq!(node.traffic_reset_day, 1);
+
+        // An hour later the same key buys nothing, which is what makes leaving
+        // the window open harmless.
+        app.db.set("register_until", &(Utc::now().timestamp() - 1).to_string()).unwrap();
+        assert_eq!(register(Some(&key), "b").await.status(), StatusCode::FORBIDDEN);
+
+        // Reopened, then shut by hand: the key from the open window stops working.
+        open_register(Admin, State(app.clone())).await;
+        let key = app.db.get("register_key").unwrap();
+        assert_eq!(close_register(Admin, State(app.clone())).await.status(), StatusCode::NO_CONTENT);
+        assert_eq!(register(Some(&key), "c").await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(app.db.nodes().unwrap().len(), 1);
+    }
+
+    /// The ceiling on the anonymous route: a leaked key cannot fill the table.
+    #[tokio::test]
+    async fn one_window_stops_registering_at_the_limit() {
+        let app = std::sync::Arc::new(app());
+        open_register(Admin, State(app.clone())).await;
+        let key = app.db.get("register_key").unwrap();
+        for i in 0..REGISTER_LIMIT {
+            node(&app, &format!("n{i}"), true);
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {key}").parse().unwrap());
+        let refused = agent_register(
+            State(app.clone()),
+            ConnectInfo("198.51.100.7:40000".parse().unwrap()),
+            headers,
+            "one-too-many".to_owned(),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        assert_eq!(app.db.nodes().unwrap().len() as i64, REGISTER_LIMIT);
     }
 
     #[test]

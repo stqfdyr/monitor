@@ -378,6 +378,113 @@ function installCommand(site: string, token: string, seconds: number) {
   return `curl -fsSL ${site}/install.sh | sh -s -- ${args.join(" ")}`
 }
 
+// One command for a batch of machines. The key is the hub's, good only inside
+// the window it opened, and each machine trades it for a token of its own --
+// so unlike an install command, this text is nobody's credential and can go
+// straight into a loop.
+function registerCommand(site: string, key: string) {
+  const args = [`--server ${site}`, `--register ${key}`]
+  if (needsInsecure(site)) args.push("--insecure")
+  return `curl -fsSL ${site}/install.sh | sh -s -- ${args.join(" ")}`
+}
+
+// The window lives on the hub; this only reads it back and counts down, which
+// is also what makes an expired one disappear from the panel without anyone
+// clicking anything.
+function useRegisterWindow() {
+  const [key, setKey] = useState("")
+  const [until, setUntil] = useState(0)
+  const [now, setNow] = useState(() => Math.floor(Date.now() / 1000))
+
+  useEffect(() => {
+    api<Settings>("/settings")
+      .then((s) => { setKey(String(s.register_key ?? "")); setUntil(Number(s.register_until ?? 0)) })
+      .catch(() => {})
+    const timer = setInterval(() => setNow(Math.floor(Date.now() / 1000)), 1000)
+    return () => clearInterval(timer)
+  }, [])
+
+  return {
+    key,
+    left: key === "" ? 0 : Math.max(0, until - now),
+    async open() {
+      try {
+        const w = await api<{ register_key: string; register_until: string }>("/register-window", { method: "POST" })
+        setKey(w.register_key)
+        setUntil(Number(w.register_until))
+      } catch (e) {
+        toast.error((e as Error).message)
+      }
+    },
+    async close() {
+      try {
+        await api("/register-window", { method: "DELETE" })
+        setKey("")
+        setUntil(0)
+        toast.success("注册窗口已关闭")
+      } catch (e) {
+        toast.error((e as Error).message)
+      }
+    },
+  }
+}
+
+function RegisterDialog({ site, reg, onClose }: {
+  site: string
+  reg: ReturnType<typeof useRegisterWindow>
+  onClose: () => void
+}) {
+  const command = reg.left > 0 ? registerCommand(site, reg.key) : ""
+  const clock = `${Math.floor(reg.left / 60)}:${String(reg.left % 60).padStart(2, "0")}`
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-xl">
+        <DialogHeader>
+          <DialogTitle>批量添加</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">
+            开一个一小时的注册窗口。期间这条命令在任意机器上跑一次，那台机器就会自己出现在
+            列表里，名字取自它的 hostname。命令里没有任何一台机器的凭证，可以直接进循环。
+          </p>
+          {command ? (
+            <div className="space-y-2">
+              <Label className="text-sm font-medium">安装命令</Label>
+              <pre className="h-24 overflow-auto whitespace-pre-wrap break-all rounded-lg border bg-muted/40 p-3 text-xs leading-relaxed select-all">
+                {command}
+              </pre>
+              {needsInsecure(site) && (
+                <p className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                  这个 hub 只有明文 HTTP，命令里的 <code>--insecure</code> 是必需的：注册密钥、凭证与
+                  上报数据全程明文，安装时下载的二进制也走同一条未验证的通道。
+                </p>
+              )}
+              <div className="flex items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
+                <span>
+                  <span className="block font-medium">窗口 {clock} 后自动关闭</span>
+                  <span className="mt-0.5 block text-xs text-muted-foreground">
+                    到点自动失效，装完了也可以现在就关
+                  </span>
+                </span>
+                <Button variant="outline" size="sm" onClick={reg.close}>立即关闭</Button>
+              </div>
+            </div>
+          ) : (
+            <Button onClick={reg.open}>开启一小时窗口</Button>
+          )}
+        </div>
+        <DialogFooter>
+          <Button variant="ghost" onClick={onClose}>关闭</Button>
+          <Button onClick={() => copy(command)} disabled={!command}>
+            <Copy className="size-4" /> 复制
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 function InstallDialog({ node, site, onClose, onRotated }: {
   node: Node
   site: string
@@ -470,6 +577,8 @@ function Nodes({ nodes, refresh, site }: { nodes: Node[]; refresh: () => void; s
   const [editing, setEditing] = useState<Node | null>(null)
   const [billing, setBilling] = useState<Node | null>(null)
   const [installing, setInstalling] = useState<Node | null>(null)
+  const [registering, setRegistering] = useState(false)
+  const reg = useRegisterWindow()
   const [deleting, setDeleting] = useState<Node | null>(null)
   const [removing, setRemoving] = useState(false)
   const [manualOrder, setManualOrder] = useState<number[]>([])
@@ -527,7 +636,12 @@ function Nodes({ nodes, refresh, site }: { nodes: Node[]; refresh: () => void; s
 
   return (
     <div className="space-y-4">
-      <div className="flex justify-end">
+      <div className="flex justify-end gap-2">
+        {/* An open window is visible from the list itself, so nobody has to
+            remember they left one open. */}
+        <Button variant="outline" onClick={() => setRegistering(true)}>
+          <Server /> 批量添加{reg.left > 0 && ` · ${Math.ceil(reg.left / 60)} 分`}
+        </Button>
         <Button onClick={() => setCreating(true)}>
           <Plus /> 添加节点
         </Button>
@@ -661,6 +775,8 @@ function Nodes({ nodes, refresh, site }: { nodes: Node[]; refresh: () => void; s
       {billing && (
         <BillingForm node={billing} onClose={() => setBilling(null)} onSaved={refresh} />
       )}
+      {registering && <RegisterDialog site={site} reg={reg} onClose={() => { setRegistering(false); refresh() }} />}
+
       {installing && (
         <InstallDialog
           node={installing}

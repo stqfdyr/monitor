@@ -479,6 +479,12 @@ impl Db {
         Ok(id)
     }
 
+    /// How many nodes were created at or after `ts`. Caps what one
+    /// registration window can add; see `api::REGISTER_LIMIT`.
+    pub fn nodes_created_since(&self, ts: i64) -> Result<i64> {
+        Ok(self.conn().query_row("SELECT COUNT(*) FROM node WHERE created_at >= ?1", [ts], |r| r.get(0))?)
+    }
+
     /// Records that the node reported. Written on the same beat as the metric
     /// row, so it costs one update a minute rather than one a report.
     pub fn touch_seen(&self, id: i64, ts: i64) -> Result<()> {

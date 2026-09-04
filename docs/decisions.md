@@ -194,6 +194,35 @@ komari 对此零检查：`-e http://1.2.3.4:25774` 直接就用，明文传 toke
 **否决**：菜单里问 `--site`（大多数人不需要，问了反而像必填）、`--data` 自定义数据目录、发布通道选择
 （只有 tag release，没有 snapshot）、装指定版本（要装旧版的人会自己 curl）。
 
+### 自动注册在 `install.sh` 里做，不在 agent 里 **[用户]**
+
+面板开一个一小时的窗口，`install.sh --register KEY` 拿 key 换这台机器自己的 token，写进它本来
+就要写的 `/etc/monitor/agent.env`。**agent 一行代码没动。**
+
+**为什么不放 agent 里**：agent 有一条无状态铁律。komari 把 auto-discovery 放在 agent 启动路径
+上，代价就是换来的 token 得落盘（`auto-discovery.json`，`0644`——那台机器上任何用户都读得到）。
+放在安装脚本里，token 落在已经有的那个 `0700` 目录里，不需要第二个文件，也不需要 agent 记住
+任何东西。
+
+和 komari 的 auto-discovery 逐项对比：
+
+| | komari | 这里 |
+|---|---|---|
+| 注册发起方 | agent 每次启动 | `install.sh` 安装时 |
+| token 落盘 | agent 目录 `auto-discovery.json`，`0644` | `/etc/monitor/agent.env`，`0700` 目录 |
+| key 有效期 | 永久 | 一小时，面板可提前关 |
+| 单个 key 能建多少节点 | 无限 | 一个窗口 100 个 |
+| 重跑安装命令 | 读 json 复用 | 读 env 复用，同样不会重复添加 |
+| agent 改动 | 一个新模块 | 无 |
+
+**否决**：agent 自己注册（要落盘，破无状态铁律）；永久有效的 key（忘了关是必然发生的，窗口
+过期不该依赖谁记得回来点一下）；用 hostname 去重（那等于谁拿到 key 就能冒充同名节点把 token
+换走）；窗口时长做成设置项（装机是分钟级的动作，一小时已经宽出一个量级）。
+
+**留着不解决**：重装系统后再跑一次注册命令会多出一个节点，旧的成僵尸，面板里手动删。跨重装
+的稳定标识不存在（`machine-id` 重装就变），komari 那份 json 也一样活不过重装——它去的是「重跑
+安装命令」的重，不是重装的重。
+
 ### 后台与默认主题嵌进二进制 **[默认]**
 
 `rust-embed` 把 `web-admin/dist` 和下载解出来的 `target/theme/dist` 打进 hub。没有安装第三方主题时，部署仍是一个二进制 + 一个 db 文件。

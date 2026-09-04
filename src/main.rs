@@ -297,6 +297,7 @@ async fn main() -> Result<()> {
     let router = Router::new()
         // Agents.
         .route("/api/agent/ws", get(agent_ws::handler))
+        .route("/api/agent/register", post(api::agent_register))
         .route("/install.sh", get(install_script))
         .route("/agent/{arch}", get(agent_binary))
         // Read paths; the public page reaches these unauthenticated.
@@ -311,6 +312,7 @@ async fn main() -> Result<()> {
         .route("/api/auth/github/callback", get(auth::github_callback))
         // Panel.
         .route("/api/nodes", post(api::create_node))
+        .route("/api/register-window", post(api::open_register).delete(api::close_register))
         .route("/api/nodes/order", put(api::reorder_nodes))
         .route("/api/nodes/{id}", put(api::update_node).delete(api::delete_node))
         .route("/api/nodes/{id}/token", post(api::reset_token))

@@ -148,7 +148,7 @@ pub async fn handler(
 }
 
 /// Extracts the node token from `Authorization: Bearer <token>`.
-fn bearer(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers.get("authorization")?.to_str().ok()?.strip_prefix("Bearer ").filter(|t| !t.is_empty())
 }
 

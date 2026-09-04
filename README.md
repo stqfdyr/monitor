@@ -101,6 +101,17 @@ curl -fsSL https://monitor.example.com/install.sh | sh -s -- \
   --server https://monitor.example.com --token <token>
 ```
 
+机器多的时候不必一台一台添加：**节点 → 批量添加**开一个一小时的注册窗口，期间下面这条命令在
+任意机器上跑一次，那台机器就会带着自己的 hostname 出现在列表里，各自拿到各自的 token。
+
+```bash
+curl -fsSL https://monitor.example.com/install.sh | sh -s -- \
+  --server https://monitor.example.com --register <key>
+```
+
+这条命令里没有任何一台机器的凭证，所以可以直接进 `for` 循环、ansible 或者开机脚本。窗口到点自
+动失效，一个窗口最多注册 100 台；重跑同一条命令不会重复添加——机器上已经有 token 就直接沿用。
+
 agent 二进制由 hub 转发，节点无需直连 GitHub。hub 自身访问不了 GitHub 时，在**设置 → 站点**里填一个
 GitHub 代理（如 `https://ghfast.top`），hub 拉 release 时会用它，节点侧不用改任何东西。
 

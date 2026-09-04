@@ -1,10 +1,12 @@
 #!/bin/sh
 # Installs monitor-agent as a systemd or OpenRC service.
 #   curl -fsSL https://hub.example.com/install.sh | sh -s -- --server URL --token TOKEN [options]
+#   curl -fsSL https://hub.example.com/install.sh | sh -s -- --server URL --register KEY [options]
 set -eu
 
 SERVER=""
 TOKEN=""
+REGISTER=""
 INTERVAL=1
 INSECURE=""
 
@@ -12,14 +14,15 @@ while [ $# -gt 0 ]; do
 	case "$1" in
 	--server) SERVER="$2"; shift 2 ;;
 	--token) TOKEN="$2"; shift 2 ;;
+	--register) REGISTER="$2"; shift 2 ;;
 	--interval) INTERVAL="$2"; shift 2 ;;
 	--insecure) INSECURE=1; shift ;;
 	*) echo "unknown option: $1" >&2; exit 2 ;;
 	esac
 done
 
-[ -n "$SERVER" ] && [ -n "$TOKEN" ] || {
-	echo "usage: install.sh --server URL --token TOKEN [--interval SECONDS] [--insecure]" >&2
+[ -n "$SERVER" ] && { [ -n "$TOKEN" ] || [ -n "$REGISTER" ]; } || {
+	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--insecure]" >&2
 	exit 2
 }
 case "$INTERVAL" in "" | *[!0-9]*) echo "interval must be an integer from 1 to 3600" >&2; exit 2 ;; esac
@@ -67,6 +70,32 @@ x86_64 | amd64) ARCH=x86_64 ;;
 aarch64 | arm64) ARCH=aarch64 ;;
 *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
 esac
+
+# --register trades a key for this node's own token, which is what lets one
+# command set up a batch of machines. The key is only good inside the window
+# the panel opened, and never becomes the credential the agent runs with.
+if [ -z "$TOKEN" ]; then
+	# Re-running the same command must not add a second node. This machine's
+	# token is already here, and it outlives the window that issued it, so the
+	# env file is the answer before the hub is asked.
+	TOKEN=$(sed -n 's/^MONITOR_TOKEN=//p' /etc/monitor/agent.env 2>/dev/null || true)
+	if [ -n "$TOKEN" ]; then
+		echo "this machine is already registered; keeping its token"
+	fi
+fi
+if [ -z "$TOKEN" ]; then
+	# The hub trims and bounds this too; here it is kept to what a hostname is
+	# allowed to contain, so nothing surprising travels in the body.
+	NAME=$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-' | cut -c1-64)
+	echo "registering $NAME with the hub"
+	TOKEN=$(curl -fsS --max-time 30 -H "Authorization: Bearer $REGISTER" \
+		--data-binary "$NAME" "${SERVER%/}/api/agent/register") || {
+		echo "the hub refused the registration key: the window may have closed," >&2
+		echo "the key may be wrong, or it has registered enough nodes already." >&2
+		echo "open a new one from the panel's node list." >&2
+		exit 1
+	}
+fi
 
 # The hub relays the binary, so a node only has to reach the hub it already
 # talks to -- an IPv6-only or blocked machine never resolves github.com at all.
