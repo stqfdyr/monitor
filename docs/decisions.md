@@ -175,17 +175,13 @@ komari 对此零检查：`-e http://1.2.3.4:25774` 直接就用，明文传 toke
 | | komari | 这里 |
 |---|---|---|
 | 下载校验 | 无 | 核对 release 的 `sha256sums.txt` 才落盘 |
-| 服务身份 | `User=root` | `DynamicUser=yes` + `StateDirectory=` |
+| 服务身份 | `User=root` | 专用 `monitor` 系统用户 + `ReadWritePaths=` |
 | 单元加固 | 无 | `ProtectSystem=strict` 那一套，与 agent 一致 |
 | curl 超时 | 无 | 全部带 `--max-time` |
 | 缺依赖 | `apt update` 全量升级 | 只报错，不动别人的系统 |
-| 已有部署 | 直接覆盖 | 单元带 `# managed-by:` 标记，认不出就拒绝动 |
 | 公网地址 | `hostname -I`，NAT 下是内网地址 | 先查公网地址，失败才回落 `hostname -I` |
 | TUI | 依赖 whiptail / dialog | 纯 ANSI，非 tty 自动去色 |
 | 版本查询 | 解析 GitHub API 的 JSON | 读下载重定向里的 tag，不受 API 限流 |
-
-`managed-by` 那条是实测踩出来的：开发机上正跑着一个手工部署的 hub（`--listen 127.0.0.1:25775`、
-`--site https://...`），脚本原本会把它的单元换成 `0.0.0.0:28080` 且无 TLS，`--purge` 还会删掉它的库。
 
 全部落在 `/opt/monitor` 下（二进制在顶层，数据库和 `themes/` 在 `data/`），不提供 `--data`：
 备份和搬机器只认一个路径，也和容器里挂 `/data` 是同一套划分——komari 的 `/opt/komari` 同理。
@@ -194,7 +190,8 @@ komari 对此零检查：`-e http://1.2.3.4:25774` 直接就用，明文传 toke
 ——服务连自己的二进制都写不了。
 
 **否决**：菜单里问 `--site`（大多数人不需要，问了反而像必填）、`--data` 自定义数据目录、发布通道选择
-（只有 tag release，没有 snapshot）、装指定版本（要装旧版的人会自己 curl）。
+（只有 tag release，没有 snapshot）、装指定版本（要装旧版的人会自己 curl）、给单元盖 `# managed-by:`
+标记再据此拒绝覆盖不认识的部署（现在还在测试期，脚本装出来的就是唯一形态，不为历史手工部署背兼容包袱）。
 
 ### 自动注册在 `install.sh` 里做，不在 agent 里 **[用户]**
 

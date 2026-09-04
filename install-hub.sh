@@ -22,11 +22,6 @@ DATA="$ROOT/data"
 # A fixed data directory needs a fixed owner: DynamicUser= picks its uid at
 # start, and a recycled one would leave the database unreadable.
 USER_NAME="monitor"
-# Stamped into the unit this script writes, and checked before it overwrites
-# one. A hub someone set up by hand is a different deployment: replacing its
-# unit would swap a loopback listener and a --site for 0.0.0.0 and no TLS,
-# and --purge would delete a database this script never created.
-MARKER="# managed-by: install-hub.sh"
 PORT="28080"
 PORT_SET=""
 SITE=""
@@ -94,10 +89,9 @@ check_port() {
 # silently resets the port and drops --site.
 old_exec() { sed -n 's/^ExecStart=.*--listen //p' "$UNIT" 2>/dev/null || true; }
 
-# The port that unit listens on, empty when there is none. Read three times:
-# the carry-over, the default the menu offers -- pressing Enter there has to
-# leave a running deployment where it is -- and the port check, where our own
-# socket must not read as a conflict.
+# The port that unit listens on, empty when there is none. Read twice: the
+# carry-over, and the default the menu offers -- pressing Enter there has to
+# leave a running deployment where it is.
 old_port() {
 	listen="$(old_exec)"
 	case "$listen" in
@@ -105,24 +99,8 @@ old_port() {
 	esac
 }
 
-# True when a unit is there that this script did not write: its listen address
-# and --site are someone else's, and the defaults here would replace them.
-foreign_unit() {
-	[ -f "$UNIT" ] || return 1
-	! grep -qF "$MARKER" "$UNIT"
-}
-
-refuse_foreign() {
-	printf '  %s✗%s  %s 不是这个脚本装的\n' "$R" "$N" "$UNIT" >&2
-	printf '     先看一眼它的参数：systemctl cat %s\n' "$D$SERVICE$N" >&2
-	printf '     确认可以替换之后删掉那个文件再重跑，否则现有部署的监听地址\n' >&2
-	printf '     和 --site 会被这里的默认值覆盖\n' >&2
-	exit 1
-}
-
 # ---- install ----
 install_hub() {
-	if foreign_unit; then refuse_foreign; fi
 	case "$(uname -m)" in
 	x86_64 | amd64) arch=x86_64 ;;
 	aarch64 | arm64) arch=aarch64 ;;
@@ -147,12 +125,18 @@ install_hub() {
 	check_port "$PORT"
 
 	# Before anything is stopped, replaced or downloaded: a port conflict has
-	# to leave the running hub exactly where it was. The port this unit
-	# already listens on is our own socket and never a conflict -- and on a
-	# first install there is no unit, so old_port is empty and it is checked.
-	if [ "$PORT" != "$(old_port)" ] && command -v ss >/dev/null 2>&1 &&
-		ss -ltnH "sport = :$PORT" 2>/dev/null | grep -q .; then
-		die "端口 $PORT 已被其它程序占用，换一个：--port <n>"
+	# to leave the running hub exactly where it was. Our own socket is never a
+	# conflict, and that is settled by pid rather than by the port written in
+	# the unit -- one this script did not write (hand-edited, or an ExecStart
+	# split across lines) parses out empty, and the hub already running on the
+	# port would be reported as somebody else squatting it.
+	if command -v ss >/dev/null 2>&1; then
+		holder="$(ss -ltnpH "sport = :$PORT" 2>/dev/null |
+			sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)"
+		if [ -n "$holder" ] &&
+			[ "$holder" != "$(systemctl show -p MainPID --value "$SERVICE" 2>/dev/null)" ]; then
+			die "端口 $PORT 已被其它程序占用，换一个：--port <n>"
+		fi
 	fi
 
 	id -u "$USER_NAME" >/dev/null 2>&1 ||
@@ -223,7 +207,6 @@ install_hub() {
 	cat >"$UNIT" <<UNIT
 [Unit]
 Description=monitor hub
-$MARKER
 After=network-online.target
 Wants=network-online.target
 
@@ -318,12 +301,6 @@ uninstall_hub() {
 		[ ! -e "$DATA" ] || die "服务已经卸载了，数据还留在 $DATA；要一并删掉就加 --purge"
 		die "这台机器上没有装 monitor hub"
 	fi
-	if foreign_unit; then refuse_foreign; fi
-	# Deleting a database is the one step nothing here can undo, so it is
-	# allowed only against a deployment this script owns.
-	if [ -n "$PURGE" ] && ! grep -qsF "$MARKER" "$UNIT"; then
-		die "只有这个脚本装的部署才能 --purge；别处的数据请自己确认后手动删"
-	fi
 	if [ -n "$PURGE" ]; then
 		confirm "卸载 monitor hub，并删除 $DATA 下的数据库？不可撤销" || return 0
 	else
@@ -401,9 +378,6 @@ hub 只监听 127.0.0.1，公网访问不到，需要自己配 nginx / caddy / C
 重跑一次就是升级：校验通过后才替换二进制，起不来会自动回滚到上一版；
 没写的参数沿用上次的，所以升级不会把端口和 --site 冲掉。
 二进制和数据都在 $ROOT 下（数据库和主题在 $DATA），卸载默认保留数据。
-
-已经有一个手工部署的 monitor-hub 时，这个脚本会拒绝动它——它写的服务单元带
-自己的标记，认不出标记就不覆盖，免得把你的监听地址和 --site 换成默认值。
 TXT
 }
 
