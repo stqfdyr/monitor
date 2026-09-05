@@ -70,6 +70,29 @@ export function changes<T extends object>(initial: T, values: Partial<T>): Parti
   return Object.fromEntries(Object.entries(values).filter(([key, value]) => value !== initial[key as keyof T])) as Partial<T>
 }
 
+export const GIB = 1024 ** 3
+
+/**
+ * The traffic boxes as a `TrafficPatch`: GB typed by hand, bytes on the wire,
+ * and only the counters that were actually given a number.
+ *
+ * An emptied box means "leave this one alone", not "set it to zero". The patch
+ * is all `Option` and `set_traffic` COALESCEs, so omitting the key is how that
+ * is said; sending 0 clears a lifetime total, which is the one figure that may
+ * never go backwards and that nothing can recompute. Zeroing on purpose stays
+ * one keystroke away: type 0.
+ */
+export function trafficCorrection(
+  pristine: Record<string, string>,
+  typed: Record<string, string>,
+): Record<string, number> {
+  return Object.fromEntries(
+    Object.entries(changes(pristine, typed))
+      .filter(([, value]) => String(value).trim() !== "")
+      .map(([key, value]) => [key, Math.round(Number(value) * GIB)]),
+  )
+}
+
 /** Installation commands require a TLS origin with a domain, never an IP. */
 export function provisioningSite(site: string): string {
   try {
@@ -115,14 +138,20 @@ export async function upload<T>(
   path: string,
   file: File,
   onProgress?: (sent: number) => void,
+  signal?: AbortSignal,
 ): Promise<T> {
   if (file.size === 0) throw new ApiError(400, "文件是空的")
   let last: Response | null = null
   for (let offset = 0; offset < file.size; offset += CHUNK) {
+    // A chunk boundary is a real stopping point: the hub applies nothing until
+    // the last piece lands, and `offset = 0` truncates whatever an abandoned
+    // attempt left behind, so giving up here leaves it exactly as it was.
+    if (signal?.aborted) throw new DOMException("aborted", "AbortError")
     const res = await fetch(`/api${path}?offset=${offset}&total=${file.size}`, {
       method: "POST",
       headers: { "content-type": "application/octet-stream" },
       body: file.slice(offset, offset + CHUNK),
+      signal,
     })
     if (!res.ok) {
       // A 413 never reached the hub -- the proxy in front of it answered, and

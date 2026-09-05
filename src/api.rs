@@ -297,17 +297,24 @@ fn invalidate_snapshot(app: &App) {
 }
 
 /// What one tick of a browser stream may send: the admin frame while the
-/// session that opened it is still live, the public frame when it was opened
-/// without one, and nothing at all once that session is revoked.
+/// session that opened it is still live, the public frame while the status page
+/// is still open to anonymous callers, and nothing at all once either stops
+/// being true.
 ///
-/// Checked every tick rather than at the handshake alone. The admin frame
-/// carries every node's token in the clear, so a socket that outlives its
-/// session hands out credentials that survive the revocation -- the same hole
-/// `reset_token` closes on the agent side by dropping its sender.
+/// Both are checked every tick rather than at the handshake alone, because a
+/// socket outlives both answers. The admin frame carries every node's token in
+/// the clear, so one that outlives its session hands out credentials that
+/// survive the revocation -- the same hole `reset_token` closes on the agent
+/// side by dropping its sender. The public frame is the one an operator takes
+/// back by switching the status page off, and a socket opened a minute earlier
+/// went on sending it for as long as the tab stayed open: `live_ws` refuses new
+/// anonymous connections from that moment and `nodes` answers them 401, so this
+/// was the one way in that never closed. Whatever the handshake tested has to
+/// be tested here too.
 fn stream_audience(app: &App, session: Option<&str>) -> Option<bool> {
     match session {
         Some(hash) => app.db.session_valid(hash).then_some(true),
-        None => Some(false),
+        None => app.public_page().then_some(false),
     }
 }
 
@@ -332,9 +339,9 @@ async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>
     loop {
         ticker.tick().await;
         // Closed rather than downgraded to the public frame: the panel would
-        // otherwise go on rendering a list with every admin field missing. A
-        // close sends it back through /api/me, which is where signing out is
-        // already handled.
+        // otherwise go on rendering a list with every admin field missing. The
+        // close lets a client go back through /api/me and find out what it is
+        // now -- it does not make it do so, which is the client's own half.
         let Some(full) = stream_audience(&app, session.as_deref()) else { break };
         if socket.send(Message::Text(live_snapshot(&app, full))).await.is_err() {
             break;
@@ -715,11 +722,19 @@ fn valid_target(target: &str) -> bool {
 }
 
 pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task): Json<PingTask>) -> Response {
-    if task.name.trim().is_empty() || task.target.trim().is_empty() {
+    // Trimmed into the value that is stored, not into a copy the check throws
+    // away: what goes to the agent is `task.target`, and a trailing space off a
+    // paste passes `valid_target` while `lookup_host` refuses the stored string
+    // outright -- the probe then reports -1 forever, which is the failure that
+    // check was added to end. The name is trimmed for the same reason: it rides
+    // out to the public page as a chart label.
+    task.name = task.name.trim().to_owned();
+    task.target = task.target.trim().to_owned();
+    if task.name.is_empty() || task.target.is_empty() {
         return bad("name and target are required");
     }
     // tcp ping needs an explicit port; a bare host would silently never connect.
-    if !valid_target(task.target.trim()) {
+    if !valid_target(&task.target) {
         return bad("target must be host:port, for example 1.1.1.1:443 or [2606:4700:4700::1111]:443");
     }
     task.interval = task.interval.clamp(5, 3_600);
@@ -1254,6 +1269,13 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
     for key in READABLE_SETTINGS {
         out.insert((*key).to_owned(), json!(app.db.get(key).unwrap_or_default()));
     }
+    // The one readable key that has a default and refuses the empty string:
+    // `setting_error` below rejects "" and `save_settings` writes nothing when
+    // any key fails, so a hub that has never had this set answered "" here and
+    // then 400'd the whole settings form -- naming a field nobody had touched.
+    // `retention_days()` already holds the default that `prune` and the data
+    // page read, so it answers here too rather than each caller guessing.
+    out.insert("retention_days".into(), json!(app.db.retention_days().to_string()));
     out.insert(
         "github_secret_set".into(),
         json!(app.db.get("github_client_secret").is_some_and(|v| !v.is_empty())),
@@ -1433,6 +1455,32 @@ mod tests {
         for good in ["1.1.1.1:443", "[2606:4700:4700::1111]:443", "example.com:80", "[::1]:1"] {
             assert!(valid_target(good), "{good}");
         }
+    }
+
+    /// The check above only means anything if it runs on the string that is
+    /// stored: what reaches the agent is the stored one, and `lookup_host`
+    /// refuses `"1.1.1.1:443 "` outright -- the -1-forever shape `valid_target`
+    /// exists to end, reachable through a check that passed.
+    #[tokio::test]
+    async fn a_probe_target_is_stored_as_the_string_that_was_checked() {
+        let app = std::sync::Arc::new(app());
+        let save = |name: &str, target: &str| {
+            let task = PingTask {
+                id: 0,
+                name: name.to_owned(),
+                target: target.to_owned(),
+                interval: 60,
+                nodes: vec![],
+            };
+            save_ping_task(Admin, State(app.clone()), Json(task))
+        };
+        assert_eq!(save(" 探测 ", "1.1.1.1:443 ").await.status(), StatusCode::OK);
+        let stored = &app.db.ping_tasks().unwrap()[0];
+        assert_eq!(stored.target, "1.1.1.1:443", "the agent gets this string, not the one that was checked");
+        assert_eq!(stored.name, "探测", "and it labels an anonymous chart");
+        // Trimming must not turn a blank into a saved row.
+        assert_eq!(save("   ", "   ").await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(app.db.ping_tasks().unwrap().len(), 1);
     }
 
     /// The update button follows a manifest's `url` to build a download
@@ -1814,12 +1862,13 @@ mod tests {
         assert_eq!(app.db.nodes().unwrap().len(), 1, "nothing was created");
     }
 
-    /// A stream outlives the request that opened it, so the session behind it
-    /// has to be re-read rather than captured. The admin frame carries every
-    /// node's token in the clear: a socket that survives its own revocation
-    /// hands out credentials that survive it too.
+    /// A stream outlives the request that opened it, so everything the
+    /// handshake tested has to be re-read rather than captured -- both answers,
+    /// not one. The admin frame carries every node's token in the clear, and the
+    /// public frame is what switching the status page off is meant to take back;
+    /// a socket that survives either decision goes on sending what it withdrew.
     #[test]
-    fn a_revoked_session_stops_its_stream_and_an_anonymous_one_carries_on() {
+    fn a_stream_re_reads_both_answers_its_handshake_tested() {
         let app = app();
         let hash = sha256("live-token");
         app.db.create_session(&hash, Utc::now().timestamp() + 3_600).unwrap();
@@ -1831,6 +1880,14 @@ mod tests {
         // a restore all end as this row going away.
         app.db.drop_session(&hash).unwrap();
         assert_eq!(stream_audience(&app, Some(&hash)), None, "a revoked session must end its stream");
+
+        // The other half. `live_ws` refuses a new anonymous connection from
+        // here and `nodes` answers one 401, so a stream that carried on was the
+        // only way left in -- for as long as the tab stayed open.
+        app.db.create_session(&hash, Utc::now().timestamp() + 3_600).unwrap();
+        app.db.set("public_page", "off").unwrap();
+        assert_eq!(stream_audience(&app, None), None, "closing the status page must end anonymous streams");
+        assert_eq!(stream_audience(&app, Some(&hash)), Some(true), "a signed-in operator still gets theirs");
     }
 
     #[test]
@@ -2179,6 +2236,31 @@ mod tests {
         assert!(app.db.get("retention_days").is_none(), "a refused window must not be stored");
         assert_eq!(put("7").await.status(), StatusCode::OK);
         assert_eq!(app.db.get("retention_days").as_deref(), Some("7"));
+    }
+
+    /// What `settings` answers has to be what `save_settings` accepts. The panel
+    /// echoes the whole form back and the write is all-or-nothing, so one key
+    /// answered in a shape the write refuses takes the entire page with it --
+    /// naming a field nobody touched.
+    #[tokio::test]
+    async fn a_fresh_hub_answers_settings_that_it_will_take_back() {
+        let app = std::sync::Arc::new(app());
+        let Json(read) = settings(Admin, State(app.clone())).await;
+        assert_eq!(read["retention_days"], "30", "the default belongs in the answer, not in each caller");
+
+        // Exactly what the panel sends, on a hub where nothing was ever set.
+        let echoed = json!({
+            "site_name": read["site_name"],
+            "retention_days": read["retention_days"],
+            "github_proxy": read["github_proxy"],
+            "public_page": "on",
+        });
+        assert_eq!(
+            save_settings(Admin, State(app.clone()), HeaderMap::new(), Json(echoed)).await.status(),
+            StatusCode::OK,
+            "a fresh hub's own settings must survive a round trip"
+        );
+        assert_eq!(app.db.retention_days(), 30, "and the stored window is the one that was shown");
     }
 
     #[tokio::test]

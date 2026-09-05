@@ -12,10 +12,9 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { api, changes, provisioningSite, upload, type Node, type PingTask } from "@/lib/api"
+import { api, changes, GIB, provisioningSite, trafficCorrection, upload, type Node, type PingTask } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, monthUsage, uptime } from "@/lib/format"
 
-const GIB = 1024 ** 3
 // Counters the panel can correct after migration or an accounting error.
 const TRAFFIC_FIELDS = [
   ["total_rx", "累计下行"],
@@ -178,9 +177,7 @@ function NodeForm({ node, onClose, onSaved }: {
       traffic_limit: Math.round(Number(limitGib) * GIB),
       traffic_reset_day: Math.min(31, Math.max(1, Math.round(Number(form.traffic_reset_day) || 1))),
     })
-    const correction = Object.fromEntries(
-      Object.entries(changes(pristine.current, traffic)).map(([key, value]) => [key, Math.round(Number(value) * GIB)]),
-    )
+    const correction = trafficCorrection(pristine.current, traffic)
     if ([patch.traffic_limit, ...Object.values(correction)].some((v) => v !== undefined && (!Number.isSafeInteger(v) || v < 0))) {
       return toast.error("流量必须是有效的非负数，且不能超出精确计数范围")
     }
@@ -1217,7 +1214,9 @@ function SettingsTab() {
             onClick={() =>
               save({
                 site_name: String(s.site_name ?? ""),
-                retention_days: String(s.retention_days ?? "30"),
+                // `||`, not `??`: the hub answers an unset key with "" rather
+                // than null, and "" is the one value this key's write path refuses.
+                retention_days: String(s.retention_days || "30"),
                 github_proxy: String(s.github_proxy ?? ""),
                 public_page: s.public_page === "off" ? "off" : "on",
               })
@@ -1385,6 +1384,9 @@ function Data() {
   const [confirm, setConfirm] = useState<"vacuum" | null>(null)
   const [pending, setPending] = useState<File | null>(null)
   const [sent, setSent] = useState(0)
+  // Closing the dialog has to stop the upload, not just hide it: restore is the
+  // one irreversible button here, and it takes minutes on a large backup.
+  const abort = useRef<AbortController | null>(null)
   const picker = useRef<HTMLInputElement>(null)
 
   const load = () => api<DbInfo>("/db").then(setInfo).catch((e: Error) => toast.error(e.message))
@@ -1407,14 +1409,19 @@ function Data() {
   async function restore(file: File) {
     setBusy("restore")
     setSent(0)
+    abort.current = new AbortController()
     try {
-      await upload("/db/restore", file, setSent)
+      await upload("/db/restore", file, setSent, abort.current.signal)
       toast.success("已恢复，正在重新加载")
       // Every node, setting and session on the page came from the database
       // that was just replaced.
       setTimeout(() => location.reload(), 800)
     } catch (e) {
-      toast.error((e as Error).message)
+      // Giving up part way is not a failure: the hub replaces nothing until the
+      // last chunk, so the database is still the one that was here.
+      const aborted = (e as Error).name === "AbortError"
+      if (aborted) toast.info("已取消，数据库没有改动")
+      else toast.error((e as Error).message)
       setBusy("")
     }
     setPending(null)
@@ -1512,7 +1519,7 @@ function Data() {
           description={`将用 ${pending.name}（${bytes(pending.size)}）整体替换当前数据库。当前的节点、设置和历史全部丢失，且无法撤销。`}
           confirmLabel={busy === "restore" ? `已上传 ${bytes(sent)} / ${bytes(pending.size)}` : "确认恢复"}
           busy={!!busy}
-          onClose={() => setPending(null)}
+          onClose={() => { abort.current?.abort(); setPending(null) }}
           onConfirm={() => restore(pending)}
         />
       )}

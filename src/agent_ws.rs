@@ -246,8 +246,12 @@ fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool> {
         "report" => report(app, node_id, rpc.params)?,
         "ping.result" => {
             let task_id = rpc.params.get("task_id").and_then(|v| v.as_i64()).unwrap_or(0);
-            let latency = rpc.params.get("latency_ms").and_then(|v| v.as_i64()).unwrap_or(-1);
-            if task_id > 0 {
+            // A missing reading is not a reading of -1: `close_bucket` counts
+            // every negative latency as a lost packet, so defaulting here drew
+            // a malformed frame as an outage on the chart. Same rule the
+            // accumulator follows for a counter it cannot read.
+            let latency = rpc.params.get("latency_ms").and_then(|v| v.as_i64());
+            if let (true, Some(latency)) = (task_id > 0, latency) {
                 app.db.insert_ping(node_id, task_id, Utc::now().timestamp(), latency)?;
             }
         }
@@ -749,6 +753,17 @@ mod tests {
         dispatch(&app, id, "ip", &result(two, 15)).unwrap();
         dispatch(&app, id, "ip", &result(0, 42)).unwrap(); // no such task
         dispatch(&app, id, "ip", &result(-1, 42)).unwrap(); // nor this one
+                                                            // A frame with no reading in it. Defaulting to -1 filed it as a lost
+                                                            // packet, so a malformed frame drew as an outage on the chart.
+        dispatch(
+            &app,
+            id,
+            "ip",
+            &json!({"jsonrpc": "2.0", "method": "ping.result",
+                                         "params": {"task_id": one}})
+            .to_string(),
+        )
+        .unwrap();
 
         // Sorted rather than indexed: both rows land in the same second and
         // the query orders by timestamp.
