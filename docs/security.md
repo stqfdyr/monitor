@@ -34,7 +34,10 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, ...) -> Response
 - 256 位随机 token，**数据库里只存 sha256**
 - cookie：`HttpOnly`、`SameSite=Lax`、`Path=/`；`--site` 不是 `http://` 时加 `Secure`，没有 `--site` 时看请求的 `X-Forwarded-Proto`
 - 14 天过期，每小时清一次过期记录
-- 改密码时 `drop_all_sessions()`，所有登录立即失效
+- 改密码时 `drop_all_sessions()`，所有登录立即失效——**包括已经开着的 `/api/ws` 推送流**：
+  admin 帧里带着每个节点的明文 token，判权只在握手时做一次的话，一条不关的 socket 会一直发下去，
+  泄露出去的凭证比被吊销的那个会话活得还久。`api::stream_audience` 每一拍复查一次 session 行，
+  查不到就断开——和 `reset_token` 对 agent 连接做的是同一件事
 
 `SameSite=Lax` + 同源 API 就是 CSRF 防护，没有额外的 CSRF token。
 
@@ -298,6 +301,19 @@ if !full {
 
 **下载地址里有一段来自数据库**：面板设置的 `github_proxy` 会拼在最前面（`main::release_url`）。
 仓库名仍是编译进来的常量，`arch` 仍是白名单，唯一能变的就是这个前缀，而且只有管理员写得了它。
+
+**但这是 URL 注入面，不是完整性面。** 这个前缀指向的主机返回什么，hub 就原样转发什么，`install.sh`
+把它写进 `/opt/monitor` 并拉起来——**全链路没有签名也没有摘要**。
+
+已收紧：设置只接受 `https://`（`api::setting_error`），排除 hub 与镜像之间的中间人；agent 的 release
+现在也发 `sha256sums.txt`（与 hub 的 release 一致，在此之前连可验的材料都没有）。
+
+**仍然没做**：hub 在转发时按摘要核对。这是一笔明知而挂着的账，不是疏漏——取舍、被否决的方案（包括
+"摘要直连 GitHub 取"为什么对中国 VPS 用户无效）和落地形状都记在
+[decisions.md](decisions.md#转发的-agent-二进制不做完整性校验--已知缺口暂不修-用户)，代码里
+`main::agent_binary` 上方有对应的 `ponytail:` 标记。
+
+**在它落地之前**：填进这个框的地址等于把整个机队的代码执行权交给那个镜像，只填信得过的。
 说清楚代价：**管理员可以把这条匿名路径指向任意地址，响应会原样转发给匿名调用方。** 这是设置它的
 人自己选的出站目标，和 `github_client_secret` 一样落在管理员的信任范围内；保存时只校验 scheme 是
 `http://` 或 `https://`。单次请求的上界没变：4 并发、120 秒超时、流式转发。

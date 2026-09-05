@@ -962,6 +962,56 @@ IPv6-only 的 Alpine 机器：github.com 没有 AAAA 记录，试过的三个加
 
 **否决**：hub 侧缓存二进制（安装是低频操作）、把二进制打进 hub（每次发 agent 都要重发 hub）。
 
+### 转发的 agent 二进制不做完整性校验 —— 已知缺口，暂不修 **[用户]**
+
+**2026-09-05 审计记录。这一条不是设计，是一笔挂着的账。**
+
+链条：节点 `curl <hub>/agent/<arch>` → `main::agent_binary` 从 GitHub 取回 → 原样转发 →
+`install.sh` `install -m 0755` 落盘 → systemd 拉起。**全程没有任何一步验证这堆字节确实是 agent。**
+默认直连 GitHub 时由 TLS 兜着；一旦面板填了 `github_proxy`，这一跳变成
+`https://<某加速站>/https://github.com/...`，那台机器返回什么，整个机队就装什么并运行什么。
+实测复现过：把代理指向一个本地服务，`curl <hub>/agent/x86_64` 拿回的就是伪造内容。
+
+**已经做的两件**：`github_proxy` 收紧到只接受 `https://`（原来 `http://` 也放行，等于把 hub 与镜像
+之间的任意中间人也拉进威胁面）；agent 仓库的 release 补发 `sha256sums.txt`（原来根本没有，hub 的
+release 一直有——所以在此之前连"可验的材料"都不存在）。
+
+**没做的是第三件：hub 转发前按摘要核对。** 它卡在一个循环上——之所以要填代理，就是因为 hub 连不上
+GitHub，那摘要也只能从同一个代理取，恶意镜像把二进制和摘要一起换掉即可，等于自己验自己。
+
+**否决 A：摘要直连 GitHub 取，只有二进制走代理。** 看起来能绕开循环，实际不行：真实用户群里有大量
+中国 VPS，github.com / api.github.com / objects.githubusercontent.com 是**一起**不可达的，而那正是
+唯一会去填代理的人群。对他们 A 退化成"验不了，打条警告放行"——在最需要它的场景里等于没做。
+（注意这和主题更新那条路的取舍不同：`api::update` 读 tag 时故意不走代理，赌的是"多数代理只 front
+releases"，但那条路失败了还有手动上传兜底，这条路失败就是装不上。）
+
+剩下两条都成立，都要求**摘要事先就在 hub 里**：
+
+| | B. 给 release 签名，公钥编进 hub | C. 把 sha256 钉进 hub 构建 |
+|---|---|---|
+| 代理全恶意 / GitHub 全不通 | 都拦得住 | 都拦得住 |
+| agent 独立发版 | 保得住 | **保不住**，换 agent 要重发 hub |
+| 新增依赖 | ed25519 crate | 无 |
+| 新增运维 | 签名密钥的生命周期 | 无 |
+| 仓库里已有同款 | 无 | `web-theme.pin` 就是这个 |
+
+C 的形状会是：`agent.pin` 一行 `<tag> <sha256-x86_64> <sha256-aarch64>`（格式抄 `web-theme.pin`）；
+`release_url` 从 `releases/latest/download/` 改成固定 tag；`agent_binary` 收完算 hash、对不上 502。
+**"要缓冲整份二进制才能校验"不再是反对理由**：那条注释写在没有闸门的时候，现在 `RELAY_SLOTS = 4`，
+4 × 1.73 MiB = 6.9 MiB，对着 unit 的 `MemoryMax=256M` 是 2.7%。附带好处是 hub 终于知道自己发出去的
+是哪个版本的 agent（现在是 `latest`，不知道）。
+
+**但 C 的耦合成本，上一条已经因为同样的理由否决过一次**（"把二进制打进 hub（每次发 agent 都要重发
+hub）"）。所以这是一个真正待拍板的取舍，不是忘了做：**用户 2026-09-05 决定先不动，保持现状并记录。**
+
+现状下的缓解：设置只收 `https://`；面板那个输入框的说明写着"这个地址返回的字节会被安装到每一台
+节点上，只填信得过的镜像"；README 与 [security.md](security.md) 同样点明。
+
+**邻居问题，单独议**：`api::update_theme` 走同一个 `proxied()`，下载第三方主题包装进公开页（同源
+JS）。它没有 pin 可钉——第三方主题按定义钉不住。性质也不同：装第三方主题本来就是主动引入第三方
+代码（见 [security.md](security.md) 的「上传的主题是在访客浏览器里运行的第三方代码」），但"代理把
+一个原本可信主题的更新包换掉"确实是代理带来的新风险。不要和 agent 这条混在一起解。
+
 ### install.sh 支持 OpenRC **[用户]**
 
 agent 本来就是 musl 静态二进制，Alpine 上跑得了，缺的只是 init 脚本。systemd 那套加固

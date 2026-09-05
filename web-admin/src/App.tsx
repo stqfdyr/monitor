@@ -57,13 +57,22 @@ export default function App() {
   const { nodes, error, refresh } = useNodes()
 
   const loadMe = useCallback(() => {
-    return api<Me>("/me").then((next) => { setMe(next); setMeError("") }).catch((e: Error) => setMeError(e.message))
+    // `|| "..."`, because an empty message reads as no error at all: api()
+    // falls back to res.statusText, which HTTP/2 and HTTP/3 removed, so a
+    // bodiless 502 from a proxy arrives as "". The check below would then take
+    // the loading branch and the retry button would never render.
+    return api<Me>("/me")
+      .then((next) => { setMe(next); setMeError("") })
+      .catch((e: Error) => setMeError(e.message || "网络错误"))
   }, [])
   useEffect(() => {
     loadMe()
   }, [loadMe])
 
-  if (!me || meError) return (
+  // Only while there is nothing else to show. Login's onDone reloads /me, so a
+  // hiccup in the second after signing in used to swap the whole signed-in
+  // panel for a full-page error while the node list was streaming fine.
+  if (!me) return (
     <div className="grid min-h-svh place-items-center p-6 text-sm text-muted-foreground">
       {meError ? <div className="space-y-3 text-center"><p role="alert">加载失败：{meError}</p><Button onClick={loadMe}>重试</Button></div> : "加载中…"}
     </div>

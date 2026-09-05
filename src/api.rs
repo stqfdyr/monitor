@@ -10,6 +10,7 @@ use axum::Json;
 use chrono::{Local, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tracing::debug;
 
 use crate::agent_ws::Agent;
 use crate::auth::{
@@ -48,7 +49,7 @@ fn bad(message: &str) -> Response {
 /// contract minus the raw kernel counters, which are a wire-protocol detail
 /// and hand out a machine's whole lifetime traffic, plus the four figures the
 /// hub folds in itself. The panel sees the report as it arrived.
-const PUBLIC_METRICS: [&str; 18] = [
+pub(crate) const PUBLIC_METRICS: [&str; 18] = [
     "uptime",
     "cpu",
     "load",
@@ -295,24 +296,46 @@ fn invalidate_snapshot(app: &App) {
     }
 }
 
+/// What one tick of a browser stream may send: the admin frame while the
+/// session that opened it is still live, the public frame when it was opened
+/// without one, and nothing at all once that session is revoked.
+///
+/// Checked every tick rather than at the handshake alone. The admin frame
+/// carries every node's token in the clear, so a socket that outlives its
+/// session hands out credentials that survive the revocation -- the same hole
+/// `reset_token` closes on the agent side by dropping its sender.
+fn stream_audience(app: &App, session: Option<&str>) -> Option<bool> {
+    match session {
+        Some(hash) => app.db.session_valid(hash).then_some(true),
+        None => Some(false),
+    }
+}
+
 /// Live stream for the browser. Each connection runs its own timer -- cheaper
 /// to reason about than a fan-out channel -- over a shared snapshot, so a timer
 /// costs nothing but a send.
 pub async fn live_ws(State(app): State<Shared>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
-    let full = authed(&app, &headers);
-    if !full && !app.public_page() {
+    // The digest rather than the answer: signing out has to reach a stream that
+    // is already running, and only the row it names can say whether it has.
+    let session = current_session(&headers).filter(|hash| app.db.session_valid(hash));
+    if session.is_none() && !app.public_page() {
         return (StatusCode::UNAUTHORIZED, "sign-in required").into_response();
     }
     upgrade
         .read_buffer_size(SOCKET_BUFFER)
         .max_message_size(MAX_FRAME)
-        .on_upgrade(move |socket| stream_live(app, socket, full))
+        .on_upgrade(move |socket| stream_live(app, socket, session))
 }
 
-async fn stream_live(app: Shared, mut socket: WebSocket, full: bool) {
+async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
     loop {
         ticker.tick().await;
+        // Closed rather than downgraded to the public frame: the panel would
+        // otherwise go on rendering a list with every admin field missing. A
+        // close sends it back through /api/me, which is where signing out is
+        // already handled.
+        let Some(full) = stream_audience(&app, session.as_deref()) else { break };
         if socket.send(Message::Text(live_snapshot(&app, full))).await.is_err() {
             break;
         }
@@ -321,7 +344,12 @@ async fn stream_live(app: Shared, mut socket: WebSocket, full: bool) {
 
 // ---- panel write paths ----
 
-const PROVISIONING_DENIED: &str = "请通过 HTTPS 域名访问面板后添加或安装节点";
+/// Names the second cause as well as the first. A reverse proxy that does not
+/// preserve Host forwards its own upstream address, which is an IP and so
+/// never an https domain entry -- and the admin reading this is already on the
+/// domain, so the first half alone sends them looking in the wrong place.
+const PROVISIONING_DENIED: &str = "请通过 HTTPS 域名访问面板后添加或安装节点；\
+     如果已经是域名访问，检查反向代理是否透传了 Host 与 X-Forwarded-Proto（见 README 的反代配置）";
 
 fn https_domain(site: &str) -> Option<reqwest::Url> {
     let url = reqwest::Url::parse(site).ok()?;
@@ -338,17 +366,58 @@ fn https_domain(site: &str) -> Option<reqwest::Url> {
 /// Host and the proxy's scheme describe this request; --site must not turn
 /// an IP entry point into a domain entry point. The listener stays behind the
 /// trusted reverse proxy, which must preserve Host and set X-Forwarded-Proto.
+///
+/// Every refusal says which half failed. Without that, a proxy configured with
+/// a bare `proxy_pass` -- nginx then forwards `Host: 127.0.0.1:28080`, and
+/// Apache does the same with its default `ProxyPreserveHost Off` -- is
+/// indistinguishable from a genuine IP entry point: provisioning stops
+/// working across an upgrade, the message blames the address bar, and nothing
+/// anywhere records the header that actually caused it.
 fn provisioning_allowed(app: &App, headers: &HeaderMap) -> bool {
-    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else { return false };
-    let https = crate::forwarded_proto(headers)
-        .map_or_else(|| app.site.starts_with("https://"), |scheme| scheme == "https");
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        debug!("provisioning refused: the request carries no readable Host header");
+        return false;
+    };
+    let forwarded = crate::forwarded_proto(headers);
+    let https = forwarded.map_or_else(|| app.site.starts_with("https://"), |scheme| scheme == "https");
     if !https || (!app.site.is_empty() && https_domain(&app.site).is_none()) {
+        debug!(
+            "provisioning refused: not an https domain entry (X-Forwarded-Proto={forwarded:?}, --site={:?}); \
+             a TLS-terminating proxy has to send X-Forwarded-Proto: https",
+            app.site
+        );
         return false;
     }
-    let Some(url) = https_domain(&format!("https://{host}")) else { return false };
-    headers
-        .get(header::ORIGIN)
-        .is_none_or(|origin| origin.to_str().ok() == Some(url.origin().ascii_serialization().as_str()))
+    let Some(url) = https_domain(&format!("https://{host}")) else {
+        debug!(
+            "provisioning refused: Host {host:?} is not an https domain entry; a reverse proxy that does \
+             not preserve Host sends its own upstream address here -- nginx needs \
+             `proxy_set_header Host $host`, Apache `ProxyPreserveHost On`"
+        );
+        return false;
+    };
+    let expected = url.origin().ascii_serialization();
+    let allowed =
+        headers.get(header::ORIGIN).is_none_or(|origin| origin.to_str().ok() == Some(expected.as_str()));
+    if !allowed {
+        debug!("provisioning refused: Origin {:?} is not {expected}", headers.get(header::ORIGIN));
+    }
+    allowed
+}
+
+/// Range and sign limits every stored node has to meet, or the reason it does
+/// not. Shared, because both writers have to hold them: the create path used to
+/// take a whole `Node` unchecked, so the values the update path refuses were
+/// still reachable one route over -- and a reset day out of range only stayed
+/// harmless because `period_start` happens to clamp what it reads.
+fn node_limits(reset_day: Option<u32>, price: Option<f64>, limit: Option<i64>) -> Option<&'static str> {
+    if reset_day.is_some_and(|d| !(1..=31).contains(&d)) {
+        return Some("reset day must be from 1 to 31");
+    }
+    if price.is_some_and(|v| !v.is_finite() || v < 0.0) || limit.is_some_and(|v| v < 0) {
+        return Some("price and traffic limit must be non-negative");
+    }
+    None
 }
 
 pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
@@ -379,6 +448,11 @@ pub async fn create_node(
     let Ok(Json(mut node)) = body else { return bad("invalid node") };
     if node.name.trim().is_empty() {
         return bad("name is required");
+    }
+    if let Some(message) =
+        node_limits(Some(node.traffic_reset_day), Some(node.price), Some(node.traffic_limit))
+    {
+        return bad(message);
     }
     node.name = node.name.trim().to_owned();
     let token = random_token();
@@ -518,11 +592,8 @@ pub async fn update_node(
             return bad("name is required");
         }
     }
-    if node.traffic_reset_day.is_some_and(|d| !(1..=31).contains(&d)) {
-        return bad("reset day must be from 1 to 31");
-    }
-    if node.price.is_some_and(|v| !v.is_finite() || v < 0.0) || node.traffic_limit.is_some_and(|v| v < 0) {
-        return bad("price and traffic limit must be non-negative");
+    if let Some(message) = node_limits(node.traffic_reset_day, node.price, node.traffic_limit) {
+        return bad(message);
     }
     match app.db.update_node(id, &node) {
         Ok(()) => {
@@ -553,6 +624,12 @@ pub async fn reorder_nodes(_: Admin, State(app): State<Shared>, Json(order): Jso
 }
 
 pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    // The token is checked only at the handshake, so deleting the row does not
+    // end a connection already open on it. Dropping the sender does; without
+    // this the agent keeps reporting under an id SQLite hands straight to the
+    // next node created, which then reads as online on somebody else's
+    // metrics. Same reason as `reset_token` below.
+    app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
     match app.db.delete_node(id) {
         Ok(()) => {
             invalidate_snapshot(&app);
@@ -1180,10 +1257,14 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         // The hub fetches this URL itself, so it has to be one: a scheme it
         // cannot speak turns every agent download into a 502 that says
         // nothing about the setting that caused it.
-        "github_proxy"
-            if !(value.is_empty() || value.starts_with("http://") || value.starts_with("https://")) =>
-        {
-            Some("GitHub proxy must start with http:// or https://".into())
+        //
+        // https only. What comes back from this host is the agent binary, and
+        // `install.sh` writes it to /opt/monitor and starts it on every node
+        // provisioned from here -- over http:// anyone on the path between the
+        // hub and the mirror chooses that binary, and the node sees a perfect
+        // TLS connection to the hub either way.
+        "github_proxy" if !(value.is_empty() || value.starts_with("https://")) => {
+            Some("GitHub proxy must start with https://: the agent binary is fetched through it and installed on every node".into())
         }
         "admin_password" if value.len() < 12 => Some("password must be at least 12 characters".into()),
         "admin_password" => None,
@@ -1618,6 +1699,87 @@ mod tests {
             "the old agent's channel must be closed"
         );
         assert!(app.agents.read().unwrap().is_empty(), "the node must read as offline at once");
+    }
+
+    /// Deleting a node has to reach the connection it opened, for the same
+    /// reason rotating its token does -- and with a sharper edge, because
+    /// SQLite hands the freed id straight to the next node created. Left
+    /// connected, the old machine reports under that id: a node nobody has
+    /// deployed reads as online, on somebody else's metrics, and its traffic
+    /// and history are booked to it.
+    #[tokio::test]
+    async fn deleting_a_node_closes_its_session_so_the_next_id_does_not_inherit_it() {
+        let app = std::sync::Arc::new(app());
+        let old = node(&app, "old", true);
+        let mut rx = connect(&app, old, json!({"cpu": 42.0}));
+
+        assert_eq!(
+            delete_node(Admin, axum::extract::State(app.clone()), Path(old)).await.status(),
+            StatusCode::OK
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)),
+            "the deleted node's agent must be told to go"
+        );
+
+        // SQLite reuses the id; nothing of the old machine may come with it.
+        let fresh = node(&app, "fresh", true);
+        assert_eq!(fresh, old, "the fixture only means anything if the id is reused");
+        let nodes = visible_nodes(&app, true).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0]["online"], json!(false), "a node nobody deployed is not online");
+        assert_eq!(nodes[0]["metrics"], Value::Null, "and it has nobody else's metrics");
+    }
+
+    /// Both writers hold the same limits. The create path took a whole `Node`
+    /// unchecked, so everything the update path refuses was reachable one
+    /// route over.
+    #[tokio::test]
+    async fn both_write_paths_refuse_the_same_out_of_range_values() {
+        let app = std::sync::Arc::new(app());
+        let id = node(&app, "n", true);
+        for bad in [
+            json!({"name": "x", "traffic_reset_day": 99}),
+            json!({"name": "x", "price": -5.0}),
+            json!({"name": "x", "traffic_limit": -1}),
+        ] {
+            let created = create_node(
+                Admin,
+                axum::extract::State(app.clone()),
+                domain_headers(),
+                Ok(Json(serde_json::from_value(bad.clone()).unwrap())),
+            )
+            .await;
+            assert_eq!(created.status(), StatusCode::BAD_REQUEST, "create accepted {bad}");
+            let updated = update_node(
+                Admin,
+                axum::extract::State(app.clone()),
+                Path(id),
+                Ok(Json(serde_json::from_value(bad.clone()).unwrap())),
+            )
+            .await;
+            assert_eq!(updated.status(), StatusCode::BAD_REQUEST, "update accepted {bad}");
+        }
+        assert_eq!(app.db.nodes().unwrap().len(), 1, "nothing was created");
+    }
+
+    /// A stream outlives the request that opened it, so the session behind it
+    /// has to be re-read rather than captured. The admin frame carries every
+    /// node's token in the clear: a socket that survives its own revocation
+    /// hands out credentials that survive it too.
+    #[test]
+    fn a_revoked_session_stops_its_stream_and_an_anonymous_one_carries_on() {
+        let app = app();
+        let hash = sha256("live-token");
+        app.db.create_session(&hash, Utc::now().timestamp() + 3_600).unwrap();
+
+        assert_eq!(stream_audience(&app, Some(&hash)), Some(true), "a live session gets the admin frame");
+        assert_eq!(stream_audience(&app, None), Some(false), "an anonymous stream gets the public one");
+
+        // Signing out, another device revoking this one, a password change and
+        // a restore all end as this row going away.
+        app.db.drop_session(&hash).unwrap();
+        assert_eq!(stream_audience(&app, Some(&hash)), None, "a revoked session must end its stream");
     }
 
     #[test]

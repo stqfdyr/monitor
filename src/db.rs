@@ -777,14 +777,21 @@ impl Db {
                 }
                 (0, 0)
             }
-            Some((rx, tx)) => ((rx - last_rx).max(0), (tx - last_tx).max(0)),
+            Some((rx, tx)) => ((rx.saturating_sub(last_rx)).max(0), (tx.saturating_sub(last_tx)).max(0)),
         };
-        total_rx += d_rx;
-        total_tx += d_tx;
-        month_rx += d_rx;
-        month_tx += d_tx;
-        day_rx += d_rx;
-        day_tx += d_tx;
+        // Saturating, not plain `+`: the release profile turns off overflow
+        // checks, so a total near i64::MAX wraps to a large negative -- a
+        // lifetime figure that has gone backwards, which the first iron rule
+        // forbids. Two ways in, one guard: a node's own counters arrive from
+        // another repository's binary, and `set_traffic` lets the panel write a
+        // correction straight into the same column. Clamping here covers both
+        // rather than each caller separately.
+        total_rx = total_rx.saturating_add(d_rx);
+        total_tx = total_tx.saturating_add(d_tx);
+        month_rx = month_rx.saturating_add(d_rx);
+        month_tx = month_tx.saturating_add(d_tx);
+        day_rx = day_rx.saturating_add(d_rx);
+        day_tx = day_tx.saturating_add(d_tx);
 
         // Both boundaries are human dates -- the day a provider resets an
         // allowance, the day a person means by "today" -- so both follow the

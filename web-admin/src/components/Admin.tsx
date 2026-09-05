@@ -1190,7 +1190,10 @@ function SettingsTab() {
               placeholder="30"
             />
           </Field>
-          <Field label="GitHub 代理" hint="留空直连。仅在 hub 自己拉不到 GitHub Release 时填">
+          <Field
+            label="GitHub 代理"
+            hint="留空直连。仅在 hub 自己拉不到 GitHub Release 时填。这个地址返回的字节会被安装到每一台节点上，只填信得过的镜像"
+          >
             <Input
               value={String(s.github_proxy ?? "")}
               onChange={(e) => set("github_proxy", e.target.value)}

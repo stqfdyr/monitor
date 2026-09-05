@@ -179,6 +179,17 @@ impl<S: futures_core::Stream + Unpin> futures_core::Stream for Metered<S> {
 /// Hands out the agent binary from the hub itself, so a node that can reach
 /// the hub can install without reaching GitHub: IPv6-only machines never
 /// resolve github.com, and neither do blocked networks.
+///
+/// ponytail: these bytes are relayed unverified, and `install.sh` runs them as
+/// root on every node. Direct to github.com that is TLS's problem; through the
+/// panel's `github_proxy` it is the mirror's word alone. Held for now by the
+/// setting accepting https:// only, and by saying so where it is typed.
+/// Upgrade path is a pinned digest -- `agent.pin` beside `web-theme.pin`, a
+/// fixed release tag, hash after the fetch and before the relay (4 permits ×
+/// 1.73 MiB against MemoryMax=256M, so buffering is free). Not a fetched
+/// checksum: whoever could swap the binary can swap that too. Deliberately
+/// deferred -- it couples agent releases to hub releases, which
+/// docs/decisions.md rejected once already for the same reason.
 async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Response {
     if !matches!(arch.as_str(), "x86_64" | "aarch64") {
         return (StatusCode::NOT_FOUND, "unknown architecture").into_response();
@@ -293,6 +304,22 @@ async fn main() -> Result<()> {
              Put it behind a TLS reverse proxy -- the panel builds install commands from the \
              browser's own address, so nothing here has to change -- then --listen 127.0.0.1:PORT \
              so this port is no longer reachable in the clear"
+        );
+    }
+    // The warning above is drawn from --site, which is the address the operator
+    // *advertises*. This one is drawn from the socket that is actually open,
+    // and the two come apart in the deployment that needs it most: `--site
+    // https://...` with --listen left at its wildcard default prints nothing at
+    // all, while the port answers plain HTTP to anyone who finds it. The
+    // provisioning gate in `api` and the X-Forwarded-Proto cookie flag both
+    // assume nobody can reach past the proxy; nothing else checks that they can.
+    else if !args.listen.ip().is_loopback() {
+        warn!(
+            "listening on {} in the clear. If a TLS proxy fronts this hub, callers can still reach \
+             this port directly and set their own X-Forwarded-Proto -- --listen 127.0.0.1:{} so the \
+             proxy is the only way in",
+            args.listen,
+            args.listen.port()
         );
     }
 

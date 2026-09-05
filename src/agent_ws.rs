@@ -302,35 +302,44 @@ fn locate(app: Shared, node_id: i64, ip: String) {
     });
 }
 
-/// Everything a report has to carry for the hub to store a complete row, plus
-/// `load`, which is stored nowhere and drawn live on the node card.
+/// Figures the hub folds into a report on the way out. They never arrive from
+/// an agent, so they are not part of the contract one has to meet.
+const INJECTED: [&str; 4] = ["total_rx", "total_tx", "month_rx", "month_tx"];
+
+/// Everything an agent has to send, derived from the public view rather than
+/// written out a third time: this list, `api::PUBLIC_METRICS` and the check
+/// below all have to agree, and only one of them is an independent fact.
+///
+/// The measure is what the hub *depends on*, not what it *stores*. `uptime`,
+/// `mem_total`, `swap_total` and `disk_total` never reach the `metric` table,
+/// but they go straight out to the browser, and the default theme voids a
+/// node's entire live view when one of them is absent. Drawn around the stored
+/// columns instead, this list left those four uncovered -- so an agent that
+/// renamed one blanked every card on the page with nothing in any log to say
+/// why. That is the failure this check exists to prevent.
 ///
 /// Hub and agent ship as two binaries from two repositories, and every reader
 /// here ends in `unwrap_or(0)`: a field the agent renames does not fail, it
 /// records zero until somebody looks at that chart. Worth one line in the log.
-const REPORT_FIELDS: [&str; 13] = [
-    "boot_id",
-    "cpu",
-    "load",
-    "mem_used",
-    "swap_used",
-    "disk_used",
-    "net_rx",
-    "net_tx",
-    "net_rx_total",
-    "net_tx_total",
-    "tcp",
-    "udp",
-    "procs",
-];
+fn report_fields() -> impl Iterator<Item = &'static str> {
+    ["boot_id", "net_rx_total", "net_tx_total"]
+        .into_iter()
+        .chain(crate::api::PUBLIC_METRICS.iter().copied().filter(|k| !INJECTED.contains(k)))
+}
+
+/// The ones carrying a plain number. `boot_id` is a string and `load` an array
+/// of three; each is checked on its own.
+fn numeric_fields() -> impl Iterator<Item = &'static str> {
+    report_fields().filter(|k| !matches!(*k, "boot_id" | "load"))
+}
 
 /// Says so, once per connection, when a report is missing fields the hub
-/// stores. A version number cannot do this: the agent that renames a field
+/// depends on. A version number cannot do this: the agent that renames a field
 /// carries a higher version, not a lower one.
 fn check_contract(node_id: i64, metrics: &serde_json::Value) {
-    let missing: Vec<&str> = REPORT_FIELDS.iter().copied().filter(|k| metrics.get(k).is_none()).collect();
+    let missing: Vec<&str> = report_fields().filter(|k| metrics.get(k).is_none()).collect();
     if !missing.is_empty() {
-        warn!("node {node_id} reports without {missing:?}: those columns will read zero, so this agent and this hub are out of step");
+        warn!("node {node_id} reports without {missing:?}: those columns will read zero and the default theme will void this node's live view, so this agent and this hub are out of step");
     }
 }
 
@@ -340,21 +349,7 @@ fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()>
     // separate: a missing/null kernel reading must not change its baseline.
     let number = |v: &serde_json::Value| v.as_f64().is_some_and(|n| n.is_finite() && n >= 0.0);
     anyhow::ensure!(metrics.is_object(), "report must be an object");
-    for key in [
-        "uptime",
-        "cpu",
-        "mem_total",
-        "mem_used",
-        "swap_total",
-        "swap_used",
-        "disk_total",
-        "disk_used",
-        "net_rx",
-        "net_tx",
-        "tcp",
-        "udp",
-        "procs",
-    ] {
+    for key in numeric_fields() {
         anyhow::ensure!(metrics.get(key).is_none_or(number), "invalid report field {key}");
     }
     if let Some(load) = metrics.get("load") {
@@ -369,8 +364,13 @@ fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()>
     // older one, or a box without the file -- would otherwise re-align on
     // every report and never book a byte.
     let boot_id = metrics.get("boot_id").and_then(|v| v.as_str()).filter(|b| !b.is_empty()).unwrap_or("-");
-    // No reading is not a reading of zero: see `accumulate`.
-    let counter = |k: &str| metrics.get(k).and_then(|v| v.as_i64());
+    // No reading is not a reading of zero: see `accumulate`. Anything that is
+    // not a non-negative i64 is no reading either -- a u64 past the signed
+    // range, a float, or a negative. A negative is refused outright above, but
+    // it must not survive as one here: `accumulate` stores whatever it is
+    // handed as the next baseline, and a negative baseline makes the following
+    // report's delta the counter plus its magnitude.
+    let counter = |k: &str| metrics.get(k).and_then(|v| v.as_i64()).filter(|n| *n >= 0);
     let counters = counter("net_rx_total").zip(counter("net_tx_total"));
     let traffic = app.db.accumulate(node_id, boot_id, counters)?;
 
@@ -505,6 +505,71 @@ mod tests {
         }
         dispatch(&app, id, "ip", &report_json("boot", 2_000, 600)).unwrap();
         assert_eq!(app.db.all_traffic()[&id].total_rx, 1_000);
+    }
+
+    /// The lifetime total is the first iron rule: it may not go backwards, and
+    /// it may not book bytes nobody moved. The two figures behind it arrive
+    /// from another repository's binary and are the only report fields that
+    /// mutate state which outlives the connection.
+    #[test]
+    fn a_hostile_counter_can_neither_inflate_the_total_nor_wrap_it() {
+        let app = app();
+        let (id, _held) = connect(&app);
+        let total = || app.db.all_traffic()[&id].total_rx;
+
+        // Both counters, always: `report` zips them, so leaving one out makes
+        // the pair unreadable and every assertion below pass for that reason
+        // instead of the one it is testing.
+        let send = |boot: &str, rx: serde_json::Value| {
+            report(&app, id, json!({"boot_id": boot, "net_rx_total": rx, "net_tx_total": 0}))
+        };
+
+        // A negative reading is refused, and -- the part that matters -- it
+        // does not survive as the baseline the next report subtracts from,
+        // which would make that report's delta its own value plus 5 GB.
+        assert!(send("b", json!(-5_000_000_000i64)).is_err());
+        send("b", json!(1_000)).unwrap();
+        assert_eq!(total(), 0, "a node that moved nothing books nothing");
+
+        // Neither does a u64 past the signed range, which `as_i64` cannot read:
+        // no reading, so the baseline stays where it was.
+        send("b", json!(u64::MAX)).unwrap();
+        send("b", json!(2_000)).unwrap();
+        assert_eq!(total(), 1_000, "only the 1 000 bytes this hub watched climb");
+
+        // And the total saturates instead of wrapping. A plain `+=` here wraps
+        // to i64::MIN in release, where overflow checks are off -- a lifetime
+        // figure that has gone backwards.
+        app.db
+            .set_traffic(id, &crate::db::TrafficPatch { total_rx: Some(i64::MAX - 10), ..Default::default() })
+            .unwrap();
+        send("c", json!(0)).unwrap();
+        send("c", json!(i64::MAX)).unwrap();
+        assert_eq!(total(), i64::MAX, "the total clamps; it never goes backwards");
+    }
+
+    /// The contract check is what makes a cross-repository rename loud. Drawn
+    /// around the columns the hub stores, it missed four fields that never
+    /// reach the `metric` table but do reach the browser -- and the default
+    /// theme voids a node's whole live view if one of them is absent, so the
+    /// drift showed up as blank cards and an empty log.
+    #[test]
+    fn the_contract_covers_every_field_the_browser_needs_not_just_the_stored_ones() {
+        let fields: Vec<&str> = report_fields().collect();
+        for needed in ["uptime", "mem_total", "swap_total", "disk_total"] {
+            assert!(fields.contains(&needed), "{needed} reaches the theme, so a rename has to warn");
+        }
+        // boot_id and the two kernel counters are the contract beyond the
+        // public view; the four the hub folds in itself are not the agent's.
+        for injected in INJECTED {
+            assert!(!fields.contains(&injected), "{injected} is the hub's own, not part of the contract");
+        }
+        assert!(fields.contains(&"boot_id") && fields.contains(&"net_rx_total"));
+        // The numeric loop is the same list minus the two that are not plain
+        // numbers, so neither can drift from the other.
+        let numeric: Vec<&str> = numeric_fields().collect();
+        assert_eq!(numeric.len(), fields.len() - 2);
+        assert!(!numeric.contains(&"load") && !numeric.contains(&"boot_id"));
     }
 
     /// A burst of reports inside one minute: each moves the live view and the

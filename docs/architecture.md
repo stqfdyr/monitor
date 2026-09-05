@@ -107,7 +107,7 @@ agent 收到后会**保留没变化的任务**（同 id + 同 target + 同 inter
 | `github_client_id` / `github_client_secret` | 空 | OAuth App |
 | `github_allowed_users` | 空 | 逗号分隔的用户名白名单。**空 = 任何人都登不进来**（不是任何人都能进） |
 | `theme` | `default` | 公开页主题短名；空、无效或已删除时使用内置默认主题 |
-| `github_proxy` | 空 | 拼在 agent release 下载地址前的代理，仅 hub 自己拉不到 GitHub 时需要 |
+| `github_proxy` | 空 | 拼在 agent release 下载地址前的代理，仅 hub 自己拉不到 GitHub 时需要。只接受 `https://`；它返回的字节会装到每台节点上，见 [security.md](security.md) |
 
 ## 请求路径
 

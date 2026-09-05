@@ -128,6 +128,10 @@ curl -fsSL https://monitor.example.com/install.sh | sh -s -- \
 agent 二进制由 hub 转发，节点无需直连 GitHub。hub 自身访问不了 GitHub 时，在**设置 → 站点**里填一个
 GitHub 代理（如 `https://ghfast.top`），hub 拉 release 时会用它，节点侧不用改任何东西。
 
+> 这个代理只接受 `https://`，而且**它返回的字节会被装到每一台节点上并跑起来**——hub 原样转发，
+> `install.sh` 直接安装，中间没有摘要校验。只填信得过的镜像。见
+> [docs/security.md](docs/security.md)。
+
 hub 只有明文 HTTP 时，命令里会多一个 `--insecure`——agent 和 `install.sh` 默认拒绝明文连远程 hub，
 因为凭证会明文传输，装 agent 下载的二进制也走同一条未验证的通道。面板会把这件事标出来。上了 TLS
 之后命令自动不再带它。
