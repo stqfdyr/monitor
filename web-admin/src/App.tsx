@@ -54,7 +54,7 @@ export default function App() {
   const [dark, toggleTheme] = useTheme()
   const [me, setMe] = useState<Me | null>(null)
   const [meError, setMeError] = useState("")
-  const { nodes, error, refresh } = useNodes()
+  const { nodes, admin, error, refresh } = useNodes()
 
   const loadMe = useCallback(() => {
     // `|| "..."`, because an empty message reads as no error at all: api()
@@ -68,6 +68,17 @@ export default function App() {
   useEffect(() => {
     loadMe()
   }, [loadMe])
+
+  // Every frame says who it was built for. The hub closes the stream when the
+  // session behind it is revoked -- signed out from another device, a password
+  // change, a restore -- and the reconnect underneath comes back as an anonymous
+  // one: the public list, with private nodes gone and every admin field empty,
+  // rendered inside a panel that still looks signed in. `authed` is only read at
+  // mount and after signing in, so nothing else notices. /api/me is where signing
+  // out is already handled; send it back there.
+  useEffect(() => {
+    if (me?.authed && admin === false) loadMe()
+  }, [admin, me?.authed, loadMe])
 
   // Only while there is nothing else to show. Login's onDone reloads /me, so a
   // hiccup in the second after signing in used to swap the whole signed-in

@@ -690,13 +690,37 @@ pub async fn ping_tasks(_: Admin, State(app): State<Shared>) -> Response {
     }
 }
 
+/// A probe target the agent can actually resolve: `host:port`, with an IPv6
+/// literal bracketed as a URL writes one.
+///
+/// A bare `contains(':')` let three shapes through that never connect -- a bare
+/// IPv6 address, which is nothing but colons; `:443` with no host; and `host:`
+/// with no port. The agent's `lookup_host` returns an error for each, `tcp_ping`
+/// answers -1, and the chart draws a probe at 100% loss forever with nothing in
+/// any log naming the target as the cause.
+fn valid_target(target: &str) -> bool {
+    let (host, port) = match target.strip_prefix('[') {
+        Some(rest) => match rest.split_once("]:") {
+            Some(pair) => pair,
+            None => return false,
+        },
+        // Unbracketed, so the last colon is the port separator -- and anything
+        // left holding a colon is an IPv6 address that needed brackets.
+        None => match target.rsplit_once(':') {
+            Some((host, port)) if !host.contains(':') => (host, port),
+            _ => return false,
+        },
+    };
+    !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0)
+}
+
 pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task): Json<PingTask>) -> Response {
     if task.name.trim().is_empty() || task.target.trim().is_empty() {
         return bad("name and target are required");
     }
     // tcp ping needs an explicit port; a bare host would silently never connect.
-    if !task.target.contains(':') {
-        return bad("target must be host:port, for example 1.1.1.1:443");
+    if !valid_target(task.target.trim()) {
+        return bad("target must be host:port, for example 1.1.1.1:443 or [2606:4700:4700::1111]:443");
     }
     task.interval = task.interval.clamp(5, 3_600);
     match app.db.save_ping_task(&task) {
@@ -852,10 +876,18 @@ fn scratch_path(app: &App, kind: &str) -> String {
     format!("{}.{kind}-{}.tmp", app.db.file(), &random_token()[..16])
 }
 
+/// The data page's figures.
+///
+/// Off the runtime, like the three routes below it: `stats` counts every row of
+/// `metric` and `ping_record` -- both WITHOUT ROWID, so each count is a full
+/// index scan -- and holds the connection the agents report through for the
+/// whole of it. Measured at 2.2M rows that is 127 ms in which the public page
+/// and every agent report wait too, and it grows with `retention_days`.
 pub async fn db_stats(_: Admin, State(app): State<Shared>) -> Response {
-    match app.db.stats() {
-        Ok(stats) => Json(stats).into_response(),
-        Err(e) => fail(e),
+    match tokio::task::spawn_blocking(move || app.db.stats()).await {
+        Ok(Ok(stats)) => Json(stats).into_response(),
+        Ok(Err(e)) => fail(e),
+        Err(e) => fail(anyhow::anyhow!(e)),
     }
 }
 
@@ -1381,6 +1413,25 @@ mod tests {
             "https://monitor.example.com/path",
         ] {
             assert!(https_domain(site).is_none());
+        }
+    }
+
+    /// Whatever this accepts is pushed to every assigned agent and handed
+    /// straight to `lookup_host`. The shapes it cannot resolve come back as -1
+    /// forever, which the chart draws as a probe losing every packet -- so the
+    /// check has to be what the error message claims it is.
+    #[test]
+    fn a_probe_target_must_be_something_the_agent_can_resolve() {
+        // Each of these makes `lookup_host` return an error, verified against it:
+        // a bare IPv6 address is nothing but colons, and the other two are
+        // missing the half the message asks for.
+        for bad in
+            ["2606:4700:4700::1111", ":443", "example.com:", "1.1.1.1", "1.1.1.1:0", "[::1]:x", "[::1]"]
+        {
+            assert!(!valid_target(bad), "{bad}");
+        }
+        for good in ["1.1.1.1:443", "[2606:4700:4700::1111]:443", "example.com:80", "[::1]:1"] {
+            assert!(valid_target(good), "{good}");
         }
     }
 

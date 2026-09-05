@@ -618,7 +618,23 @@ impl Db {
     /// one statement: `SET` reads the row as it was, so the comparison is
     /// against the stored address, not the one being written.
     pub fn save_facts(&self, id: i64, f: &serde_json::Value, ip: &str) -> Result<bool> {
-        let s = |k: &str| f.get(k).and_then(|v| v.as_str()).unwrap_or("").to_owned();
+        // Same rule as `api::agent_register` applies to the name it is handed:
+        // these come off a machine nobody has vouched for, control characters
+        // break the panel's rows, and a length has to stop somewhere. Six of
+        // them -- os, kernel, arch, virt, cpu_name, agent_version -- go straight
+        // into the anonymous public frame, which is rebuilt and pushed to every
+        // viewer every two seconds, so without a ceiling one node decides how
+        // many bytes that frame costs. 128 rather than 64: a real PRETTY_NAME
+        // runs to about 60 characters and a CPU model to about 50.
+        let s = |k: &str| {
+            f.get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(128)
+                .collect::<String>()
+        };
         let n = |k: &str| f.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
         let conn = self.conn();
         conn.execute(
@@ -970,8 +986,21 @@ impl Db {
         Ok(id)
     }
 
+    /// Deletes a probe and the results filed under it.
+    ///
+    /// `ping_record` carries no foreign key -- it is WITHOUT ROWID and keyed for
+    /// the chart query -- so it is cleared by hand, exactly as `delete_node`
+    /// does. SQLite hands a deleted probe's id straight to the next one created,
+    /// and the chart selects on `task_id IN (assignments for this node)`: without
+    /// this the new probe draws the dead one's latency under its own name, with
+    /// the dead one's timeouts folded into its loss figure.
+    ///
+    /// The delete is a scan -- the key starts at `node_id` -- and is the same
+    /// order of work as `prune`, for a button pressed by hand a few times a year.
     pub fn delete_ping_task(&self, id: i64) -> Result<()> {
-        self.conn().execute("DELETE FROM ping_task WHERE id=?1", [id])?;
+        let conn = self.conn();
+        conn.execute("DELETE FROM ping_record WHERE task_id = ?1", [id])?;
+        conn.execute("DELETE FROM ping_task WHERE id=?1", [id])?;
         Ok(())
     }
 
@@ -1747,6 +1776,45 @@ mod tests {
         assert_eq!(fresh, id, "the id is reused, which is what makes this reachable");
         db.save_ping_task(&PingTask { id: task, nodes: vec![fresh], ..probe(vec![]) }).unwrap();
         assert!(db.ping_records(fresh, 0, 60).unwrap().is_empty(), "and it starts with no history");
+    }
+
+    /// The mirror of the sweep above, on the other key of the same table.
+    /// SQLite reuses a deleted probe's id too, and the chart selects on the
+    /// assignments a node has -- so the dead probe's samples come back under the
+    /// new probe's name, with its timeouts folded into the new one's loss figure.
+    #[test]
+    fn deleting_a_probe_takes_its_history_with_it() {
+        let db = db();
+        let id = node(&db, 1);
+        let probe = |name: &str| PingTask {
+            id: 0,
+            name: name.into(),
+            target: "1.1.1.1:443".into(),
+            interval: 60,
+            nodes: vec![id],
+        };
+        let old = db.save_ping_task(&probe("tokyo")).unwrap();
+        db.insert_ping(id, old, 1, 999).unwrap();
+        db.delete_ping_task(old).unwrap();
+
+        let fresh = db.save_ping_task(&probe("singapore")).unwrap();
+        assert_eq!(fresh, old, "the id is reused, which is what makes this reachable");
+        assert!(db.ping_records(id, 0, 60).unwrap().is_empty(), "and it starts with no history");
+    }
+
+    /// The strings in a `hello` come off a machine nobody has vouched for, and
+    /// six of them go straight into the frame the public page is pushed every
+    /// two seconds -- so their length cannot be the node's to choose. `api`
+    /// already holds the same line on the one string `agent_register` takes.
+    #[test]
+    fn facts_from_an_unvouched_machine_cannot_choose_their_own_length() {
+        let db = db();
+        let id = node(&db, 1);
+        db.save_facts(id, &serde_json::json!({"os": "A".repeat(10_000), "hostname": "x\u{7}y"}), "ip")
+            .unwrap();
+        let stored = db.node(id).unwrap().unwrap();
+        assert_eq!(stored.os.chars().count(), 128);
+        assert_eq!(stored.hostname, "xy", "control characters break the panel's rows");
     }
 
     /// A correction has to survive the node coming back. `all_traffic` gates

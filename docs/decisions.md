@@ -1012,6 +1012,34 @@ JS）。它没有 pin 可钉——第三方主题按定义钉不住。性质也�
 代码（见 [security.md](security.md) 的「上传的主题是在访客浏览器里运行的第三方代码」），但"代理把
 一个原本可信主题的更新包换掉"确实是代理带来的新风险。不要和 agent 这条混在一起解。
 
+### ProtectHome 与磁盘口径：加固不动，独立 /home 不计入 **[用户]**
+
+**2026-09-05 审计记录。** `install.sh` 写的 unit 里有 `ProtectHome=yes`，systemd 的实现是**在 `/home`
+上盖一层 tmpfs**（默认内存的一半）。agent 在那个 namespace 里读 `/proc/self/mounts`，被盖住的那条
+`/dev/vdb1 /home ext4` **仍然列在表里**，而 `statvfs("/home")` 走路径解析，拿到的是上面那层 tmpfs。
+
+于是在一台 `/home` 是独立分区的机器上：`disk_total` 多出几百 MB 到几 GB 的 RAM 盘，`disk_used` 少掉
+`/home` 的全部用量。**第二条铁律（和 `df` 对得上）被破，而破它的是这个仓库的 unit 文件，不是采集
+代码。** 更糟的是 agent 那边守着这条铁律的 `cargo test crosscheck` 在开发者的 shell 里跑、没有这层
+namespace，**结构上不可能看见它**——采集口径的正确性依赖运行环境，而定义运行环境的是另一个仓库。
+
+`unshare -m` + loop 设备实测复现：真分区 57 MB，改之前 agent 读到 400 MB。
+
+**做的**：agent 的 `parse_mounts()` 改成同一个挂载点只认最后一条（路径解析走的就是最上层），
+tmpfs 被 `SKIP_FSTYPES` 正常挡掉，于是 `/home` **不再冒充**，改为**不计入**；agent 启动时用
+`shadowed_mounts()` 打一行说明是哪个挂载点没算。
+
+**否决 A：unit 改 `ProtectHome=read-only`。** 数字能和 `df` 完全对上，代价是 agent（`DynamicUser` 的
+临时用户）能读 `/home` 下世界可读的文件。它自己不读，但 agent 二进制目前是经 hub **无校验**转发下来的
+（见上一条），所以这个代价不是零。用户选了保加固。
+
+**否决 B：agent 侧按 `f_fsid` 认文件系统。** 比「认最后一条挂载」多一次 statvfs 和一张表，换到的只是
+同一个结论。挂载表已经按顺序把答案写在那里了。
+
+**剩下的差**：`df` 500G / 面板 450G 这种差仍然存在，只是有据可查、启动日志里点名了哪个挂载点。
+要连这个差都消掉，就得回到 A，或者给 unit 加 `ReadOnlyPaths=/home`——都是加固与口径之间的取舍，
+不是能悄悄改的东西。
+
 ### install.sh 支持 OpenRC **[用户]**
 
 agent 本来就是 musl 静态二进制，Alpine 上跑得了，缺的只是 init 脚本。systemd 那套加固

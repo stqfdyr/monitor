@@ -146,7 +146,10 @@ export async function upload<T>(
  */
 export function useNodes() {
   const [nodes, setNodes] = useState<Node[] | null>(null)
-  const [admin, setAdmin] = useState(false)
+  // null until a frame says. The panel treats an explicit false as "this session
+  // is no longer an admin one", so an unanswered first fetch must not read as
+  // that -- see App.tsx.
+  const [admin, setAdmin] = useState<boolean | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [reload, setReload] = useState(0)
 
@@ -163,7 +166,13 @@ export function useNodes() {
           setAdmin(d.admin)
           setError(null)
         })
-        .catch((e: Error) => setError(e.message))
+        .catch((e: Error) => {
+          setError(e.message)
+          // With the public page switched off a revoked session gets a 401 here
+          // and on the stream, so the frame that would have said admin=false
+          // never arrives and the panel would sit on the list it already had.
+          if (e instanceof ApiError && e.status === 401) setAdmin(false)
+        })
 
     fetchOnce()
 
@@ -179,7 +188,9 @@ export function useNodes() {
         return
       }
       socket.onmessage = (event) => {
-        setNodes(JSON.parse(event.data).nodes)
+        const frame = JSON.parse(event.data)
+        setNodes(frame.nodes)
+        setAdmin(frame.admin)
         setError(null)
         // The stream is back; the poll was only covering for it.
         if (poll) {

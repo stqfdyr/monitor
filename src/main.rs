@@ -471,6 +471,13 @@ fn exposed_over_plain_http(site: &str) -> bool {
 /// colon.
 fn host_is_loopback(authority: &str) -> bool {
     let authority = authority.split('/').next().unwrap_or("");
+    // RFC 3986 puts userinfo before the host, so `127.0.0.1:28080@example.com`
+    // reads as loopback to anything splitting at the first colon while the
+    // browser goes to whoever owns that name -- and this decides whether the
+    // "you are in the clear" warning prints at all. `provisioning_allowed` parses
+    // --site with reqwest::Url a few files over and does strip it; two answers to
+    // one question in one process is how the wrong one goes unnoticed.
+    let authority = authority.rsplit('@').next().unwrap_or("");
     let host = match authority.strip_prefix('[') {
         Some(v6) => v6.split(']').next().unwrap_or(""),
         None => authority.split(':').next().unwrap_or(""),
@@ -657,6 +664,10 @@ mod tests {
         // as loopback drops the warning that the cookie is in the clear.
         assert!(exposed_over_plain_http("http://127.example.com"));
         assert!(exposed_over_plain_http("http://127.0.0.1.nip.io"));
+        // Nor is userinfo an address: the host is what follows the '@', and
+        // reading the part before it as loopback drops the same warning.
+        assert!(exposed_over_plain_http("http://127.0.0.1:28080@hub.example.com"));
+        assert!(!app("http://127.0.0.1:28080@hub.example.com").secure_cookies(&proto(None)));
 
         // No --site: the proxy's header is the only word on the scheme.
         let bare = app("");

@@ -61,6 +61,14 @@ case "$SERVER" in *://*) ;; *) SERVER="$SCHEME://$SERVER" ;; esac
 # loopback would hand this exact plaintext channel to whoever owns it.
 HOST="${SERVER#*://}"
 HOST="${HOST%%/*}"
+# RFC 3986 puts userinfo before the host, so `127.0.0.1:28080@evil.example.com`
+# leaves a loopback address where the test below looks while curl -- which parses
+# the URL properly -- fetches from whoever owns that name. Over plain HTTP, and
+# the bytes are installed 0755 and started as root a few lines down. Nothing a
+# hub is reached at needs userinfo; the agent's own ws_url refuses it too.
+case "$HOST" in
+*@*) echo "server URL must not contain '@': the host is whatever follows it" >&2; exit 2 ;;
+esac
 case "$HOST" in
 "["*) HOST="${HOST#\[}"; HOST="${HOST%%]*}" ;;
 *) HOST="${HOST%%:*}" ;;

@@ -147,6 +147,21 @@ IPv4/IPv6。去掉它不会报错，只会让上报的地址一直是空字符�
 **curl 对没有 scheme 的 URL 默认走 `http://`**。于是同一条安装命令里 token 走 TLS，那个二进制走
 明文——规则里更糟的那半反而没护住。
 
+**`--server` 里不允许出现 `@`。** RFC 3986 把 userinfo 放在 host 前面，所以
+`http://127.0.0.1:28080@evil.example.com/` 里，「按第一个冒号切出主机」的写法拿到的是 `127.0.0.1`，
+而真正解析 URL 的那一方（curl、`http::Uri`）连的是 `evil.example.com`。这个形状同时穿过三份实现：
+agent 的 `is_loopback()`、`install.sh` 的 shell 版、hub 的 `host_is_loopback()`——前两份把明文拒绝整段
+跳过（`install.sh` 随后 `install -m 0755` 并由 systemd 以 root 拉起），第三份让 hub 启动时那条「你在
+明文里」的告警一条都不打。不带端口的写法（`http://127.0.0.1@evil.example.com/`）反而被挡住，因为
+`127.0.0.1@evil.example.com` parse 不成 IP。
+
+一个 hub 地址没有任何理由带 userinfo，所以 agent 和 `install.sh` 都是**直接拒绝**而不是解析——拒绝
+比剥离多守一样东西：`--insecure` 会跳过明文检查，剥离拦不住它。hub 那份只用来决定要不要打告警，
+没有可拒绝的路径，所以是 `rsplit('@')` 剥掉 userinfo 之后再判。同一个进程里 `provisioning_allowed()`
+用 `reqwest::Url` 解析 `--site`，它一直是对的——**一个问题两份答案，就是错的那份没人发现的原因**。
+2026-09-05 补，见 `ws_url_upgrades_scheme_and_refuses_plaintext_to_remote` 与
+`the_cookie_flag_follows_site_when_it_is_set_and_the_proxy_when_it_is_not` 里的断言。
+
 ### `--insecure` 是这道闸唯一的开关
 
 裸 ip:port 部署的 hub 只有明文 HTTP，所以两边都认一个 `--insecure`。它不是「忽略警告」，而是三件
