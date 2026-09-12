@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">
+  <!-- The same mark the public page carries: one product, and one mid tone
+       rather than a light/dark pair, because a favicon sits on browser chrome
+       neither page picks. -->
+  <g fill="#8a8a8a">
+    <rect x="2" y="9" width="3" height="5" rx="1"/>
+    <rect x="6.5" y="5" width="3" height="9" rx="1"/>
+    <rect x="11" y="2" width="3" height="12" rx="1"/>
+  </g>
+</svg>

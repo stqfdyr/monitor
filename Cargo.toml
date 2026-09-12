@@ -1,0 +1,46 @@
+[package]
+name = "monitor-hub"
+version = "0.1.22"
+edition = "2021"
+license = "MIT"
+description = "Lightweight server monitoring hub"
+repository = "https://github.com/monitor-probe/monitor"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum = { version = "0.8", features = ["ws", "macros"] }
+rusqlite = { version = "0.37", features = ["bundled", "backup"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+argon2 = "0.5"
+rand = "0.9"
+sha2 = "0.10"
+hex = "0.4"
+futures-core = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+rust-embed = { version = "8", features = ["include-exclude"] }
+mime_guess = "2"
+tokio-util = { version = "0.7", features = ["io"] }
+tower-http = { version = "0.6", features = ["limit", "compression-gzip"] }
+# Theme archives. Both are pure Rust: the release binary is built with `cross`
+# and the image is FROM scratch, which rules out a C dependency or an external
+# tar.
+tar = { version = "0.4", default-features = false }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[dev-dependencies]
+serde_urlencoded = "0.7"
+# Only the tests need a movable clock; the relay deadline spans minutes.
+# dev-dependencies do not reach the shipped binary.
+tokio = { version = "1", features = ["test-util"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+panic = "abort"
+strip = true

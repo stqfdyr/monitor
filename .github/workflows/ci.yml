@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    # Prose changes nothing a compiler or linter can check.
+    paths-ignore: ["**.md", "LICENSE"]
+  pull_request:
+    paths-ignore: ["**.md", "LICENSE"]
+
+# A new push supersedes any run still in progress for the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # A hanging test would otherwise consume the six-hour default; a cold build
+    # plus the suite takes a few minutes.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      # The default theme arrives as a published archive, verified against the
+      # hash in web-theme.pin. Run here rather than left to build.rs so the
+      # download happens on the runner: release builds go through cross, whose
+      # container does not necessarily carry curl.
+      - run: ./scripts/theme.sh
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web-admin/package-lock.json
+
+      # rust-embed requires the panel's dist/ to exist before cargo runs.
+      - run: npm ci && npm run lint && npm test && npm run build
+        working-directory: web-admin
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
